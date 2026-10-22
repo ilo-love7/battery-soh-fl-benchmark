@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 纯标准库部分：划分与协议模块不依赖 torch/flwr，任何 Python ≥3.11 都能跑。
+  # 这是全仓库唯一能在 CI 里低成本执行的部分，所以测试只覆盖这里。
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装 pytest
+        run: python -m pip install -U pytest
+      - name: 运行测试
+        run: python -m pytest tests -v
+      - name: 语法检查（脚本与 src 全部编译）
+        run: python -m compileall -q scripts src
+
+  # 实验协议校验器：两份真实配置必须零 ERROR。
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: mvp.toml 必须零 ERROR
+        run: python scripts/check_protocol.py --config configs/mvp.toml
+      - name: full.toml 必须零 ERROR
+        run: python scripts/check_protocol.py --config configs/full.toml
+
+      # 负控：检查器必须能报错。一个永远打印 PASS 的检查器比没有检查器更糟，
+      # 因为它会让「已校验」这句话变成假的。
+      # 夹具由真实配置改一行得到，因此不会与 schema 漂移。
+      - name: 负控 1：划分原子改成 cycle 必须失败
+        run: |
+          sed 's/partition_atom = "cell"/partition_atom = "cycle"/' configs/mvp.toml > /tmp/atom.toml
+          if python scripts/check_protocol.py --config /tmp/atom.toml; then
+            echo "::error::检查器对错误的划分原子放行了"; exit 1
+          fi
+          python scripts/check_protocol.py --config /tmp/atom.toml | grep -q "C-ATOM" || {
+            echo "::error::失败码不是 C-ATOM"; exit 1; }
+      - name: 负控 2：删掉 centralized 基线必须失败
+        run: |
+          sed 's/"centralized", //' configs/mvp.toml > /tmp/nocentral.toml
+          if python scripts/check_protocol.py --config /tmp/nocentral.toml; then
+            echo "::error::检查器对缺少 centralized 放行了"; exit 1
+          fi
+          python scripts/check_protocol.py --config /tmp/nocentral.toml | grep -q "C-STRATEGY" || {
+            echo "::error::失败码不是 C-STRATEGY"; exit 1; }
+      - name: 负控 3：只给 2 个 seed 必须失败
+        run: |
+          sed 's/values = \[0, 1, 2\]/values = [0, 1]/' configs/mvp.toml > /tmp/seeds.toml
+          if python scripts/check_protocol.py --config /tmp/seeds.toml; then
+            echo "::error::检查器对 2 个 seed 放行了"; exit 1
+          fi
+          python scripts/check_protocol.py --config /tmp/seeds.toml | grep -q "C-SEEDS" || {
+            echo "::error::失败码不是 C-SEEDS"; exit 1; }
+
+  # 划分泄漏检测：生成器必须全 PASS，且必须能抓出被污染的产物。
+  partition:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: mvp 划分必须全 PASS
+        run: python scripts/check_partition.py --config configs/mvp.toml
+      - name: full 划分必须全 PASS
+        run: python scripts/check_partition.py --config configs/full.toml
+      - name: 生成的划分可被再次对账
+        run: |
+          python scripts/check_partition.py --config configs/mvp.toml \
+            --emit /tmp/clean.json --emit-k 5 --emit-scheme iid
+          python scripts/check_partition.py --config configs/mvp.toml \
+            --partition-json /tmp/clean.json
+      - name: 负控：把一颗电池塞进第二个客户端必须报 P-LEAK
+        run: |
+          cp /tmp/clean.json /tmp/leaked.json
+          python - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("/tmp/leaked.json")
+          d = json.loads(p.read_text(encoding="utf-8"))
+          ids = sorted(d["partition"])
+          d["partition"][ids[1]].append(d["partition"][ids[0]][0])
+          p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+          print("已注入泄漏：", d["partition"][ids[0]][0])
+          PY
+          python scripts/check_partition.py --config configs/mvp.toml \
+            --partition-json /tmp/leaked.json | tee /tmp/leaked.log
+          if ! grep -q "P-LEAK" /tmp/leaked.log; then
+            echo "::error::失败码不是 P-LEAK"; exit 1
+          fi
+      - name: 负控：把测试电池塞进客户端必须报 P-TEST
+        run: |
+          cp /tmp/clean.json /tmp/testleak.json
+          python - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("/tmp/testleak.json")
+          d = json.loads(p.read_text(encoding="utf-8"))
+          ids = sorted(d["partition"])
+          d["partition"][ids[0]].append(d["test_cells"][0])
+          p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+          PY
+          python scripts/check_partition.py --config configs/mvp.toml \
+            --partition-json /tmp/testleak.json | tee /tmp/testleak.log
+          if ! grep -q "P-TEST" /tmp/testleak.log; then
+            echo "::error::失败码不是 P-TEST"; exit 1
+          fi
+
+  # 反造假闸门：方案阶段不许出现实验结果。
+  # 这一步防的是「先写结论再补实验」的写作顺序——一旦有人往 §10.2 里填了数，
+  # 而仓库里又没有对应的 results/*.json，CI 会直接红。
+  no-fabricated-results:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: §10.2 结果表必须仍为占位状态
+        run: |
+          python - <<'PY'
+          import re, sys, pathlib
+          text = pathlib.Path("docs/plan.md").read_text(encoding="utf-8")
+          m = re.search(r"### 10\.2 结果表（当前为空）(.*?)(?=\n### )", text, re.S)
+          if not m:
+              sys.exit("::error::docs/plan.md 里找不到 §10.2 结果表，请人工核对")
+          body = m.group(1)
+          if "本仓库尚无实验结果" not in body:
+              sys.exit("::error::§10.2 的声明句被删了：先确认实验阶段，再决定要不要恢复")
+          rows = [l for l in body.splitlines() if l.strip().startswith("|")]
+          # 结果列是最后三列（MAE / RMSE / 收敛轮数），协议参数列（如客户端数）
+          # 是允许有数字的。占位符必须全是「—」。
+          bad = []
+          for line in rows:
+              if "---" in line or any("配置" in c for c in line.split("|")[1:3]):
+                  continue  # 表头与分隔行
+              cells = [c.strip() for c in line.split("|")]
+              if len(cells) < 8:
+                  continue
+              if cells[5:8] != ["—", "—", "—"]:
+                  bad.append(line)
+          if bad:
+              sys.exit("::error::结果列出现非占位符，但本阶段不应有实验结果：\n" + "\n".join(bad))
+          print(f"OK：{len(rows)} 行的结果列全部为占位符")
+          PY

@@ -1,0 +1,63 @@
+# 完整版实验矩阵 —— 对应 docs/plan.md §9.2，覆盖 D6-D8
+#
+# 与 mvp.toml 的差别：
+#   1. cells_per_client 两档（2 / 5）→ 客户端数 50 / 20，量化量偏斜的影响
+#   2. alpha 三档（0.1 / 0.5 / 1.0）→ 图 2 的 Non-IID 程度扫描
+#   3. 策略扩到 fedadam / fedbn
+#   4. 打开 DP，noise 三档 → 图 3 的隐私-效用曲线
+#
+# 注意：本文件描述的是"要跑什么"，不是"已经跑完什么"。
+# 全矩阵 = 2 (k) × 4 (alpha 含 iid) × 5 (策略) × 3 (seed) + DP 3 × 3 = 129 个 run，
+# 单 run 墙钟超 30 min 就按 §12 R7 砍 α 扫描，别硬跑。
+
+[meta]
+name = "full"
+plan_version = "2.0"
+description = "策略扩展 + α 扫描 + 跨化学体系 + Opacus DP 隐私-效用曲线"
+
+[data]
+dataset = "mit-stanford"
+n_cells = 124
+partition_atom = "cell"
+
+[partitions]
+test_cells = 24
+split_seed = 0
+# 100 颗：k=2 → 50 客户端；k=5 → 20 客户端
+cells_per_client = [2, 5]
+remainder = "spread"
+schemes = ["iid", "dirichlet"]
+# 1.0 接近 IID，用来确认 α 扫描的方向性；0.1 是极端异质
+dirichlet_alpha = [0.1, 0.5, 1.0]
+
+[strategies]
+include = ["centralized", "fedavg", "fedprox", "fedadam", "fedbn"]
+# fedbn / scaffold 不在 flwr 内置策略里，需自行接入（§5.2）。
+# 接不进来就从这个列表里删掉，不要在报告里写"已对比"。
+proximal_mu = [0.0, 0.01, 0.1]
+server_learning_rate = [0.01, 0.1]
+
+[train]
+num_rounds = 200
+local_epochs = 1
+learning_rate = 0.001
+batch_size = 64
+fraction_fit = 1.0
+
+[seeds]
+values = [0, 1, 2]
+min_required = 3
+
+[privacy]
+enabled = true
+noise_multiplier = [0.5, 1.0, 2.0]
+max_grad_norm = 1.0
+target_delta = 1e-5
+
+[acceptance]
+iid_degradation_max = 0.05
+non_iid_degradation_min = 0.10
+fedprox_improvement_min = 0.05
+seed_cv_max = 0.10
+dp_degradation_max = 0.30
+dp_epsilon_max = 8.0

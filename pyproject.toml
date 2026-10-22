@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flsoh"
+version = "0.1.0"
+description = "Federated learning simulation platform for battery SOH estimation on charging data"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+license = { text = "MIT" }
+authors = [{ name = "ilo-love7" }]
+keywords = ["federated-learning", "battery", "soh", "flower", "benchmark"]
+classifiers = [
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# 训练栈单独一组：划分与协议模块只用标准库，装不装 torch 都能跑检查器
+train = [
+  "flwr[simulation]==1.41.0",
+  "torch==2.10.0",
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "scikit-learn>=1.4",
+]
+# 完整版 D8 才需要
+privacy = ["opacus==1.6.0"]
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/ilo-love7/battery-soh-fl-benchmark"
+Plan = "https://github.com/ilo-love7/battery-soh-fl-benchmark/blob/main/docs/plan.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+# Flower App 元数据。版本敏感：fab-format-version 与 flwr-version-target
+# 必须与 docs/plan.md §2.1 锁定的 flwr 版本一致，否则 `flwr run` 会拒绝加载。
+[tool.flwr.app]
+publisher = "ilo-love7"
+fab-format-version = 1
+flwr-version-target = "1.41.0"
+
+[tool.flwr.app.components]
+serverapp = "flsoh.app.server_app:app"
+clientapp = "flsoh.app.client_app:app"
+
+[tool.flwr.app.config]
+num-server-rounds = 100
+local-epochs = 1
+learning-rate = 0.001
+proximal-mu = 0.0

@@ -1,0 +1,41 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 测试与类型检查
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 实验产物：结果 JSON 要进版本库（它是数据源），但缓存与日志不进
+results/**/*.log
+results/**/__pycache__/
+*.tmp
+
+# 数据：原始数据集体积大且需自行下载，不进版本库（只保留目录说明）
+data/*
+!data/README.md
+
+# Flower 构建产物
+*.fab
+.flower/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地验证 CI 步骤时的临时目录
+.tmpci/

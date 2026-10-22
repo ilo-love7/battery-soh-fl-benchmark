@@ -1,0 +1,67 @@
+# MVP 实验矩阵 —— 对应 docs/plan.md §9.2
+#
+# 校验：python3 scripts/check_protocol.py --config configs/mvp.toml
+# 划分：python3 scripts/check_partition.py --config configs/mvp.toml
+#
+# 两条命令都在训练之前跑。协议错了，后面所有 run 的 JSON 都不能用。
+
+[meta]
+name = "mvp"
+plan_version = "2.0"
+description = "FedAvg/FedProx × IID/Non-IID，3 seeds，出轮数-精度曲线与表 1"
+
+[data]
+dataset = "mit-stanford"
+n_cells = 124
+# 划分原子必须是 "cell"。改成 cycle 会让同一颗电池的相邻循环跨客户端，
+# 时间序列截断使泛化虚高（§6.2 规则 1）。check_protocol.py 会直接拒。
+partition_atom = "cell"
+
+[partitions]
+# 全局测试集按"整颗电池"留出，与所有客户端数据不相交（§6.2 规则 2）。
+# 124 - 24 = 100 颗进客户端，100 / 5 = 20 个客户端。
+test_cells = 24
+# 留出哪 24 颗只由这个 seed 决定，与训练 seed 无关：
+# 否则换一个训练 seed 就换一个测试集，曲线之间不可比。
+split_seed = 0
+cells_per_client = [5]
+# 不整除时把余数摊给前几个客户端（spread），不丢弃电池；
+# "drop" 会直接扔掉尾部电池，只适合临时调试。
+remainder = "spread"
+schemes = ["iid", "dirichlet"]
+# 实测（check_partition.py）：N=20、α=0.5 时有一个客户端拿到 25 颗、
+# 7 个客户端各只有 1 颗。Dirichlet 分的是电池不是样本，客户端一多、
+# α 一小就会退化成"一人独占"。这是要写进报告的现象，不是 bug。
+dirichlet_alpha = [0.5]
+
+[strategies]
+# 必须含 centralized：没有 C0 就不知道联邦掉的是不是"本来就该掉"（§9.4）。
+include = ["centralized", "fedavg", "fedprox"]
+proximal_mu = [0.0, 0.01, 0.1]
+
+[train]
+num_rounds = 100
+local_epochs = 1
+learning_rate = 0.001
+batch_size = 64
+fraction_fit = 1.0
+
+[seeds]
+values = [0, 1, 2]
+min_required = 3
+
+[privacy]
+# MVP 只做 L1（联邦本身），不开 DP。完整版见 full.toml。
+enabled = false
+noise_multiplier = []
+max_grad_norm = 1.0
+target_delta = 1e-5
+
+[acceptance]
+# §11.3 的判据阈值。全部是相对量，不是绝对 MAE。
+iid_degradation_max = 0.05
+non_iid_degradation_min = 0.10
+fedprox_improvement_min = 0.05
+seed_cv_max = 0.10
+dp_degradation_max = 0.30
+dp_epsilon_max = 8.0
