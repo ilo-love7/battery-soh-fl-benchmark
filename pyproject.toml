@@ -56,8 +56,14 @@ flwr-version-target = "1.41.0"
 serverapp = "flsoh.app.server_app:app"
 clientapp = "flsoh.app.client_app:app"
 
+# 这些键会被 client_app / server_app 通过 context.run_config 读到。
+# 键名必须用连字符（flwr 的约定），且与 src/flsoh/app/*.py 里读取的一致——
+# 少一个键不会在启动时报错，会在第一轮训练时 KeyError。
 [tool.flwr.app.config]
 num-server-rounds = 100
 local-epochs = 1
 learning-rate = 0.001
 proximal-mu = 0.0
+input-dim = 1000
+batch-size = 64
+seed = 0

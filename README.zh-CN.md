@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-87%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-200%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -38,10 +38,14 @@
 | **`docs/plan.md`** | 完整执行方案（v2.0，17 节）：可证伪假设 H1–H4、模块契约、划分规则、风险登记册、里程碑 DOD |
 | **`src/flsoh/partition.py`** | 电池级划分 + 泄漏检测。纯标准库——不依赖 numpy，也不依赖 torch |
 | **`src/flsoh/protocol.py`** | 实验矩阵校验。缺 centralized 基线、缺 IID 对照、seed 少于 3 个，一律拒绝 |
+| **`src/flsoh/model.py`** | MLP 1000→128→64→1。`parameter_bytes()` / `wire_bytes()` 把通信量表算出来，不手抄 |
+| **`src/flsoh/data.py`** | 特征表读写、按客户端的 DataLoader，以及把「不许全局标准化」从注释变成断言的 `LocalStandardizer` |
+| **`src/flsoh/app/`** | Flower 1.41 客户端/服务端 App（`ClientApp` + `@app.train()` + `flwr.serverapp.strategy`） |
 | **`scripts/check_partition.py`** | 对账划分文件：跨客户端泄漏、测试集污染、空客户端 |
 | **`scripts/check_protocol.py`** | 在烧掉 GPU 小时之前先校验实验矩阵 |
+| **`scripts/run_local_baseline.py`** | C0（中心化上限）与 C1（本地独立下限）基线——不需要联邦运行时 |
 | **`configs/mvp.toml`、`configs/full.toml`** | 机器可读的实验矩阵：MIT-Stanford 124 颗电池、留出 24 颗、k ∈ {2, 5}、α 扫描、DP 扫描 |
-| **`tests/`** | 87 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
+| **`tests/`** | 200 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
 
 ## 快速开始
 
@@ -64,11 +68,21 @@ mvp.toml  cells=124  test=24
 全 PASS：无跨客户端泄漏、无测试集污染、无空客户端、无未覆盖电池。
 ```
 
-对账一次训练**实际用过**的划分文件，而不只是生成器：
+生成一次运行用的划分，再对账**实际用过的那份文件**：
 
 ```bash
 python3 scripts/check_partition.py --config configs/mvp.toml \
+    --emit results/partition.json --emit-k 5 --emit-scheme iid
+python3 scripts/check_partition.py --config configs/mvp.toml \
     --partition-json results/partition.json
+```
+
+跑基线（需要 `pip install -e ".[train]"`）：
+
+```bash
+python3 scripts/run_local_baseline.py --config configs/mvp.toml \
+    --features data/mit-stanford/features.csv \
+    --partition-json results/partition.json --out results/
 ```
 
 ## 每次实验前的六道检查
@@ -82,16 +96,31 @@ python3 scripts/check_partition.py --config configs/mvp.toml \
 | `P-COUNT` | 实际客户端数与声明的 N 不符 | 论文里的 N 写错 |
 | `P-UNKNOWN` | 出现数据集清单之外的电池 ID | 数据源读错了 |
 
+## 三个拒绝手抄的数字
+
+`docs/plan.md` 反复引用这几个数，所以由 `src/flsoh/model.py` 算出、
+`tests/test_model.py` 钉住：
+
+| 量 | 值 | 来源 |
+|---|---|---|
+| 参数量 | 136,449 | `expected_param_count(1000, (128, 64))` |
+| 单次更新载荷 | 545,796 B | `parameter_bytes()` |
+| **单次更新线上字节数** | **546,630 B** | `wire_bytes()`——flwr 的 `ArrayRecord.count_bytes()`，含 139 B/张量的 NumPy 元数据 |
+| 每客户端每轮往返 | 1,091,592 B ≈ 1.04 MiB | `round_trip_bytes()` |
+| N=20 × 100 轮总计 | 2,183,184,000 B ≈ 2.03 GiB | 派生值；**不是** v1 写的 2.60 GiB |
+
 ## 刻意没有的东西
 
 - **没有结果。** 见上文。
-- **还没有 `data.py` / `model.py` / Flower App。** 它们依赖 torch + flwr，因此不进 CI，也不进第一次提交。`docs/plan.md` §3.2 的模块契约就是它们的规格说明。
 - **没有绝对精度目标。** 所有结论以相对中心化基线（C0）的劣化百分比表述，见 `docs/plan.md` §11。
 - **不宣称可部署。** 这是仿真。`docs/plan.md` §14 坑 6 讲的就是这件事。
+- **重依赖测试不进默认 CI。** `test_model.py` / `test_data.py` / `test_app.py` 需要 torch + flwr，
+  放在手动的 `heavy-tests` job 里（Actions → CI → Run workflow）。默认 CI 保持秒级可跑。
 
 ## 文档
 
 - **执行方案（v2.0）** — [`docs/plan.md`](./docs/plan.md)，主文档
+- **§3.4 API 实测校准** — 对照安装的 `flwr` 1.41.0 逐项核对的结果，含发现的两处差异
 - **v1 归档** — [`docs/archive/plan-v1.md`](./docs/archive/plan-v1.md)，保留用于对比
 - **Flower 版本说明** — `docs/plan.md` §2：`flwr` 1.41.0 用的是 `ClientApp` + `@app.train()` + `flwr.serverapp.strategy`，不是 `NumPyClient`
 
@@ -105,7 +134,9 @@ python3 scripts/check_partition.py --config configs/mvp.toml \
 2. **没有运行结果就没有数字。** §10.2 保持 `—`，直到 `results/*.json` 存在。
 
 ```bash
-python3 -m pytest tests -v
+python3 -m pytest tests -v        # 纯标准库，CI 里跑的就是这些
+pip install -e ".[train,dev]"     # 装 torch/flwr 后才能跑另外 112 条
+python3 -m pytest tests -v        # 全部 200 条
 ```
 
 ## 许可证

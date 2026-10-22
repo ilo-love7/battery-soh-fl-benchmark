@@ -12,6 +12,7 @@ from flsoh.partition import (
     PartitionError,
     check_partition,
     client_ids,
+    client_order,
     expected_n_clients,
     make_cell_ids,
     partition_by_size,
@@ -178,6 +179,40 @@ class TestPartitionDirichlet:
     def test_rejects_more_clients_than_cells(self):
         with pytest.raises(PartitionError):
             partition_dirichlet(make_cell_ids(3), 5, 0.5, 0)
+
+
+class TestClientOrder:
+    """flower 仿真运行时的 partition-id 是整数 0..N-1，划分的键是 client-N。
+
+    按索引取客户端时必须按**数字后缀**排序。直接 sorted() 在 N≥10 时会把
+    client-10 排到 client-2 前面，每个客户端拿到别人的电池，且不报错。
+    """
+
+    def test_numeric_order_not_lexicographic(self):
+        p = {f"client-{i}": [f"cell-{i}"] for i in range(12)}
+        order = client_order(p)
+        assert order == [f"client-{i}" for i in range(12)]
+        assert order.index("client-10") > order.index("client-2")
+
+    def test_lexicographic_sort_would_be_wrong(self):
+        # 这条测试钉住"bug 确实存在"：朴素 sorted 的顺序是错的
+        p = {f"client-{i}": [] for i in range(12)}
+        assert sorted(p) != client_order(p)
+
+    def test_handles_arbitrary_suffixes(self):
+        p = {"node-3": [], "node-1": [], "node-20": [], "node-2": []}
+        assert client_order(p) == ["node-1", "node-2", "node-3", "node-20"]
+
+    def test_suffix_less_ids_sort_last_and_stable(self):
+        p = {"alpha": [], "client-2": [], "client-1": []}
+        assert client_order(p) == ["client-1", "client-2", "alpha"]
+
+    def test_empty_partition(self):
+        assert client_order({}) == []
+
+    def test_order_is_deterministic(self):
+        p = {f"client-{i}": [] for i in range(15)}
+        assert client_order(p) == client_order(p)
 
 
 class TestCheckPartitionClean:

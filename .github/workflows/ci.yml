@@ -157,3 +157,26 @@ jobs:
               sys.exit("::error::结果列出现非占位符，但本阶段不应有实验结果：\n" + "\n".join(bad))
           print(f"OK：{len(rows)} 行的结果列全部为占位符")
           PY
+
+  # data / model / app 依赖 torch + flwr。它们**默认不在 CI 里跑**：
+  # 上面的 tests job 用纯标准库就能验证检查器，不需要为了跑检查去解析
+  # 几百 MB 的依赖树。这个 job 是手动触发的（workflow_dispatch），
+  # 改了训练代码时点一下即可——它的存在是让"有测试"这句话保持为真，
+  # 而不是让每次 push 都等 10 分钟装 torch。
+  heavy-tests:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安装训练栈（flwr 1.41.0 / torch 2.10.0）
+        run: |
+          python -m pip install -U pip
+          python -m pip install "flwr[simulation]==1.41.0" "torch==2.10.0" \
+              "numpy>=1.26" "pandas>=2.1" "scikit-learn>=1.4" pytest
+      - name: 运行依赖 torch/flwr 的测试
+        run: python -m pytest tests/test_model.py tests/test_data.py tests/test_app.py -v
+      - name: App 三层可导入
+        run: python -c "import flsoh.app.client_app, flsoh.app.server_app; print('apps import OK')"

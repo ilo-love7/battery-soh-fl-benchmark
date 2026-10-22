@@ -286,3 +286,22 @@ def check_partition(
 def partition_sizes(partition: dict[str, list[str]]) -> Counter:
     """各客户端电池数分布，供 CLI 打印一行摘要。"""
     return Counter(len(v) for v in partition.values())
+
+
+def client_order(partition: dict[str, list[str]]) -> list[str]:
+    """按**数字后缀**排序的客户端 ID 列表。
+
+    为什么不能直接 ``sorted(partition)``：字符串排序下 ``client-10`` 会排在
+    ``client-2`` 前面。N≥10 时这会静默把客户端顺序打乱——flower 仿真运行时
+    按 ``partition-id``（整数 0..N-1）索引客户端，顺序一错，每个客户端拿到
+    的就是别人的电池，而且不会有任何报错。
+
+    没有数字后缀的 ID 排在最后，按字典序，保证结果稳定可复现。
+    """
+    import re
+
+    def sort_key(cid: str):
+        m = re.search(r"(\d+)$", cid)
+        return (0, int(m.group(1)), "") if m else (1, 0, cid)
+
+    return sorted(partition, key=sort_key)

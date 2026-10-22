@@ -22,6 +22,8 @@
 | 10 | §6.3 泄漏检测从规则变成**可执行脚本** | "同一颗电池不得跨客户端"是全文最贵的一条规则，靠人眼核对 124 颗电池不现实 |
 | 11 | 新增 **§16 参考文献 / §17 术语表** | 方案里出现的每个方法名都要能追到原文 |
 | 12 | 客户端数 **N=25 → 20**，§6.3 补 **P-UNKNOWN** 检查 | 25 是 124÷5 的取整，但 124 不能被 5 整除，而且没扣全局测试集。写 `check_protocol.py` 时才发现：按 §6.2 规则 2 整颗留出 24 颗后只剩 100 颗，k=5 只能得 20 个客户端。报告里 N 写错是硬伤 |
+| 13 | 总流量 **2.60 GiB → 2.03 GiB**，补协议开销实测值 | 2.60 是按错的 N=25 算出来的，而且即便按 25 算也是 2.54。§10.1 的派生表抄了错输入。现在表 2 的每个数由 `round_trip_bytes()` 算出并有测试钉住 |
+| 14 | 新增 **§3.4 实测校准**：`model.py` / `data.py` 落地后的 API 与数字核对 | v2.0 的方案骨架按 flwr 1.41.0 官方 quickstart 推演，M1 落地后逐项实测，差异记录在案而不是悄悄改掉 |
 
 ---
 
@@ -251,6 +253,44 @@ def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
     mae = evaluate_mae(model, load_global_test())
     return MetricRecord({"mae": mae})
 ```
+
+---
+
+## 3.4 实测校准（M1 落地后核对）
+
+§3.3 的骨架按 flwr 1.41.0 官方 quickstart 推演。装上 `flwr==1.41.0` +
+`torch==2.10.0` 后逐项实测，结果如下——**对得上的记"确认"，对不上的记差异**，
+不悄悄改前面的章节。
+
+| §3.3 的说法 | 实测 | 结论 |
+|---|---|---|
+| `from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict` | 全部可导入 | ✅ 确认 |
+| `from flwr.clientapp import ClientApp` + `@app.train()` / `@app.evaluate()` | 可导入，装饰器存在 | ✅ 确认 |
+| `from flwr.serverapp import Grid, ServerApp` | 可导入 | ✅ 确认 |
+| `from flwr.serverapp.strategy import FedAvg, FedProx` | 可导入 | ✅ 确认 |
+| `FedProx(proximal_mu=mu)` | `proximal_mu` **确实存在**，但是最后一个参数，排在 `fraction_train` / `min_*` / `weighted_by_key` / `arrayrecord_key` / `configrecord_key` / 两个 `*_aggr_fn` 之后 | ✅ 确认（位置靠后，按关键字传） |
+| `strategy.start(grid=..., initial_arrays=..., num_rounds=..., evaluate_fn=...)` | 签名完全一致，另有 `timeout` / `train_config` / `evaluate_config` | ✅ 确认 |
+| `ArrayRecord.from_torch_state_dict` / `.to_torch_state_dict` | 两个方法都在 | ✅ 确认 |
+| 通信量载荷 545,796 B | `parameter_bytes()` = 545,796 | ✅ 确认 |
+| 通信量"即线上的字节数" | `ArrayRecord.count_bytes()` = **546,630** | ⚠️ 差 834 B，见下 |
+
+**两处需要记进报告的差异：**
+
+1. **协议开销 834 B**。`count_bytes()` 比载荷多 834 B = 139 B/张量 × 6 个张量。
+   实测多组模型确认这是 NumPy 序列化的 dtype/shape 元数据，**与模型规模无关、
+   只与张量数有关**。§10.1 表 2 已补这一项。
+
+2. **聚合权重依赖客户端上报 `num-examples`**。`FedAvg.__init__` 的默认
+   `weighted_by_key="num-examples"`——也就是说 §14 坑 3「聚合应按样本数加权」
+   这条规则，在 flwr 1.41 里的**执行方式是客户端必须在 `MetricRecord` 里报
+   `num-examples`**。漏报不会报错，会静默退化成等权聚合。
+   `src/flsoh/app/client_app.py` 因此把 `num-examples` 写进训练与评估两条
+   `MetricRecord`，并由 `tests/test_app.py` 钉住。
+
+**另一处与方案不同的实现选择**：§11.2 说 C1（本地独立训练）是下限参考线。
+C1 不需要联邦运行时——它就是 N 个单客户端模型各训各的。因此 `server_app.py`
+不实现 C1，改由 `scripts/run_local_baseline.py` 直接跑，避免为一条基线
+拉起整套 SuperLink。
 
 `pyproject.toml` 的关键字段（版本敏感，照抄官方结构）：
 
@@ -512,7 +552,11 @@ epsilon = privacy_engine.get_epsilon(delta=1e-5)
 | 图 3 | 隐私-效用曲线 | noise_multiplier vs MAE，每点标注 ε |
 | 表 2 | 通信量估算 | 参数量 × 4 B × 2（上/下行）× 客户端数 × 轮数 |
 
-表 2 用 §4.1 的精确值：`136,449 × 4 × 2 = 1,091,592 B/客户端/轮 ≈ 1.04 MiB`。N=25、100 轮 → 约 **2.60 GiB** 总流量（不含协议开销）。
+表 2 用 §4.1 的精确值：`136,449 × 4 × 2 = 1,091,592 B/客户端/轮 ≈ 1.04 MiB`。N=20、100 轮 → **2,183,184,000 B ≈ 2.03 GiB** 总流量（不含协议开销）。
+
+> **协议开销已实测（flwr 1.41.0，2026-10-22）**：`ArrayRecord.count_bytes()` 对上述模型返回 **546,630 B**，比载荷多 834 B。差额恒为 **139 B/张量**，与模型规模无关——那是 NumPy 序列化要写的 dtype 与 shape 元数据。占比 0.15%，本可忽略，但换 1D-CNN/LSTM 时张量数会变，必须重算。算式固化在 `src/flsoh/model.py: wire_bytes()`。
+>
+> **一个已经犯过的错**：v1 写「N=25、100 轮 → 约 2.60 GiB」。N=25 是 124÷5 的取整（正确值 20），而即便按 N=25 算也是 2.54 GiB。**派生表抄了错的输入，就会一直错下去。** 所以表 2 的每个数都由 `round_trip_bytes()` 算出，并由 `tests/test_model.py::TestCommunicationBudget` 钉住。
 
 ### 10.2 结果表（当前为空）
 
