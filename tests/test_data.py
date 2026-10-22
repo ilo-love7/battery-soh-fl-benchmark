@@ -9,11 +9,15 @@
    可观测证据。
 """
 
-import numpy as np
-import pandas as pd
 import pytest
 
+# 注意顺序：importorskip 必须是本文件的第一个 import。
+# 若把 numpy / pandas 放在它上面，CI（不装重依赖）会在 collection 阶段就
+# ModuleNotFoundError，而不是干净地 skip。这个顺序被 CI 的 tests job 钉住。
 torch = pytest.importorskip("torch", reason="data 需要 torch；CI 只跑纯标准库部分")
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
 from flsoh.data import (  # noqa: E402
     CELL_COL,

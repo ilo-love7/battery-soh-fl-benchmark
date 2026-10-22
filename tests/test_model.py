@@ -5,10 +5,14 @@
 这些数字在方案里出现多次，手抄一遍就会错一次。
 """
 
-import numpy as np
 import pytest
 
+# 注意顺序：importorskip 必须是本文件的第一个 import。
+# 若把 numpy 之类放在它上面，CI（不装重依赖）会在 collection 阶段就
+# ModuleNotFoundError，而不是干净地 skip。这个顺序被 CI 的 tests job 钉住。
 torch = pytest.importorskip("torch", reason="model 需要 torch；CI 只跑纯标准库部分")
+
+import numpy as np  # noqa: E402
 
 from flsoh.model import (  # noqa: E402
     FLOAT32_BYTES,

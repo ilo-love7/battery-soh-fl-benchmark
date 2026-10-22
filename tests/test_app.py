@@ -10,12 +10,15 @@
 这些测试依赖 flwr + torch，用 importorskip 守门，不进 CI。
 """
 
-import numpy as np
 import pytest
 
+# 注意顺序：importorskip 必须是本文件的第一个 import。
+# 若把 numpy / flwr 放在它上面，CI（不装重依赖）会在 collection 阶段就
+# ModuleNotFoundError，而不是干净地 skip。这个顺序被 CI 的 tests job 钉住。
 pytest.importorskip("torch", reason="app 层需要 torch")
 flwr_app = pytest.importorskip("flwr.app", reason="app 层需要 flwr")
 
+import numpy as np  # noqa: E402
 from flwr.app import ArrayRecord, ConfigRecord, Message, RecordDict  # noqa: E402
 from flwr.supercore.task_identity import TaskIdentity  # noqa: E402
 
