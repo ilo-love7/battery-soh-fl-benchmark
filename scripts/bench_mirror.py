@@ -1,21 +1,23 @@
 """量远端镜像的吞吐与单颗耗时。**换时段跑一遍再引用任何数字。**
 
-存在的理由：这个仓库的 docstring 里有一堆吞吐数字（1.5 次/秒、13 KB/s、
+存在的理由：这个仓库的 docstring 里有一堆吞吐数字（1.1–1.3 次/秒、13 KB/s、
 24 s/颗 vs 120 s/颗），而它们全是**时段相关**的。同一个镜像早上和晚上
 能差 5 倍，把某一次的量测当成常量是这里犯过最贵的错。所以留一个能
 复跑的工具，让下一个读 docstring 的人先量一遍再信。
 
-三个子命令：
+四个子命令：
 
 ``rate``   纯 HTTP：给定并发下的请求速率与字节吞吐
 ``cell``   真实代码路径：抽 N 颗电池的墙钟时间（可指定顶层 workers）
 ``addrs``  单颗电池 134 个请求的地址分布，判断预读窗口是否成立
+``burst``  沿真实访问路径连发小请求，看单请求耗时的分布
 
 用法::
 
     python scripts/bench_mirror.py rate
     python scripts/bench_mirror.py cell --cells 2 --workers 1
     python scripts/bench_mirror.py addrs
+    python scripts/bench_mirror.py burst
 """
 
 from __future__ import annotations
@@ -176,6 +178,48 @@ def cmd_addrs(args) -> None:
     )
 
 
+def cmd_burst(args) -> None:
+    """沿真实访问路径连发小请求，看单请求耗时分布。
+
+    这条量的是「请求贵还是字节贵」。实测单请求耗时高度离散（中位
+    0.29–0.32 s、均值 0.45–0.65 s、最快 0.14 s、最慢 4.25 s），
+    而真实负载里 134 个请求的中位也是 0.64 s——说明瓶颈不在我们的代码里。
+    机制（边缘命中 vs 回源）没查清，别据此下结论。
+    """
+    conn = http.client.HTTPSConnection(HOST, timeout=60)
+    times: list[float] = []
+    try:
+        for i in range(args.count):
+            offset = args.base + i * args.stride
+            t0 = time.time()
+            conn.request("GET", PATH, headers={"Range": f"bytes={offset}-{offset + args.size - 1}"})
+            resp = conn.getresponse()
+            resp.read()
+            if resp.status != 206:
+                raise SystemExit(f"服务器返回 {resp.status}，不是 206")
+            times.append(time.time() - t0)
+    finally:
+        conn.close()
+    ordered = sorted(times)
+    print(
+        json.dumps(
+            {
+                "count": len(times),
+                "size_B": args.size,
+                "median_s": round(ordered[len(ordered) // 2], 2),
+                "mean_s": round(sum(times) / len(times), 2),
+                "min_s": round(ordered[0], 2),
+                "max_s": round(ordered[-1], 2),
+                "under_0.35s_share": round(sum(1 for t in times if t < 0.35) / len(times), 2),
+                "first_6": [round(t, 2) for t in times[:6]],
+                "last_6": [round(t, 2) for t in times[-6:]],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -196,6 +240,13 @@ def main() -> None:
     p_addr = sub.add_parser("addrs", help="单颗请求的地址分布")
     p_addr.add_argument("--batch", type=int, default=1)
     p_addr.set_defaults(func=cmd_addrs)
+
+    p_burst = sub.add_parser("burst", help="连发小请求，看单请求耗时分布")
+    p_burst.add_argument("--count", type=int, default=24)
+    p_burst.add_argument("--size", type=int, default=512)
+    p_burst.add_argument("--stride", type=int, default=9173, help="每循环约 9,184 B")
+    p_burst.add_argument("--base", type=int, default=42_358_623, help="batch 1 的 cycle1 对象头")
+    p_burst.set_defaults(func=cmd_burst)
 
     args = parser.parse_args()
     args.func(args)
