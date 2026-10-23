@@ -316,6 +316,26 @@ class TestHTTPRangeFile:
             assert handle.read(999) == payload[-10:]
             assert handle.read(1) == b""
 
+    def test_default_workers_is_one(self):
+        """内部补洞并发默认必须是 1。
+
+        这不是性能洁癖，是一个被实测推翻过的默认值：最早按「单连接 17 KB/s、
+        6 并发 131 KB/s」设成 8，后来这个镜像改成**惩罚并发连接**，
+        于是 8 从优化变成了 3 倍以上的减速——而顶层 ``--workers`` 调到 1
+        也看不出问题，因为并发藏在 ``_pull`` 里面。
+
+        同一个时段、同一份代码实测：内部并发 1 → 134 请求 / 436 KB / 60.6 s；
+        内部并发 8 → 280 s 内没跑完。所以「并发听起来更快」在这里是错的，
+        拿这条测试挡着，别让人凭直觉改回去。
+
+        从签名读默认值而**不构造实例**：构造函数会探测远端文件大小，
+        那是一条真实请求，测试不该为它付钱。
+        """
+        import inspect
+
+        default = inspect.signature(HTTPRangeFile.__init__).parameters["workers"].default
+        assert default == 1, "内部补洞并发默认值被改大了；见 docstring 里的实测表"
+
     def test_rejects_server_ignoring_range(self, payload):
         server, url = _serve(payload, honor_range=False)
         try:
