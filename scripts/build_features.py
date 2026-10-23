@@ -95,7 +95,7 @@ DEFAULT_V_LO = 2.0
 DEFAULT_V_HI = 3.5
 DEFAULT_POINTS = 1000
 DEFAULT_REF_CYCLE = 1
-DEFAULT_WORKERS = 4
+DEFAULT_WORKERS = 1  # 见 --workers 的 help：这个镜像惩罚并发，调大只会更慢
 
 STATE_NAME = "state.json"
 
@@ -573,7 +573,12 @@ def main(argv: list[str] | None = None) -> int:
         "--workers",
         type=int,
         default=DEFAULT_WORKERS,
-        help="批次内并发的 h5py 句柄数",
+        help=(
+            "批次内并发的 h5py 句柄数。**默认 1，别调大**：实测这个镜像惩罚"
+            "并发连接——1 个 worker 前 2 颗 60 s、稳态约 24 s/颗；2 个 worker "
+            "前 2 颗 253 s；6 个 worker 首颗 404 s、稳态约 100 s/颗。"
+            "加连接让每个请求都变慢，总时间成倍上升。"
+        ),
     )
     parser.add_argument("--limit-cells", type=int, default=None, help="每批只跑前 N 颗")
     parser.add_argument(
