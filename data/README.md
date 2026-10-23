@@ -86,6 +86,27 @@ python scripts/build_features.py \
     --out data/mit-stanford/features.parquet
 ```
 
+第 3 步**不可能一次跑完**：135 颗 × 21 个循环 × 2 条曲线，每次远端往返 1.4 s 到
+几十秒。所以它按颗落分片（`features.parquet.parts/`），中断后**重跑同一条命令**
+即可，已有分片自动跳过。
+
+「中断」是关键前提：**跑完的那一轮会清掉分片目录**，所以重复执行一条已经跑完的
+命令是全新一轮，不是续跑。想留着分片（比如要接着换参数做对照）就加 `--keep-parts`。
+
+```bash
+# 中断后接着跑（同一条命令）
+python scripts/build_features.py \
+    --manifest data/mit-stanford/manifest.json \
+    --out data/mit-stanford/features.parquet
+
+# 换了网格 / 循环区间：拒绝续跑，确认要重来才加 --restart
+python scripts/build_features.py --manifest ... --out ... --points 500 --restart
+```
+
+拒绝续跑不是麻烦，是必须：网格从 1000 点改成 500 点，新旧分片的第 i 列就不是
+同一个电压，拼出来的表**不报任何异常**。规格指纹（循环区间、参考循环、电压
+网格）写在分片目录的 `state.json` 里，任何一项变了都要显式 `--restart`。
+
 `cells.txt` 是**生成物，不是手写清单**。手写清单一旦和数据脱节，
 `check_partition.py` 就会对着一份虚构的 ID 清单说 PASS——`P-UNKNOWN` 防的是
 「ID 不在数据集里」，它防不住「清单本身就是假的」。

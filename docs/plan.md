@@ -28,6 +28,7 @@
 | 16 | §6.3 新增 **P-CONT**：同一物理电池跨文件出现的泄漏 | `b2c7` 与 `b1c0` 是同一颗电池的两段。ID 不同、文件也不同，`P-LEAK` 结构上抓不到；不处理的话同一颗电池会同时进两个客户端，指标虚高而曲线看不出来 |
 | 17 | 特征从「每颗电池一行 ΔQ₁₀₀₋₁₀」改为 **per-cycle 行** | 按电池划分后每客户端只有 5 颗电池。每颗一行则本地只有 5 个样本，联邦训练不成立。per-cycle 让每客户端约 100 行，H1–H3 才有统计意义 |
 | 18 | 新增 **`matr.py`** 与 `build_manifest.py` / `build_features.py` / `check_continuations.py` | 三个 .mat 合计 7.7 GiB，而需要的字节不到 0.1%。整篇下载不可行（单连接实测 17 KB/s），所以按 HDF5 区间随机读；清单必须由数据生成，否则 `P-UNKNOWN` 会对着虚构 ID 说 PASS |
+| 20 | `build_features.py` 改为**按颗落分片、可断点续跑** | 135 颗 × 21 循环 × 2 曲线，每次远端往返 1.4 s 到几十秒，这个命令不可能一次跑完；中断一次全部作废，而重来还是跑不完。三处不能省：分片原子落盘（半块 parquet 恰好还能打开，比没有更危险）、规格指纹不匹配就拒绝续跑（换了网格后新旧行的同一列不是同一个物理量，而拼出来的表不报异常）、写完读回来验（cell_id / 行数 / 列数对不上就删掉重抽） |
 | 19 | 延续关系的**证据换了一套**：`channel_id` 被证伪，改用 policy 后缀 + 段长 + 交界容量；N=20 → **23**，总流量 2.03 → **2.34 GiB** | 最初拿 `channel_id` 验证，5 对全 FAIL。查下去发现它根本不是身份字段（第 5 位是批次内行号，b1c0 是 47、b2c7 是 56），`barcode` 更糟——140 颗全是同一个常数 3707764736。真正的指纹是 `policy_readable`：延续段存的是原段的后缀（`80%)-3.6C` ← `3.6C(80%)-3.6C`），配合 add_len 段长与交界容量，四条证据全过。颗数确认 135，N 随之为 23 |
 
 ---
@@ -160,7 +161,7 @@ battery-soh-fl-benchmark/
 │   ├── check_protocol.py     # 实验矩阵校验 CLI
 │   ├── check_continuations.py# 跨批次延续验证（policy 后缀 + 段长 + 交界容量）
 │   ├── build_manifest.py     # 原始文件 → cells.txt + manifest.json
-│   └── build_features.py     # 原始曲线 → features.parquet + spec
+│   └── build_features.py     # 原始曲线 → features.parquet + spec（按颗落分片，可续跑）
 ├── tests/                    # 纯标准库 + matr（合成 HDF5，不联网）
 └── docs/
 ```

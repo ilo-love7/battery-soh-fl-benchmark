@@ -27,9 +27,9 @@ jobs:
       - name: 语法检查（脚本与 src 全部编译）
         run: python -m compileall -q scripts src
 
-  # matr 模块：只依赖 numpy + h5py（各约 5 MB），比 torch 便宜得多，
-  # 所以它进默认 CI。测试用合成 HDF5 + 本地 Range 服务器，全程不联网——
-  # 数据集的 7.7 GiB 不该成为「能不能跑测试」的前提。
+  # matr 模块：只依赖 numpy + h5py + pandas（都比 torch 便宜得多），所以它进默认
+  # CI。测试用合成 HDF5 + 本地 Range 服务器，全程不联网——数据集的 7.7 GiB 不该
+  # 成为「能不能跑测试」的前提。
   matr:
     runs-on: ubuntu-latest
     steps:
@@ -37,10 +37,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: 安装 numpy / h5py / pyarrow
-        run: python -m pip install -U pip numpy h5py pyarrow pytest
-      - name: 运行 matr 测试
-        run: python -m pytest tests/test_matr.py -v
+      - name: 安装 numpy / h5py / pandas / pyarrow
+        run: python -m pip install -U pip numpy h5py pandas pyarrow pytest
+      - name: 运行 matr 与特征表测试
+        run: python -m pytest tests/test_matr.py tests/test_features.py -v
       - name: 清单脚本的纯逻辑（选择与去重）不联网即可跑
         run: |
           python - <<'PY'

@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-229%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-260%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -42,12 +42,12 @@ So this repo treats the *checkers* as the deliverable, not the training loop.
 | **`src/flsoh/app/`** | Flower 1.41 client/server apps (`ClientApp` + `@app.train()` + `flwr.serverapp.strategy`) |
 | **`scripts/check_continuations.py`** | Proves that 5 batch-2 cells are continuations of 5 batch-1 cells, using four independent lines of evidence. Wrong pairing would delete healthy cells invisibly |
 | **`scripts/build_manifest.py`** | Generates `cells.txt` / `manifest.json` **from the data**, so `P-UNKNOWN` cannot pass against an invented ID list |
-| **`scripts/build_features.py`** | Builds the per-cycle ΔQ(V) feature table, and records every dropped curve in `features.spec.json` |
+| **`scripts/build_features.py`** | Builds the per-cycle ΔQ(V) feature table, **resumably** — one parquet part per cell, so an interrupted run resumes instead of restarting. Records every dropped curve in `features.spec.json` |
 | **`scripts/check_partition.py`** | Audits a partition file for cross-client leakage, test-set contamination, empty clients |
 | **`scripts/check_protocol.py`** | Audits a TOML matrix before you burn GPU-hours on it |
 | **`scripts/run_local_baseline.py`** | C0 (centralized ceiling) and C1 (local-only floor) baselines — no federated runtime needed |
 | **`configs/mvp.toml`, `configs/full.toml`** | The machine-readable experiment matrix: 135 MIT-Stanford cells, 20 held out, k ∈ {2, 5}, α scan, DP scan |
-| **`tests/`** | 229 tests. Every checker is proven to *fail* on a broken input — a checker that only ever prints PASS is worse than none |
+| **`tests/`** | 260 tests. Every checker is proven to *fail* on a broken input — a checker that only ever prints PASS is worse than none |
 
 ## Quick start
 

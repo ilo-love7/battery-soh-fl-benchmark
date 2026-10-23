@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-229%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-260%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -44,12 +44,12 @@
 | **`src/flsoh/app/`** | Flower 1.41 客户端/服务端 App（`ClientApp` + `@app.train()` + `flwr.serverapp.strategy`） |
 | **`scripts/check_continuations.py`** | 用四条独立证据证明批次 2 的 5 颗是批次 1 的延续段。配错一对就会静默删掉正常电池 |
 | **`scripts/build_manifest.py`** | **从数据**生成 `cells.txt` / `manifest.json`，让 `P-UNKNOWN` 不可能对着虚构 ID 说 PASS |
-| **`scripts/build_features.py`** | 生成 per-cycle 的 ΔQ(V) 特征表，并把每一条丢弃的曲线记进 `features.spec.json` |
+| **`scripts/build_features.py`** | 生成 per-cycle 的 ΔQ(V) 特征表，**可断点续跑**——每颗落一块 parquet 分片，中断后重跑同一条命令即可。丢弃的曲线逐条记进 `features.spec.json` |
 | **`scripts/check_partition.py`** | 对账划分文件：跨客户端泄漏、测试集污染、空客户端 |
 | **`scripts/check_protocol.py`** | 在烧掉 GPU 小时之前先校验实验矩阵 |
 | **`scripts/run_local_baseline.py`** | C0（中心化上限）与 C1（本地独立下限）基线——不需要联邦运行时 |
 | **`configs/mvp.toml`、`configs/full.toml`** | 机器可读的实验矩阵：MIT-Stanford 135 颗电池、留出 20 颗、k ∈ {2, 5}、α 扫描、DP 扫描 |
-| **`tests/`** | 229 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
+| **`tests/`** | 260 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
 
 ## 快速开始
 
@@ -141,7 +141,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
 ```bash
 python3 -m pytest tests -v        # 纯标准库，CI 里跑的就是这些
 pip install -e ".[train,dev]"     # 装 torch/flwr 后才能跑另外 112 条
-python3 -m pytest tests -v        # 全部 229 条
+python3 -m pytest tests -v        # 全部 260 条
 ```
 
 ## 许可证
