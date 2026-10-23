@@ -691,7 +691,8 @@ def main(argv: list[str] | None = None) -> int:
             eta = ""
             if finished_now > 0:
                 per_cell = elapsed / finished_now
-                eta = f"  剩余约 {len(todo) * per_cell / 60:.0f} 分钟"
+                left = total - done[0]
+                eta = f"  剩余 {left} 颗约 {left * per_cell / 60:.0f} 分钟"
             print(
                 f"  [{done[0]:>3d}/{total}] {result.cell_id:<7s} "
                 f"{n_rows:>3d} 行  {elapsed:>6.0f}s 累计{eta}"
