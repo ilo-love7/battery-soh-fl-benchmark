@@ -701,6 +701,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[batch {batch_no}] {len(batch_todo)} 颗待抽", flush=True)
         source = sources[batch_no]
         workers = max(1, args.workers)
+        # 一个 future 就是一次「打开批次」的成本（约 28 个请求，全是 HDF5
+        # 元数据导航）。块越大这笔钱摊得越薄，所以块大小按「每个 worker 一块」
+        # 取，而不是按固定颗数。真正决定中断损失的是 persist 回调——
+        # 它每颗都落盘，所以块大小只影响元数据开销，不影响断点粒度。
         size = -(-len(batch_todo) // workers)
         chunks = [batch_todo[i : i + size] for i in range(0, len(batch_todo), size)]
         with ThreadPoolExecutor(max_workers=len(chunks)) as pool:

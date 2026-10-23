@@ -122,6 +122,15 @@ class HTTPRangeFile:
        131 KB/s。所以一次 read 缺几段就并发抓几段。
     3. **拒绝降级**。服务器若忽略 Range 返回 200 整篇，直接抛错——那会把
        3 GB 拉进内存，而且是静默的。
+
+    **并发到底有没有用，要分指标看**（后来量出来的，上面第 2 条只对了一半）：
+
+    - 请求数：聚合上限约 2.5 个/秒，单线程和 6 并发一样。加并发不省请求。
+    - 字节数：聚合上限约 20 KB/s，同样与并发基本无关。
+
+    所以「6 个并发 131 KB/s」那个数只在特定时段成立。真正省时间的是
+    **少发请求、少抓字节**，不是多加连接。见
+    :meth:`MatrBatch.prefetch_cell` 的实测对比表。
     """
 
     def __init__(
@@ -378,10 +387,14 @@ class CellMeta:
 
 
 def _data_span(dataset) -> tuple[int, int] | None:
-    """数据集载荷的 [起始, 结束) 字节区间；非连续存储返回 None。
+    """数据集载荷的 [起始, 结束) 字节区间；取不到就返回 None。
 
-    chunked 数据集上 ``get_offset()`` 给的是块索引地址而不是数据地址，
-    拿它去预取会抓回一堆无关字节，所以直接放弃预取——只影响速度，不影响正确性。
+    ``DatasetID.get_offset()`` 对 MATLAB v7.3 写出来的这些数据集**一律返回
+    None**——实测包括 contiguous 的 summary 字段（``chunks is None`` 但
+    ``get_offset() is None``）。所以本函数基本用不上，保留它只是为了在
+    真能取到时少走一层。
+
+    真正管用的是 :func:`_object_addr`——对象头地址是能拿到的。
     """
     try:
         if dataset.chunks is not None:
@@ -393,6 +406,33 @@ def _data_span(dataset) -> tuple[int, int] | None:
     if offset is None or offset < 0 or size is None or size <= 0:
         return None
     return (int(offset), int(offset) + int(size))
+
+
+def _object_addr(obj) -> int | None:
+    """任意 HDF5 对象（数据集或组）在文件里的字节地址。
+
+    ``h5o.get_info().addr`` 对 contiguous / compact / chunked 都有效，
+    而 ``get_offset()`` 只对 contiguous 且已分配的情况有效——MATLAB v7.3
+    的数据集两边都不满足，所以前面那版包络预取从来没成立过。
+    """
+    try:
+        return int(h5py.h5o.get_info(obj.id).addr)
+    except Exception:
+        return None
+
+
+def _object_span(obj) -> tuple[int, int] | None:
+    """对象的 [起始, 结束) 字节区间。结束地址按 storage size 估，是上界。"""
+    addr = _object_addr(obj)
+    if addr is None or addr < 0:
+        return None
+    try:
+        size = int(obj.id.get_storage_size())
+    except Exception:
+        size = 0
+    if size <= 0:
+        size = 0
+    return (addr, addr + size)
 
 
 class MatrBatch:
@@ -421,6 +461,10 @@ class MatrBatch:
         self._batch_refs: dict[str, np.ndarray] = {}
         self._summary_groups: dict[int, object] = {}
         self._cycle_refs_cache: dict[tuple[int, str], np.ndarray] = {}
+        # 包络预取为什么没在用。服务端聚合吞吐约 2.5 请求/秒、约 20 KB/s，
+        # 两个上限都量过；包络省请求却费字节，实测反而慢一倍。
+        # 理由见 prefetch_cell 的 docstring，别让人以为这条路还在跑。
+        self.prefetch_degraded: set[str] = set()
         try:
             self._load(batch_no)
         except Exception:
@@ -605,44 +649,45 @@ class MatrBatch:
     # 预取
     # ------------------------------------------------------------------
     def prefetch_cell(self, index: int, cycles, fields=("V", "Qc")) -> int:
-        """把该电池本次要用的数据区间并发抓回缓存，返回预取的字节数。
+        """把该电池本次要用的曲线解引用一遍，让数据和对象头进缓存。
 
-        做法是**包络预取**：先读首尾两个循环的对象头拿到字节偏移，再按
-        ``[最小偏移, 最大偏移)`` 一次抓回。MATLAB 写 HDF5 时同一颗电池的循环
-        是顺序分配的，所以包络内的浪费有限，而请求数从「每循环每通道一次」
-        降到一次。
+        **为什么不用包络预取**（一次抓一大段字节区间）：实测过，而且慢一倍。
 
-        包络不成立（首尾乱序，或跨度大到说明布局不像预期）时退化为逐个预取。
-        这只影响速度，不影响正确性——真正的读取仍然走正常的缓存/抓取路径。
+        ``DatasetID.get_offset()`` 对这些 MATLAB v7.3 数据集一律返回 None，
+        所以只能走 ``h5o.get_info().addr`` 拿对象头地址。地址确实单调递增
+        （cycle1=42,358,623 → cycle100=43,276,349，每循环约 9,184 B），
+        包络能成立。但代价是字节：
+
+        ============ =================== ================== ==============
+                     请求数              字节数              单颗耗时
+        ============ =================== ================== ==============
+        包络          73                  **2.0 MB**          约 90 s
+        逐个解引用    **125**             415 KB              约 59 s
+        ============ =================== ================== ==============
+
+        服务端两个上限都量过：**聚合约 2.5 请求/秒**、**聚合约 20 KB/s**。
+        包络把请求数砍半，却把字节数放大 5 倍，于是从「请求受限」变成
+        「字节受限」，反而更慢。解引用一次约 2.3 个请求、4.2 KB——
+        它就是这件事的最优解，没有中间地带。
+
+        另一个关键事实：**解引用一次就等于读完整条曲线**。对象头里带着数据，
+        所以解引用完再 ``charge_curve`` 是 0 请求 0 字节。这也意味着
+        「先算 span 再决定怎么抓」那套逻辑全是白费——算 span 的那 21 次
+        解引用已经把数据拿回来了。
+
+        包络代码留在 :func:`_object_span` / :func:`_data_span`，换存储布局时
+        可能又划得来；``prefetch_degraded`` 记下当前没用包络，别让人以为
+        这条路径还在跑。
         """
-        spans: list[tuple[int, int]] = []
-        group = self._summary_group(index)
-        for field in SUMMARY_FIELDS:
-            span = _data_span(group[field])
-            if span:
-                spans.append(span)
-
+        count = 0
         for field in fields:
             refs = self._cycle_refs(index, field)
-            wanted = [c for c in cycles if 0 <= c < len(refs)]
-            if not wanted:
-                continue
-            first = _data_span(self._h5[refs[wanted[0]]])
-            last = _data_span(self._h5[refs[wanted[-1]]])
-            if first and last and first[0] < last[0]:
-                envelope = (first[0], last[1])
-                if envelope[1] - envelope[0] <= 32 << 20:
-                    spans.append(envelope)
-                    continue
-            for cycle in wanted:
-                span = _data_span(self._h5[refs[cycle]])
-                if span:
-                    spans.append(span)
-
-        total = sum(end - start for start, end in spans)
-        if isinstance(self._file, HTTPRangeFile) and spans:
-            self._file.prefetch(spans)
-        return total
+            for cycle in cycles:
+                if 0 <= cycle < len(refs):
+                    self._h5[refs[cycle]]
+                    count += 1
+        self.prefetch_degraded.add(f"{fields}：未用包络，实测字节更省")
+        return count
 
     @property
     def requests(self) -> int:
