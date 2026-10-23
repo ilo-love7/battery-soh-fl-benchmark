@@ -29,6 +29,7 @@
 | 17 | 特征从「每颗电池一行 ΔQ₁₀₀₋₁₀」改为 **per-cycle 行** | 按电池划分后每客户端只有 5 颗电池。每颗一行则本地只有 5 个样本，联邦训练不成立。per-cycle 让每客户端约 100 行，H1–H3 才有统计意义 |
 | 18 | 新增 **`matr.py`** 与 `build_manifest.py` / `build_features.py` / `check_continuations.py` | 三个 .mat 合计 7.7 GiB，而需要的字节不到 0.1%。整篇下载不可行（单连接实测 17 KB/s），所以按 HDF5 区间随机读；清单必须由数据生成，否则 `P-UNKNOWN` 会对着虚构 ID 说 PASS |
 | 20 | `build_features.py` 改为**按颗落分片、可断点续跑** | 135 颗 × 21 循环 × 2 曲线，每次远端往返 1.4 s 到几十秒，这个命令不可能一次跑完；中断一次全部作废，而重来还是跑不完。三处不能省：分片原子落盘（半块 parquet 恰好还能打开，比没有更危险）、规格指纹不匹配就拒绝续跑（换了网格后新旧行的同一列不是同一个物理量，而拼出来的表不报异常）、写完读回来验（cell_id / 行数 / 列数对不上就删掉重抽） |
+| 21 | 纯特征数学拆出 **`flsoh/features.py`**，`data.py` 改为 re-export | `delta_q_features` / `make_v_grid` / `validate_feature_table` 一行 torch 代码都没有，却被 `data.py` 模块层的 `import torch` 挡在 CI 门外——`build_features.py` 要在不装 torch 的 job 里生成特征表，于是红了一次。**能被便宜测试覆盖的代码，不要被昂贵的依赖挡住** |
 | 19 | 延续关系的**证据换了一套**：`channel_id` 被证伪，改用 policy 后缀 + 段长 + 交界容量；N=20 → **23**，总流量 2.03 → **2.34 GiB** | 最初拿 `channel_id` 验证，5 对全 FAIL。查下去发现它根本不是身份字段（第 5 位是批次内行号，b1c0 是 47、b2c7 是 56），`barcode` 更糟——140 颗全是同一个常数 3707764736。真正的指纹是 `policy_readable`：延续段存的是原段的后缀（`80%)-3.6C` ← `3.6C(80%)-3.6C`），配合 add_len 段长与交界容量，四条证据全过。颗数确认 135，N 随之为 23 |
 
 ---
@@ -151,6 +152,7 @@ battery-soh-fl-benchmark/
 │   ├── partition.py          # 电池级划分 + 泄漏检测（纯标准库，可单测）
 │   ├── protocol.py           # 配置校验（纯标准库，可单测）
 │   ├── matr.py               # MATR .mat 的远端随机读与解析（需 h5py，进 CI）
+│   ├── features.py           # ΔQ(V) 特征与特征表契约（只依赖 numpy/pandas，进 CI）
 │   ├── data.py               # 特征表 + 本地标准化 + DataLoader（需 torch/pandas）
 │   ├── model.py              # MLP 定义
 │   └── app/                  # Flower App（需 flwr，不在 CI 里跑）
@@ -166,7 +168,9 @@ battery-soh-fl-benchmark/
 └── docs/
 ```
 
-**分层原则**：`partition.py` 与 `protocol.py` 不依赖 torch/flwr，因此可以在任何机器上跑、可以进 CI。这两个模块承载的是**最容易出错且最贵的逻辑**（划分泄漏、协议缺项），值得脱离深度学习栈单独测试。`matr.py` 只依赖 numpy + h5py，测试用合成 HDF5 与本地 Range 服务器，因此也能进 CI——数据集的 7.7 GiB 不该成为「能不能跑测试」的前提。训练代码依赖重，不进 CI。
+**分层原则**：`partition.py` 与 `protocol.py` 不依赖 torch/flwr，因此可以在任何机器上跑、可以进 CI。这两个模块承载的是**最容易出错且最贵的逻辑**（划分泄漏、协议缺项），值得脱离深度学习栈单独测试。`matr.py` 只依赖 numpy + h5py，测试用合成 HDF5 与本地 Range 服务器，因此也能进 CI——数据集的 7.7 GiB 不该成为「能不能跑测试」的前提。
+
+`features.py` 是同一原则的第二次应用：`delta_q_features` / `make_v_grid` / `validate_feature_table` 一行 torch 代码都没有，却被 `data.py` 模块层的 `import torch` 挡在 CI 门外——`build_features.py` 要在不装 torch 的 job 里生成特征表，于是红了一次。拆开后 `data.py` 从 `features.py` re-export，`from flsoh.data import CELL_COL` 照旧能用。**能被便宜测试覆盖的代码，不要被昂贵的依赖挡住。** 训练代码依赖重，不进 CI。
 
 ### 3.2 模块契约
 
@@ -175,6 +179,7 @@ battery-soh-fl-benchmark/
 | `partition.py` | 电池 ID 列表、每客户端电池数、划分方案、seed | `{client_id: [cell_id, ...]}` | 不许碰特征、不许读原始数据、不许依赖 pandas |
 | `protocol.py` | 一份 TOML 配置 | `[(level, code, message)]` | 不许改配置、不许猜默认值 |
 | `data.py` | 电池 ID、本地训练/验证电池集合 | 该客户端的 `DataLoader` 对 | **不许做全局标准化**（见 §14 坑 1） |
+| `features.py` | (V, Q) 曲线序列 + 电压网格 | `ΔQ(V)` 特征矩阵；特征表契约校验 | 不许 import torch、不许外延电压网格 |
 | `model.py` | 输入维度 | `nn.Module` | 不许内置任何与数据相关的常量 |
 | `app/client_app.py` | 一轮的 `Message` | 参数 + 指标 | 不许把原始数据写进 `Message` |
 

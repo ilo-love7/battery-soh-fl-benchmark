@@ -37,7 +37,8 @@ from build_features import (  # noqa: E402
     write_cell_part,
 )
 from build_manifest import resolve_source  # noqa: E402
-from flsoh.data import CELL_COL, CYCLE_COL, SOH_COL, make_v_grid  # noqa: E402
+# 同样从 flsoh.features 导入：flsoh.data 在模块层 import torch。
+from flsoh.features import CELL_COL, CYCLE_COL, SOH_COL, make_v_grid  # noqa: E402
 from flsoh.matr import MatrBatch  # noqa: E402
 
 from test_matr import write_fake_matr  # noqa: E402

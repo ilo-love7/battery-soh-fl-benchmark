@@ -77,7 +77,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from flsoh.data import (  # noqa: E402
+# 刻意从 flsoh.features 而不是 flsoh.data 导入：后者在模块层 import torch，
+# 而本脚本要能在没装 torch 的 CI job 里跑。纯特征数学归 features。
+from flsoh.features import (  # noqa: E402
     CELL_COL,
     CYCLE_COL,
     SOH_COL,
