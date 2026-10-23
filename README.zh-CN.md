@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-272%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-274%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -49,7 +49,7 @@
 | **`scripts/check_protocol.py`** | 在烧掉 GPU 小时之前先校验实验矩阵 |
 | **`scripts/run_local_baseline.py`** | C0（中心化上限）与 C1（本地独立下限）基线——不需要联邦运行时 |
 | **`configs/mvp.toml`、`configs/full.toml`** | 机器可读的实验矩阵：MIT-Stanford 135 颗电池、留出 20 颗、k ∈ {2, 5}、α 扫描、DP 扫描 |
-| **`tests/`** | 272 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
+| **`tests/`** | 274 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
 
 ## 快速开始
 
@@ -141,7 +141,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
 ```bash
 python3 -m pytest tests -v        # 纯标准库，CI 里跑的就是这些
 pip install -e ".[train,dev]"     # 装 torch/flwr 后才能跑另外 112 条
-python3 -m pytest tests -v        # 全部 272 条
+python3 -m pytest tests -v        # 全部 274 条
 ```
 
 ## 许可证

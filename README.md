@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-272%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-274%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -47,7 +47,7 @@ So this repo treats the *checkers* as the deliverable, not the training loop.
 | **`scripts/check_protocol.py`** | Audits a TOML matrix before you burn GPU-hours on it |
 | **`scripts/run_local_baseline.py`** | C0 (centralized ceiling) and C1 (local-only floor) baselines — no federated runtime needed |
 | **`configs/mvp.toml`, `configs/full.toml`** | The machine-readable experiment matrix: 135 MIT-Stanford cells, 20 held out, k ∈ {2, 5}, α scan, DP scan |
-| **`tests/`** | 272 tests. Every checker is proven to *fail* on a broken input — a checker that only ever prints PASS is worse than none |
+| **`tests/`** | 274 tests. Every checker is proven to *fail* on a broken input — a checker that only ever prints PASS is worse than none |
 
 ## Quick start
 

@@ -293,3 +293,76 @@ class TestMatrTransportErrorHierarchy:
     def test_can_be_caught_as_matrerror(self):
         with pytest.raises(MatrError):
             raise MatrTransportError("区间抓取失败：gaierror")
+
+
+class TestPartsAreWrittenPerCell:
+    """分片必须**逐颗**落盘，不能等整块跑完。
+
+    这一轮要跑一小时，而中断随时会来。主循环原本等 ``future.result()``
+    返回才写分片，于是一次中断白丢一整块（默认 8 颗 × 约 60 s）。
+    改成 worker 每抽完一颗就回调 ``persist`` 之后，这条路径本身要被钉住——
+    它和「写分片」是两段代码，中间那段没被执行过的话，第一次真跑就会炸。
+    """
+
+    @staticmethod
+    def _fake_source(tmp_path, n_cells=4):
+        raw = tmp_path / "raw"
+        raw.mkdir()
+        path = raw / "2017-05-12_batchdata_updated_struct_errorcorrect.mat"
+        write_fake_matr(path, n_cells=n_cells, n_cycles=8)
+        return str(path)
+
+    def test_on_result_fires_once_per_cell(self, tmp_path):
+        from build_features import _extract_chunk
+        from flsoh.features import make_v_grid
+
+        source = self._fake_source(tmp_path)
+        metas = [{"cell_id": f"b1c{i}", "index": i} for i in range(4)]
+        seen: list[str] = []
+
+        results, error = _extract_chunk(
+            source,
+            1,
+            metas,
+            cycles=[1, 3],
+            ref_cycle=1,
+            grid=make_v_grid(3.0, 3.5, 16),
+            on_result=lambda r: seen.append(r.cell_id),
+        )
+        assert error is None
+        assert seen == ["b1c0", "b1c1", "b1c2", "b1c3"], seen
+        assert [r.cell_id for r in results] == seen
+
+    def test_on_result_fires_before_transport_error(self, tmp_path, monkeypatch):
+        """断网那一刻，前面已抽到的颗也必须已经交出去了。"""
+
+        from build_features import _extract_chunk
+        from flsoh.features import make_v_grid
+        from flsoh.matr import MatrTransportError
+
+        source = self._fake_source(tmp_path)
+        metas = [{"cell_id": f"b1c{i}", "index": i} for i in range(3)]
+        seen: list[str] = []
+
+        real_extract_one = _extract_chunk.__globals__["_extract_one"]
+        calls = {"n": 0}
+
+        def flaky(batch, meta, **kwargs):
+            calls["n"] += 1
+            if calls["n"] > 2:
+                raise MatrTransportError("区间抓取失败：gaierror")
+            return real_extract_one(batch, meta, **kwargs)
+
+        monkeypatch.setattr("build_features._extract_one", flaky)
+        results, error = _extract_chunk(
+            source,
+            1,
+            metas,
+            cycles=[1, 3],
+            ref_cycle=1,
+            grid=make_v_grid(3.0, 3.5, 16),
+            on_result=lambda r: seen.append(r.cell_id),
+        )
+        assert isinstance(error, MatrTransportError)
+        assert seen == ["b1c0", "b1c1"], "失败前抽到的两颗必须已经交出去"
+        assert [r.cell_id for r in results] == seen

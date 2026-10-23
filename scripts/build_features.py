@@ -388,26 +388,32 @@ def _extract_chunk(
     cycles: list[int],
     ref_cycle: int,
     grid: np.ndarray,
+    on_result=None,
 ) -> tuple[list[CellResult], MatrTransportError | None]:
     """一个 worker 抽一小批电池，**自己开 h5py 句柄**。
 
     h5py 不是线程安全的，共用句柄并发读会静默错位，而错位后的指标完全正常。
     所以宁可每个 worker 多付一次 HDF5 元数据的往返，也不共用句柄。
 
-    返回 ``(已抽到的结果, 传输错误或 None)``。传输错误不往上抛是为了**不丢
-    已抽到的那几颗**——分片是按颗落的，抛异常会把同一块里前面几颗的成果一起
-    吞掉。所以先把成果带回去让调用方落盘，再让它决定中止。
+    ``on_result`` 每抽完一颗就调一次。**这不是便利设施而是必需的**：
+    分片必须在抽到的瞬间落盘。若等整块（默认 8 颗）跑完再写，
+    中断一次就丢掉 8 颗 × 约 60 s 的成果，而这一轮本来就要跑一小时。
+
+    返回 ``(已抽到的结果, 传输错误或 None)``。传输错误不往上抛同样是为了
+    **不丢已抽到的那几颗**——先把成果通过 ``on_result`` 交出去落盘，
+    再让调用方决定中止。
     """
     results: list[CellResult] = []
     error: MatrTransportError | None = None
     try:
         with MatrBatch(source, batch_no=batch_no) as batch:
             for meta in metas:
-                results.append(
-                    _extract_one(
-                        batch, meta, cycles=cycles, ref_cycle=ref_cycle, grid=grid
-                    )
+                result = _extract_one(
+                    batch, meta, cycles=cycles, ref_cycle=ref_cycle, grid=grid
                 )
+                results.append(result)
+                if on_result is not None:
+                    on_result(result)
     except MatrTransportError as exc:
         error = exc
     return results, error
@@ -636,19 +642,57 @@ def main(argv: list[str] | None = None) -> int:
     lock = threading.Lock()
     done = [total - len(todo)]
     started = time.time()
-
-    def report(results: list[CellResult], rows: list[int], seconds: float) -> None:
-        with lock:
-            for result, n_rows in zip(results, rows):
-                done[0] += 1
-                print(
-                    f"  [{done[0]:>3d}/{total}] {result.cell_id:<7s} "
-                    f"{n_rows:>3d} 行  {seconds:>6.1f}s"
-                    + (f"  丢弃 {len(result.drops)}" if result.drops else ""),
-                    flush=True,
-                )
-
     all_drops: list[dict] = []
+
+    def persist(result: CellResult) -> None:
+        """把一颗的结果落盘并打印。worker 线程每抽完一颗就调这个。
+
+        **必须在 worker 里调用，不能等整块跑完**。这一轮要跑一小时，
+        而中断（网络、Ctrl-C、机器休眠）随时会来；等整块 8 颗跑完再落盘，
+        等于每次中断都白丢 8 × 60 s。
+        """
+        with lock:
+            frame = cell_frame(result, args.points)
+            if frame is None:
+                # 一颗都没抽到时也留痕：没有分片 ≠ 没跑过，
+                # 否则下次还会再跑一遍这颗，永远看不到它失败在哪。
+                # 走到这里说明 drops 里全是数据问题——传输错误在
+                # _extract_chunk 就被拦下，不会生成 .empty。
+                (parts / f"{result.cell_id}.empty").write_text(
+                    json.dumps(result.drops, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                n_rows = 0
+            else:
+                path = write_cell_part(parts, result.cell_id, frame)
+                back = read_cell_part(
+                    path,
+                    cell_id=result.cell_id,
+                    n_points=args.points,
+                    n_cycles=len(cycles),
+                )
+                if back is None:
+                    path.unlink(missing_ok=True)
+                    raise SystemExit(
+                        f"{result.cell_id} 的分片写坏并已删除，请重跑这一颗"
+                    )
+                n_rows = len(frame)
+            all_drops.extend(
+                {"cell_id": result.cell_id, **drop} for drop in result.drops
+            )
+            done[0] += 1
+            elapsed = time.time() - started
+            finished_now = done[0] - (total - len(todo))
+            eta = ""
+            if finished_now > 0:
+                per_cell = elapsed / finished_now
+                eta = f"  剩余约 {len(todo) * per_cell / 60:.0f} 分钟"
+            print(
+                f"  [{done[0]:>3d}/{total}] {result.cell_id:<7s} "
+                f"{n_rows:>3d} 行  {elapsed:>6.0f}s 累计{eta}"
+                + (f"  丢弃 {len(result.drops)}" if result.drops else ""),
+                flush=True,
+            )
     for entry in entries:
         batch_no = int(entry["batch_no"])
         batch_todo = [meta for ent, meta in todo if ent is entry]
@@ -669,45 +713,13 @@ def main(argv: list[str] | None = None) -> int:
                     cycles=cycles,
                     ref_cycle=args.ref_cycle,
                     grid=grid,
+                    on_result=persist,
                 ): chunk
                 for chunk in chunks
             }
             pending: list[MatrTransportError] = []
             for future in as_completed(futures):
-                t0 = time.time()
-                chunk_results, transport_error = future.result()
-                rows: list[int] = []
-                for result in chunk_results:
-                    frame = cell_frame(result, args.points)
-                    if frame is None:
-                        # 一颗都没抽到时也留痕：没有分片 ≠ 没跑过，
-                        # 否则下次还会再跑一遍这颗，永远看不到它失败在哪。
-                        # 走到这里说明 drops 里全是数据问题——传输错误在
-                        # _extract_chunk 就被拦下，不会生成 .empty。
-                        (parts / f"{result.cell_id}.empty").write_text(
-                            json.dumps(result.drops, ensure_ascii=False, indent=2)
-                            + "\n",
-                            encoding="utf-8",
-                        )
-                        rows.append(0)
-                    else:
-                        path = write_cell_part(parts, result.cell_id, frame)
-                        back = read_cell_part(
-                            path,
-                            cell_id=result.cell_id,
-                            n_points=args.points,
-                            n_cycles=len(cycles),
-                        )
-                        if back is None:
-                            path.unlink(missing_ok=True)
-                            raise SystemExit(
-                                f"{result.cell_id} 的分片写坏并已删除，请重跑这一颗"
-                            )
-                        rows.append(len(frame))
-                    all_drops.extend(
-                        {"cell_id": result.cell_id, **drop} for drop in result.drops
-                    )
-                report(chunk_results, rows, time.time() - t0)
+                _, transport_error = future.result()
                 if transport_error is not None:
                     pending.append(transport_error)
 
