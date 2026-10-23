@@ -79,6 +79,24 @@ class MatrError(RuntimeError):
     """数据源、结构或契约不满足时抛出。不静默降级。"""
 
 
+class MatrTransportError(MatrError):
+    """**网络或远端出了问题**，与数据本身无关。
+
+    单独一类是因为这两种失败的处置完全相反：
+
+    - 数据问题（曲线不存在、循环越界、容量非正）→ 记进 ``dropped``，
+      这颗电池算跑完，特征表里少几行，spec 里有据可查。
+    - 传输问题（DNS 失败、连接重置、HTTP 5xx、服务器忽略 Range）→
+      **不是数据缺失**。把它记进 ``dropped`` 等于把一次网络抖动
+      写成一条数据缺陷：spec 里会躺着几十条「参考曲线读不出」，
+      读起来就是"这些电池没有数据"。若这一轮没崩，命令正常退出、
+      表正常写出，下游拿到一张少三分之一样本的表，唯一的告警是
+      一段被误分类的丢弃原因。
+
+    所以传输错误必须往上抛，让这一轮大声失败，重跑同一条命令即可。
+    """
+
+
 def _decode_text(arr) -> str:
     """MATLAB 的 char 数组在 HDF5 里是 uint16：ASCII 占一个字节、隔一个 \\x00。"""
     a = np.asarray(arr)
@@ -179,18 +197,20 @@ class HTTPRangeFile:
                         self.bytes_fetched += len(body)
                     return body
                 if resp.status == 200:
-                    raise MatrError(
+                    raise MatrTransportError(
                         "服务器忽略 Range 返回整篇；拒绝把整个文件拉进内存"
                     )
                 reason = f"HTTP {resp.status}"
                 self._reset()
+            except MatrTransportError:
+                raise
             except MatrError:
                 raise
             except (http.client.HTTPException, OSError) as exc:
                 reason = f"{type(exc).__name__}: {exc}"
                 self._reset()
             time.sleep(self._retry_delay * (attempt + 1))
-        raise MatrError(f"区间抓取失败 [{start}, {end})：{reason}")
+        raise MatrTransportError(f"区间抓取失败 [{start}, {end})：{reason}")
 
     def _probe_size(self) -> int:
         for attempt in range(6):
@@ -206,7 +226,7 @@ class HTTPRangeFile:
             except (http.client.HTTPException, OSError):
                 self._reset()
             time.sleep(self._retry_delay * (attempt + 1))
-        raise MatrError("无法从 Content-Range 得知远端文件大小")
+        raise MatrTransportError("无法从 Content-Range 得知远端文件大小")
 
     # ------------------------------------------------------------------
     # 缓存

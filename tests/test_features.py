@@ -444,3 +444,4 @@ class TestResumeEndToEnd:
 
         assert main(self._args(tmp_path, manifest, raw, out)) == 0
         assert len(pd.read_parquet(out)) == 12, "重新抽一遍，结果必须一样"
+

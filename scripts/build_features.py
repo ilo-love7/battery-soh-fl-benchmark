@@ -88,7 +88,7 @@ from flsoh.features import (  # noqa: E402
     make_v_grid,
     validate_feature_table,
 )
-from flsoh.matr import MatrBatch, MatrError  # noqa: E402
+from flsoh.matr import MatrBatch, MatrError, MatrTransportError  # noqa: E402
 
 DEFAULT_CYCLES = "5:100:5"
 DEFAULT_V_LO = 2.0
@@ -98,6 +98,27 @@ DEFAULT_REF_CYCLE = 1
 DEFAULT_WORKERS = 4
 
 STATE_NAME = "state.json"
+
+# 传输失败的指纹。这些词只会出现在网络错误里，不会出现在数据问题的描述里
+# （数据问题说的是「越界」「非正」「覆盖不住」）。用来识别旧版本写坏的
+# .empty 标记——它们把一次 DNS 失败写成了「这颗电池没有数据」。
+_TRANSPORT_MARKERS = (
+    "gaierror",
+    "getaddrinfo",
+    "ConnectionReset",
+    "ConnectionRefused",
+    "RemoteDisconnected",
+    " timed out",
+    "timeout",
+    "HTTP 5",
+    "区间抓取失败",
+    "Content-Range",
+)
+
+
+def _looks_like_transport(reason: str) -> bool:
+    """这条丢弃原因其实是网络问题，不是数据问题。"""
+    return any(marker in reason for marker in _TRANSPORT_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -272,10 +293,18 @@ def extract_cell(
     ref_cycle: int,
     grid: np.ndarray,
 ) -> CellResult:
-    """抽一颗电池的所有行。读不出/覆盖不住的循环记进 ``drops``，不抛异常。"""
+    """抽一颗电池的所有行。
+
+    只有**数据本身的问题**才记进 ``drops``（循环越界、容量非正、曲线覆盖不住
+    电压窗口）。传输错误往上抛——它不是数据缺失，记进 drops 等于把一次网络
+    抖动写成一条数据缺陷：spec 里会躺着几十条「参考曲线读不出」，
+    读起来就是"这些电池没有数据"。
+    """
     result = CellResult(cell_id=cell_id)
     try:
         summary = batch.summary(index, fields=("QDischarge", "cycle"))
+    except MatrTransportError:
+        raise
     except MatrError as exc:
         result.drops.append({"cycle": None, "reason": f"summary 读不出：{exc}"})
         return result
@@ -296,6 +325,8 @@ def extract_cell(
 
     try:
         v_ref, c_ref = batch.charge_curve(index, ref_cycle)
+    except MatrTransportError:
+        raise
     except MatrError as exc:
         result.drops.append({"cycle": None, "reason": f"参考曲线读不出：{exc}"})
         return result
@@ -311,6 +342,8 @@ def extract_cell(
             feature = delta_q_features(
                 [(v_ref, c_ref), (voltage, capacity)], grid, reference_index=0
             )[0]
+        except MatrTransportError:
+            raise
         except (DataContractError, MatrError) as exc:
             result.drops.append({"cycle": cycle, "reason": str(exc)})
             continue
@@ -333,6 +366,8 @@ def _extract_one(
     # 不预取的话每条曲线两次往返，20 条就是 40 次。
     try:
         batch.prefetch_cell(index, [ref_cycle, *cycles])
+    except MatrTransportError:
+        raise  # 预取阶段的网络失败同样不是数据问题，不能吞
     except MatrError:
         pass  # 预取失败不影响正确性，退化为逐条读
     return extract_cell(
@@ -353,17 +388,29 @@ def _extract_chunk(
     cycles: list[int],
     ref_cycle: int,
     grid: np.ndarray,
-) -> list[CellResult]:
+) -> tuple[list[CellResult], MatrTransportError | None]:
     """一个 worker 抽一小批电池，**自己开 h5py 句柄**。
 
     h5py 不是线程安全的，共用句柄并发读会静默错位，而错位后的指标完全正常。
     所以宁可每个 worker 多付一次 HDF5 元数据的往返，也不共用句柄。
+
+    返回 ``(已抽到的结果, 传输错误或 None)``。传输错误不往上抛是为了**不丢
+    已抽到的那几颗**——分片是按颗落的，抛异常会把同一块里前面几颗的成果一起
+    吞掉。所以先把成果带回去让调用方落盘，再让它决定中止。
     """
-    with MatrBatch(source, batch_no=batch_no) as batch:
-        return [
-            _extract_one(batch, meta, cycles=cycles, ref_cycle=ref_cycle, grid=grid)
-            for meta in metas
-        ]
+    results: list[CellResult] = []
+    error: MatrTransportError | None = None
+    try:
+        with MatrBatch(source, batch_no=batch_no) as batch:
+            for meta in metas:
+                results.append(
+                    _extract_one(
+                        batch, meta, cycles=cycles, ref_cycle=ref_cycle, grid=grid
+                    )
+                )
+    except MatrTransportError as exc:
+        error = exc
+    return results, error
 
 
 def extract_batch(
@@ -382,6 +429,9 @@ def extract_batch(
     ``todo`` 给了就只抽这些（续跑时用），否则抽 ``entry['cells']``。
     ``workers`` 是**批次内**的并发句柄数——之前并发只发生在批次之间，
     而批次只有 3 个，等于大部分时间在串行等往返。
+
+    传输错误在这里**往上抛**：本函数是给测试和一次性调用用的，
+    它们没有分片目录可以续跑，所以必须让失败可见。
     """
     metas = list(entry["cells"] if todo is None else todo)
     if limit is not None:
@@ -390,7 +440,7 @@ def extract_batch(
         return []
     workers = max(1, min(int(workers), len(metas)))
     if workers == 1:
-        return _extract_chunk(
+        results, error = _extract_chunk(
             source,
             int(entry["batch_no"]),
             metas,
@@ -398,6 +448,9 @@ def extract_batch(
             ref_cycle=ref_cycle,
             grid=grid,
         )
+        if error is not None:
+            raise error
+        return results
     size = -(-len(metas) // workers)
     chunks = [metas[i : i + size] for i in range(0, len(metas), size)]
     with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
@@ -414,8 +467,14 @@ def extract_batch(
             for chunk in chunks
         ]
         out: list[CellResult] = []
+        errors: list[MatrTransportError] = []
         for future in futures:
-            out.extend(future.result())
+            results, error = future.result()
+            out.extend(results)
+            if error is not None:
+                errors.append(error)
+        if errors:
+            raise errors[0]
     return out
 
 
@@ -445,6 +504,53 @@ def summarise_drops(records: list[dict]) -> dict:
         key = reason.split("（")[0][:60]
         counts[key] = counts.get(key, 0) + 1
     return {"by_reason": counts, "per_cell": per_cell}
+
+
+def cell_is_done(parts: Path, cell_id: str) -> bool:
+    """这颗算跑完了吗？
+
+    只有 ``.parquet`` 和**真数据问题**的 ``.empty`` 算跑完。传输失败留下的
+    ``.empty`` 不算——那是旧版本把网络抖动写成了数据缺失，必须重抽。
+
+    为什么不干脆让所有 ``.empty`` 都算跑完：那正是最初那次真实故障的形态。
+    DNS 抽了一次，46 颗全落下 ``.empty``，若它算"跑完"，这颗就永远跳过，
+    特征表少掉三分之一。所以默认必须是"没跑完"，只有证据表明是数据问题时
+    才敢跳过。
+    """
+    if (parts / f"{cell_id}.parquet").is_file():
+        return True
+    empty = parts / f"{cell_id}.empty"
+    if not empty.is_file():
+        return False
+    try:
+        saved = json.loads(empty.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False  # 读不出来的标记不信任，重抽
+    return bool(saved) and not any(
+        _looks_like_transport(record.get("reason", "")) for record in saved
+    )
+
+
+def heal_stale_empty(parts: Path, cells: list[dict]) -> list[str]:
+    """删掉传输失败留下的 ``.empty``，返回被自愈的 cell_id 列表。
+
+    旧版本（``MatrError`` 还没分类时）会把 ``getaddrinfo failed`` 记成
+    「参考曲线读不出」，于是 spec 的 ``dropped`` 里躺着 46 条假的数据缺失。
+    标记删掉之后，这些电池重新排队，审计也恢复诚实。
+    """
+    healed: list[str] = []
+    for meta in cells:
+        empty = parts / f"{meta['cell_id']}.empty"
+        if not empty.is_file():
+            continue
+        try:
+            saved = json.loads(empty.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if any(_looks_like_transport(record.get("reason", "")) for record in saved):
+            empty.unlink()
+            healed.append(str(meta["cell_id"]))
+    return healed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -505,7 +611,7 @@ def main(argv: list[str] | None = None) -> int:
         (entry, meta)
         for entry in entries
         for meta in entry["cells"][: args.limit_cells if args.limit_cells else None]
-        if not (parts / f"{meta['cell_id']}.parquet").is_file()
+        if not cell_is_done(parts, str(meta["cell_id"]))
     ]
     total = sum(
         len(entry["cells"][: args.limit_cells if args.limit_cells else None])
@@ -521,6 +627,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"待抽 {len(todo)} 颗，已有 {total - len(todo)} 颗分片", flush=True)
     else:
         print(f"{total} 颗全部有分片，直接拼接", flush=True)
+
+    # 传输失败留下的 .empty 在这里删掉：它们不该出现在审计里，
+    # 而且删晚了会让「已跑完」的计数对不上。
+    for cell_id in heal_stale_empty(parts, [m for _, m in todo]):
+        print(f"  {cell_id} 的 .empty 是网络失败留下的，已删除并重新排队", flush=True)
 
     lock = threading.Lock()
     done = [total - len(todo)]
@@ -561,15 +672,18 @@ def main(argv: list[str] | None = None) -> int:
                 ): chunk
                 for chunk in chunks
             }
+            pending: list[MatrTransportError] = []
             for future in as_completed(futures):
                 t0 = time.time()
-                chunk_results = future.result()
+                chunk_results, transport_error = future.result()
                 rows: list[int] = []
                 for result in chunk_results:
                     frame = cell_frame(result, args.points)
                     if frame is None:
                         # 一颗都没抽到时也留痕：没有分片 ≠ 没跑过，
                         # 否则下次还会再跑一遍这颗，永远看不到它失败在哪。
+                        # 走到这里说明 drops 里全是数据问题——传输错误在
+                        # _extract_chunk 就被拦下，不会生成 .empty。
                         (parts / f"{result.cell_id}.empty").write_text(
                             json.dumps(result.drops, ensure_ascii=False, indent=2)
                             + "\n",
@@ -594,17 +708,36 @@ def main(argv: list[str] | None = None) -> int:
                         {"cell_id": result.cell_id, **drop} for drop in result.drops
                     )
                 report(chunk_results, rows, time.time() - t0)
+                if transport_error is not None:
+                    pending.append(transport_error)
 
-    # 这一轮之前跑掉的那些，也要把丢弃记录补进来。
+            if pending:
+                # 传输失败不是数据缺失。这里必须中止而不是"记一笔继续跑"——
+                # 继续跑会得到一张看着完整、实际少了几十颗的表，
+                # 而少样本在精度曲线上完全看不出来。
+                done_now = len(list(parts.glob("*.parquet"))) + len(
+                    list(parts.glob("*.empty"))
+                )
+                print(flush=True)
+                print(f"网络失败，本轮中止：{pending[0]}", flush=True)
+                print(
+                    f"已落盘 {done_now} 颗。重跑**同一条命令**即可续跑，"
+                    "已有的分片会跳过。",
+                    flush=True,
+                )
+                return 1
+
+    # 把往届的丢弃记录补进来（真数据问题的那些 .empty）。
     for entry in entries:
         for meta in entry["cells"][: args.limit_cells if args.limit_cells else None]:
             empty = parts / f"{meta['cell_id']}.empty"
-            if empty.is_file():
-                try:
-                    for drop in json.loads(empty.read_text(encoding="utf-8")):
-                        all_drops.append({"cell_id": str(meta["cell_id"]), **drop})
-                except (OSError, json.JSONDecodeError):
-                    pass
+            if not empty.is_file():
+                continue
+            try:
+                saved = json.loads(empty.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            all_drops.extend({"cell_id": str(meta["cell_id"]), **d} for d in saved)
 
     part_files = sorted(parts.glob("*.parquet"))
     if not part_files:
