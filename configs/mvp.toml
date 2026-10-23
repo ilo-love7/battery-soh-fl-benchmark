@@ -12,15 +12,20 @@ description = "FedAvg/FedProx × IID/Non-IID，3 seeds，出轮数-精度曲线�
 
 [data]
 dataset = "mit-stanford"
-n_cells = 124
+# 实测值，不是论文口径。三个原始文件共 140 颗（46 + 48 + 46），其中批次 2 有
+# 5 颗是批次 1 的延续（同一物理通道，channel_id 逐位相同，见
+# scripts/check_continuations.py），去重后 135 颗。
+# 论文的 124 是另一件事：它为「预测 cycle life」剔掉了没跑到 80% 容量的电池；
+# 本项目的标签是逐循环 SOH，那些电池在循环 5–100 区间内是正常数据。
+n_cells = 135
 # 划分原子必须是 "cell"。改成 cycle 会让同一颗电池的相邻循环跨客户端，
 # 时间序列截断使泛化虚高（§6.2 规则 1）。check_protocol.py 会直接拒。
 partition_atom = "cell"
 
 [partitions]
 # 全局测试集按"整颗电池"留出，与所有客户端数据不相交（§6.2 规则 2）。
-# 124 - 24 = 100 颗进客户端，100 / 5 = 20 个客户端。
-test_cells = 24
+# 135 - 20 = 115 颗进客户端，115 / 5 = 23 个客户端。
+test_cells = 20
 # 留出哪 24 颗只由这个 seed 决定，与训练 seed 无关：
 # 否则换一个训练 seed 就换一个测试集，曲线之间不可比。
 split_seed = 0
@@ -29,9 +34,10 @@ cells_per_client = [5]
 # "drop" 会直接扔掉尾部电池，只适合临时调试。
 remainder = "spread"
 schemes = ["iid", "dirichlet"]
-# 实测（check_partition.py）：N=20、α=0.5 时有一个客户端拿到 25 颗、
-# 7 个客户端各只有 1 颗。Dirichlet 分的是电池不是样本，客户端一多、
-# α 一小就会退化成"一人独占"。这是要写进报告的现象，不是 bug。
+# 实测（check_partition.py）：N=23、α=0.5 时最大的客户端独占 21 颗，而 8 个
+# 客户端各只有 1 颗。Dirichlet 分的是电池不是样本，客户端一多、α 一小就会
+# 退化成"一人独占"。这是要写进报告的现象，不是 bug——但它意味着这个划分下
+# 「量偏斜」与「域偏移」已经混在一起，不能声称只考察了其中一种（§5.1）。
 dirichlet_alpha = [0.5]
 
 [strategies]

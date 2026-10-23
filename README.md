@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-200%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-229%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -33,17 +33,21 @@ So this repo treats the *checkers* as the deliverable, not the training loop.
 
 | | |
 |---|---|
-| **`docs/plan.md`** | The full execution plan (v2.0, 17 sections): falsifiable hypotheses H1–H4, module contracts, partitioning rules, risk register, milestone DODs |
+| **`docs/plan.md`** | The full execution plan (v2.1, 17 sections): falsifiable hypotheses H1–H4, module contracts, partitioning rules, risk register, milestone DODs |
 | **`src/flsoh/partition.py`** | Cell-level partitioning + leakage detection. Pure standard library — no numpy, no torch |
 | **`src/flsoh/protocol.py`** | Experiment-matrix validation. Refuses configs missing a centralized baseline, missing an IID control, or with fewer than 3 seeds |
 | **`src/flsoh/model.py`** | MLP 1000→128→64→1. `parameter_bytes()` / `wire_bytes()` compute the communication table instead of hand-copying it |
+| **`src/flsoh/matr.py`** | Remote random-access reader for the 7.7 GiB MATR `.mat` files: HTTP Range + h5py `fileobj`. Pulls ~33 MB instead of 3 GB per batch |
 | **`src/flsoh/data.py`** | Feature-table I/O, per-client loaders, and the `LocalStandardizer` that makes "no global normalization" an assertion rather than a comment |
 | **`src/flsoh/app/`** | Flower 1.41 client/server apps (`ClientApp` + `@app.train()` + `flwr.serverapp.strategy`) |
+| **`scripts/check_continuations.py`** | Proves that 5 batch-2 cells are continuations of 5 batch-1 cells, using four independent lines of evidence. Wrong pairing would delete healthy cells invisibly |
+| **`scripts/build_manifest.py`** | Generates `cells.txt` / `manifest.json` **from the data**, so `P-UNKNOWN` cannot pass against an invented ID list |
+| **`scripts/build_features.py`** | Builds the per-cycle ΔQ(V) feature table, and records every dropped curve in `features.spec.json` |
 | **`scripts/check_partition.py`** | Audits a partition file for cross-client leakage, test-set contamination, empty clients |
 | **`scripts/check_protocol.py`** | Audits a TOML matrix before you burn GPU-hours on it |
 | **`scripts/run_local_baseline.py`** | C0 (centralized ceiling) and C1 (local-only floor) baselines — no federated runtime needed |
-| **`configs/mvp.toml`, `configs/full.toml`** | The machine-readable experiment matrix: 124 MIT-Stanford cells, 24 held out, k ∈ {2, 5}, α scan, DP scan |
-| **`tests/`** | 200 tests. Every checker is proven to *fail* on a broken input — a checker that only ever prints PASS is worse than none |
+| **`configs/mvp.toml`, `configs/full.toml`** | The machine-readable experiment matrix: 135 MIT-Stanford cells, 20 held out, k ∈ {2, 5}, α scan, DP scan |
+| **`tests/`** | 229 tests. Every checker is proven to *fail* on a broken input — a checker that only ever prints PASS is worse than none |
 
 ## Quick start
 
@@ -57,11 +61,11 @@ Expected output:
 
 ```text
 PASS configs/mvp.toml  (mvp)  errors=0 warnings=0
-  客户端数：k=5→N=20
+  客户端数：k=5→N=23
   协议齐备：划分原子、iid 对照、centralized 基线、seed 数、判据阈值均在场
-mvp.toml  cells=124  test=24
-  PASS  k=5 iid                    N=20   5颗×20
-  PASS  k=5 dirichlet alpha=0.5    N=20   1颗×7 2颗×2 3颗×3 5颗×2 6颗×1 7颗×1 9颗×2 14颗×1 25颗×1
+mvp.toml  cells=135  test=20
+  PASS  k=5 iid                    N=23   5颗×23
+  PASS  k=5 dirichlet alpha=0.5    N=23   1颗×8 2颗×3 3颗×2 4颗×1 5颗×2 6颗×1 8颗×2 9颗×1 14颗×1 15颗×1 21颗×1
 
 全 PASS：无跨客户端泄漏、无测试集污染、无空客户端、无未覆盖电池。
 ```
@@ -83,7 +87,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
     --partition-json results/partition.json --out results/
 ```
 
-## The six checks that gate every experiment
+## The seven checks that gate every experiment
 
 | Code | What it catches | Cost of missing it |
 |---|---|---|
@@ -93,6 +97,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
 | `P-COVER` | A cell in neither clients nor test set | Wasted data |
 | `P-COUNT` | Actual client count ≠ declared N | The N in your paper is wrong |
 | `P-UNKNOWN` | An ID not in the dataset manifest | Wrong data source entirely |
+| `P-CONT` | One physical cell under two IDs (cross-batch continuation) | `P-LEAK` compares IDs, so it structurally cannot catch this |
 
 ## Three numbers this repo refuses to hand-copy
 
@@ -105,7 +110,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
 | Payload per update | 545,796 B | `parameter_bytes()` |
 | **Wire size per update** | **546,630 B** | `wire_bytes()` — flwr's `ArrayRecord.count_bytes()`, 139 B/tensor of NumPy metadata |
 | Round trip per client/round | 1,091,592 B ≈ 1.04 MiB | `round_trip_bytes()` |
-| Total, N=20 × 100 rounds | 2,183,184,000 B ≈ 2.03 GiB | derived; **not** the 2.60 GiB v1 claimed |
+| Total, N=23 × 100 rounds | 2,510,661,600 B ≈ 2.34 GiB | derived; **not** the 2.60 GiB v1 claimed |
 
 ## What is deliberately absent
 
@@ -116,7 +121,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
 
 ## Documentation
 
-- **Execution plan (v2.0)** — [`docs/plan.md`](./docs/plan.md), the primary document
+- **Execution plan (v2.1)** — [`docs/plan.md`](./docs/plan.md), the primary document
 - **§3.4 API calibration** — what was verified against the installed `flwr` 1.41.0, including the two discrepancies found
 - **v1 archive** — [`docs/archive/plan-v1.md`](./docs/archive/plan-v1.md), kept for diffing
 - **Flower version notes** — `docs/plan.md` §2: `flwr` 1.41.0 uses `ClientApp` + `@app.train()` + `flwr.serverapp.strategy`, not `NumPyClient`

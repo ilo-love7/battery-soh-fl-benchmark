@@ -1,7 +1,7 @@
 # 完整版实验矩阵 —— 对应 docs/plan.md §9.2，覆盖 D6-D8
 #
 # 与 mvp.toml 的差别：
-#   1. cells_per_client 两档（2 / 5）→ 客户端数 50 / 20，量化量偏斜的影响
+#   1. cells_per_client 两档（2 / 5）→ 客户端数 58 / 23，量化量偏斜的影响
 #   2. alpha 三档（0.1 / 0.5 / 1.0）→ 图 2 的 Non-IID 程度扫描
 #   3. 策略扩到 fedadam / fedbn
 #   4. 打开 DP，noise 三档 → 图 3 的隐私-效用曲线
@@ -17,13 +17,15 @@ description = "策略扩展 + α 扫描 + 跨化学体系 + Opacus DP 隐私-效
 
 [data]
 dataset = "mit-stanford"
-n_cells = 124
+# 实测 135 颗（140 原始 − 5 颗跨批次延续），口径见 mvp.toml 与
+# scripts/check_continuations.py。
+n_cells = 135
 partition_atom = "cell"
 
 [partitions]
-test_cells = 24
+test_cells = 20
 split_seed = 0
-# 100 颗：k=2 → 50 客户端；k=5 → 20 客户端
+# 115 颗：k=2 → 58 客户端；k=5 → 23 客户端
 cells_per_client = [2, 5]
 remainder = "spread"
 schemes = ["iid", "dirichlet"]

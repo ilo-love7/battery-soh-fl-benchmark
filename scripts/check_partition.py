@@ -20,7 +20,7 @@
     python3 scripts/check_partition.py --config configs/mvp.toml \
         --emit results/partition-mvp-k5-iid.json --emit-k 5 --emit-scheme iid
 
-规则 1「同一颗电池不得跨客户端」靠人眼核对 124 颗电池不现实，所以做成脚本。
+规则 1「同一颗电池不得跨客户端」靠人眼核对 135 颗电池不现实，所以做成脚本。
 这一步必须跑在训练之前：划分错了，后面所有实验都白做，而且从精度上看不出来
 ——只会看到一个"效果很好"的假结论。
 

@@ -163,17 +163,21 @@ class TestCommunicationBudget:
         assert FLOAT32_BYTES == 4
 
     def test_total_volume_formula(self):
-        """plan.md §10.1：N=20、100 轮 → 2,183,184,000 B ≈ 2.03 GiB。
+        """plan.md §10.1：N=23、100 轮 → 2,510,661,600 B ≈ 2.34 GiB。
 
         这里钉住一个已经犯过的错误：v1 方案写「N=25、100 轮 → 约 2.60 GiB」，
-        而 N=25 本身就是 124÷5 的取整（正确值是 20）。即使用 N=25 算，
-        结果也是 2.54 GiB 而不是 2.60。派生表抄了错的输入，就会一直错下去。
+        而 N=25 本身就是 124÷5 的取整。即使用 N=25 算，结果也是 2.54 GiB
+        而不是 2.60。派生表抄了错的输入，就会一直错下去。
+
+        v2.1 又改了一次输入：实测 140 颗、去 5 颗跨批次延续得 135 颗、留出 20
+        颗测试 → (135-20)/5 = 23 个客户端。N 从 20 变 23，总量从 2.03 变 2.34。
+        同一个教训重复了一次：**N 不是常数，它是颗数和 k 的函数**。
         """
         m = MLP(PLAN_INPUT_DIM, PLAN_HIDDEN)
-        n_clients, num_rounds = 20, 100
+        n_clients, num_rounds = 23, 100
         total = round_trip_bytes(m) * n_clients * num_rounds
-        assert total == 2_183_184_000
-        assert total / 1024**3 == pytest.approx(2.03, abs=0.01)
+        assert total == 2_510_661_600
+        assert total / 1024**3 == pytest.approx(2.34, abs=0.01)
 
     def test_old_n25_figure_was_wrong(self):
         """回归：N=25 时的正确值是 2.54 GiB，不是方案里写的 2.60。"""

@@ -302,12 +302,14 @@ class TestLoadConfig:
 
 class TestExpectedClientsFor:
     def test_mvp(self):
-        assert expected_clients_for(load_config(CONFIG_DIR / "mvp.toml"), 5) == 20
+        # 135 颗、留 20 颗测试 → 115 颗进客户端；k=5 → 23。
+        # 这个数改过两次（25 → 20 → 23），每次都是因为上游的颗数变了。
+        assert expected_clients_for(load_config(CONFIG_DIR / "mvp.toml"), 5) == 23
 
     def test_full_two_k_values(self):
         cfg = load_config(CONFIG_DIR / "full.toml")
-        assert expected_clients_for(cfg, 2) == 50
-        assert expected_clients_for(cfg, 5) == 20
+        assert expected_clients_for(cfg, 2) == 58
+        assert expected_clients_for(cfg, 5) == 23
 
 
 class TestConfigsAreNotCopies:

@@ -27,6 +27,90 @@ jobs:
       - name: 语法检查（脚本与 src 全部编译）
         run: python -m compileall -q scripts src
 
+  # matr 模块：只依赖 numpy + h5py（各约 5 MB），比 torch 便宜得多，
+  # 所以它进默认 CI。测试用合成 HDF5 + 本地 Range 服务器，全程不联网——
+  # 数据集的 7.7 GiB 不该成为「能不能跑测试」的前提。
+  matr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安装 numpy / h5py / pyarrow
+        run: python -m pip install -U pip numpy h5py pyarrow pytest
+      - name: 运行 matr 测试
+        run: python -m pytest tests/test_matr.py -v
+      - name: 清单脚本的纯逻辑（选择与去重）不联网即可跑
+        run: |
+          python - <<'PY'
+          import copy, sys
+          sys.path.insert(0, "scripts")
+          from build_manifest import (
+              CONTINUATION_ADD_LEN,
+              CONTINUATIONS,
+              check_continuation_evidence,
+              select_cells,
+          )
+
+          # 用真实 policy 字符串：延续段的字符串缺前缀是数据里的事实。
+          origins = {
+              "b1c0": "3.6C(80%)-3.6C",
+              "b1c1": "3.6C(80%)-3.6C",
+              "b1c2": "3.6C(80%)-3.6C",
+              "b1c3": "4C(80%)-4C",
+              "b1c4": "4C(80%)-4C",
+              "b1c5": "4.4C(80%)-4.4C",  # 干扰项：后缀是 80%)-4.4C，接不上 80%)-4C
+          }
+          conts = {
+              "b2c7": "80%)-3.6C",
+              "b2c8": "80%)-3.6C",
+              "b2c9": "80%)-3.6C",
+              "b2c15": "80%)-4C",
+              "b2c16": "80%)-4C",
+          }
+          manifest = {
+              "batches": [
+                  {"batch_no": 1, "cells_meta_complete": True, "cells": [
+                      {"cell_id": cid, "index": int(cid.split("c")[1]),
+                       "policy": pol, "n_cycles": 1000}
+                      for cid, pol in origins.items()]},
+                  {"batch_no": 2, "cells_meta_complete": True, "cells": [
+                      {"cell_id": cid, "index": int(cid.split("c")[1]),
+                       "policy": pol, "n_cycles": CONTINUATION_ADD_LEN[cid] + 1}
+                      for cid, pol in conts.items()]},
+              ],
+              "totals": {"n_cells": 11, "plan_n_cells": 135, "matches_plan": False},
+          }
+          assert set(conts) == set(CONTINUATIONS), "CI 里的映射和代码里的不一致"
+          assert check_continuation_evidence(manifest) == [], "四条证据应当全过"
+
+          picked = select_cells(manifest)
+          ids = [c["cell_id"] for e in picked["batches"] for c in e["cells"]]
+          assert "b2c7" not in ids and len(ids) == 6, ids
+          assert picked["totals"]["n_cells_selected"] == 6
+
+          # 负控 1：policy 接不上必须报出来，否则删的是正常数据
+          bad = copy.deepcopy(manifest)
+          for cell in bad["batches"][1]["cells"]:
+              if cell["cell_id"] == "b2c15":
+                  cell["policy"] = "80%)-4.4C"
+          assert check_continuation_evidence(bad), "policy 接不上却没报错"
+
+          # 负控 2：段长对不上 add_len，说明「谁接谁」配错了
+          bad = copy.deepcopy(manifest)
+          for cell in bad["batches"][1]["cells"]:
+              if cell["cell_id"] == "b2c7":
+                  cell["n_cycles"] = 980
+          assert check_continuation_evidence(bad), "段长不符却没报错"
+
+          # 负控 3：没有元信息时必须返回 None，不能假装通过
+          thin = copy.deepcopy(manifest)
+          thin["batches"][1]["cells_meta_complete"] = False
+          assert check_continuation_evidence(thin) is None
+          print("selection logic OK")
+          PY
+
   # 实验协议校验器：两份真实配置必须零 ERROR。
   protocol:
     runs-on: ubuntu-latest

@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-200%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-229%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -35,17 +35,21 @@
 
 | | |
 |---|---|
-| **`docs/plan.md`** | 完整执行方案（v2.0，17 节）：可证伪假设 H1–H4、模块契约、划分规则、风险登记册、里程碑 DOD |
+| **`docs/plan.md`** | 完整执行方案（v2.1，17 节）：可证伪假设 H1–H4、模块契约、划分规则、风险登记册、里程碑 DOD |
 | **`src/flsoh/partition.py`** | 电池级划分 + 泄漏检测。纯标准库——不依赖 numpy，也不依赖 torch |
 | **`src/flsoh/protocol.py`** | 实验矩阵校验。缺 centralized 基线、缺 IID 对照、seed 少于 3 个，一律拒绝 |
 | **`src/flsoh/model.py`** | MLP 1000→128→64→1。`parameter_bytes()` / `wire_bytes()` 把通信量表算出来，不手抄 |
+| **`src/flsoh/matr.py`** | 7.7 GiB MATR `.mat` 的远端随机读：HTTP Range + h5py `fileobj`。每批只拉约 33 MB，不是 3 GB |
 | **`src/flsoh/data.py`** | 特征表读写、按客户端的 DataLoader，以及把「不许全局标准化」从注释变成断言的 `LocalStandardizer` |
 | **`src/flsoh/app/`** | Flower 1.41 客户端/服务端 App（`ClientApp` + `@app.train()` + `flwr.serverapp.strategy`） |
+| **`scripts/check_continuations.py`** | 用四条独立证据证明批次 2 的 5 颗是批次 1 的延续段。配错一对就会静默删掉正常电池 |
+| **`scripts/build_manifest.py`** | **从数据**生成 `cells.txt` / `manifest.json`，让 `P-UNKNOWN` 不可能对着虚构 ID 说 PASS |
+| **`scripts/build_features.py`** | 生成 per-cycle 的 ΔQ(V) 特征表，并把每一条丢弃的曲线记进 `features.spec.json` |
 | **`scripts/check_partition.py`** | 对账划分文件：跨客户端泄漏、测试集污染、空客户端 |
 | **`scripts/check_protocol.py`** | 在烧掉 GPU 小时之前先校验实验矩阵 |
 | **`scripts/run_local_baseline.py`** | C0（中心化上限）与 C1（本地独立下限）基线——不需要联邦运行时 |
-| **`configs/mvp.toml`、`configs/full.toml`** | 机器可读的实验矩阵：MIT-Stanford 124 颗电池、留出 24 颗、k ∈ {2, 5}、α 扫描、DP 扫描 |
-| **`tests/`** | 200 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
+| **`configs/mvp.toml`、`configs/full.toml`** | 机器可读的实验矩阵：MIT-Stanford 135 颗电池、留出 20 颗、k ∈ {2, 5}、α 扫描、DP 扫描 |
+| **`tests/`** | 229 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
 
 ## 快速开始
 
@@ -59,11 +63,11 @@ python3 scripts/check_partition.py --config configs/mvp.toml
 
 ```text
 PASS configs/mvp.toml  (mvp)  errors=0 warnings=0
-  客户端数：k=5→N=20
+  客户端数：k=5→N=23
   协议齐备：划分原子、iid 对照、centralized 基线、seed 数、判据阈值均在场
-mvp.toml  cells=124  test=24
-  PASS  k=5 iid                    N=20   5颗×20
-  PASS  k=5 dirichlet alpha=0.5    N=20   1颗×7 2颗×2 3颗×3 5颗×2 6颗×1 7颗×1 9颗×2 14颗×1 25颗×1
+mvp.toml  cells=135  test=20
+  PASS  k=5 iid                    N=23   5颗×23
+  PASS  k=5 dirichlet alpha=0.5    N=23   1颗×8 2颗×3 3颗×2 4颗×1 5颗×2 6颗×1 8颗×2 9颗×1 14颗×1 15颗×1 21颗×1
 
 全 PASS：无跨客户端泄漏、无测试集污染、无空客户端、无未覆盖电池。
 ```
@@ -85,7 +89,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
     --partition-json results/partition.json --out results/
 ```
 
-## 每次实验前的六道检查
+## 每次实验前的七道检查
 
 | 检查码 | 抓什么 | 漏掉的代价 |
 |---|---|---|
@@ -95,6 +99,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
 | `P-COVER` | 有电池既不在客户端也不在测试集 | 数据浪费 |
 | `P-COUNT` | 实际客户端数与声明的 N 不符 | 论文里的 N 写错 |
 | `P-UNKNOWN` | 出现数据集清单之外的电池 ID | 数据源读错了 |
+| `P-CONT` | 同一颗物理电池以两个 ID 出现（跨批次延续） | `P-LEAK` 比的是 ID，结构上抓不到这种 |
 
 ## 三个拒绝手抄的数字
 
@@ -107,7 +112,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
 | 单次更新载荷 | 545,796 B | `parameter_bytes()` |
 | **单次更新线上字节数** | **546,630 B** | `wire_bytes()`——flwr 的 `ArrayRecord.count_bytes()`，含 139 B/张量的 NumPy 元数据 |
 | 每客户端每轮往返 | 1,091,592 B ≈ 1.04 MiB | `round_trip_bytes()` |
-| N=20 × 100 轮总计 | 2,183,184,000 B ≈ 2.03 GiB | 派生值；**不是** v1 写的 2.60 GiB |
+| N=23 × 100 轮总计 | 2,510,661,600 B ≈ 2.34 GiB | 派生值；**不是** v1 写的 2.60 GiB |
 
 ## 刻意没有的东西
 
@@ -119,7 +124,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
 
 ## 文档
 
-- **执行方案（v2.0）** — [`docs/plan.md`](./docs/plan.md)，主文档
+- **执行方案（v2.1）** — [`docs/plan.md`](./docs/plan.md)，主文档
 - **§3.4 API 实测校准** — 对照安装的 `flwr` 1.41.0 逐项核对的结果，含发现的两处差异
 - **v1 归档** — [`docs/archive/plan-v1.md`](./docs/archive/plan-v1.md)，保留用于对比
 - **Flower 版本说明** — `docs/plan.md` §2：`flwr` 1.41.0 用的是 `ClientApp` + `@app.train()` + `flwr.serverapp.strategy`，不是 `NumPyClient`
@@ -136,7 +141,7 @@ python3 scripts/run_local_baseline.py --config configs/mvp.toml \
 ```bash
 python3 -m pytest tests -v        # 纯标准库，CI 里跑的就是这些
 pip install -e ".[train,dev]"     # 装 torch/flwr 后才能跑另外 112 条
-python3 -m pytest tests -v        # 全部 200 条
+python3 -m pytest tests -v        # 全部 229 条
 ```
 
 ## 许可证
