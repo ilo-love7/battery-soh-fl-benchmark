@@ -229,8 +229,13 @@ class TestMatrBatch:
 class _RangeHandler(http.server.BaseHTTPRequestHandler):
     payload = b""
     honor_range = True
+    # HTTP/1.1 + Content-Length 才会让客户端复用连接；用默认的 1.0 每条
+    # 请求都关连接，「连接复用」这件事在测试里根本观察不到。
+    protocol_version = "HTTP/1.1"
+    connections: set = set()
 
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler 的约定
+        type(self).connections.add(self.client_address)
         spec = self.headers.get("Range")
         if self.honor_range and spec and spec.startswith("bytes="):
             start_s, _, end_s = spec[len("bytes=") :].partition("-")
@@ -263,6 +268,19 @@ def _serve(payload: bytes, *, honor_range: bool = True):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, f"http://127.0.0.1:{server.server_address[1]}/blob"
+
+
+def _serve_counting(payload: bytes):
+    """额外返回一个记录 TCP 连接（客户端端口）的集合，用来验证连接复用。"""
+    handler = type(
+        "CountingHandler",
+        (_RangeHandler,),
+        {"payload": payload, "honor_range": True, "connections": set()},
+    )
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}/blob", handler.connections
 
 
 @pytest.fixture
@@ -316,17 +334,56 @@ class TestHTTPRangeFile:
             assert handle.read(999) == payload[-10:]
             assert handle.read(1) == b""
 
-    def test_default_workers_is_one(self):
-        """内部补洞并发默认必须是 1。
+    def test_second_batch_opens_no_new_connection(self):
+        """两批请求之间不能重新握手。
 
-        这不是性能洁癖，是一个被实测推翻过的默认值：最早按「单连接 17 KB/s、
-        6 并发 131 KB/s」设成 8，后来这个镜像改成**惩罚并发连接**，
-        于是 8 从优化变成了 3 倍以上的减速——而顶层 ``--workers`` 调到 1
-        也看不出问题，因为并发藏在 ``_pull`` 里面。
+        这条挡的是一个**我自己写进去又量错过的** bug：``_pull`` 每次新建
+        ``ThreadPoolExecutor``，``with`` 退出时把线程 join 掉，线程本地的
+        连接随之失效，于是每一批请求都要重做一次 TLS 握手。表现为
+        「并发看起来有害」——我据此把 ``workers`` 从 8 改成 1，还写了
+        「并发有害，别改回去」。
 
-        同一个时段、同一份代码实测：内部并发 1 → 134 请求 / 436 KB / 60.6 s；
-        内部并发 8 → 280 s 内没跑完。所以「并发听起来更快」在这里是错的，
-        拿这条测试挡着，别让人凭直觉改回去。
+        真正的因果是连接复用：同主机同时段实测，新建连接 0.63 请求/秒、
+        复用连接 2.56、复用连接 + 8 线程 8.45。所以钉住「第二批不开新连接」
+        比钉住某个并发数字有用——数字可以再调，这条不能破。
+        """
+        payload = bytes(range(256)) * 40
+        server, url, conns = _serve_counting(payload)
+        try:
+            with HTTPRangeFile(url, workers=2, retry_delay=0.01) as handle:
+                # 第一批把线程池和连接都建起来
+                handle.prefetch([(0, 100), (500, 600)])
+                assert handle.requests == 2
+                warm = len(conns)
+                assert warm >= 1, "第一批居然没建连接"
+                # 第二批：走同一个池、同一批线程、同一批连接
+                handle.prefetch([(1000, 1100), (1500, 1600)])
+                assert handle.requests == 4
+                assert len(conns) == warm, (
+                    f"第二批新开了 {len(conns) - warm} 条连接；"
+                    "线程池或线程本地连接没有跨 _pull 存活"
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_close_shuts_down_pool_and_connections(self):
+        """``close()`` 之后不能留下活线程——否则进程退出会挂住。"""
+        payload = bytes(range(256)) * 40
+        server, url, _ = _serve_counting(payload)
+        try:
+            handle = HTTPRangeFile(url, workers=4, retry_delay=0.01)
+            handle.prefetch([(0, 100), (200, 300), (400, 500), (600, 700)])
+            assert handle._pool is not None, "多段预取应该建起线程池"
+            handle.close()
+            assert handle._pool is None
+            assert handle._conns == []
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_default_workers(self):
+        """默认 8：并发有 5.5 倍收益，前提是连接复用（见类 docstring）。
 
         从签名读默认值而**不构造实例**：构造函数会探测远端文件大小，
         那是一条真实请求，测试不该为它付钱。
@@ -334,7 +391,7 @@ class TestHTTPRangeFile:
         import inspect
 
         default = inspect.signature(HTTPRangeFile.__init__).parameters["workers"].default
-        assert default == 1, "内部补洞并发默认值被改大了；见 docstring 里的实测表"
+        assert default == 8, "内部补洞并发默认值被改小了；见 docstring 里的实测表"
 
     def test_rejects_server_ignoring_range(self, payload):
         server, url = _serve(payload, honor_range=False)

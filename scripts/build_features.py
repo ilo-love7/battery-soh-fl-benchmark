@@ -95,7 +95,7 @@ DEFAULT_V_LO = 2.0
 DEFAULT_V_HI = 3.5
 DEFAULT_POINTS = 1000
 DEFAULT_REF_CYCLE = 1
-DEFAULT_WORKERS = 1  # 见 --workers 的 help：这个镜像惩罚并发，调大只会更慢
+DEFAULT_WORKERS = 1  # 见 --workers 的 help：服务端按聚合速率节流，调大只有 1.14 倍
 
 STATE_NAME = "state.json"
 
@@ -574,10 +574,13 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=DEFAULT_WORKERS,
         help=(
-            "批次内并发的 h5py 句柄数。**默认 1，别调大**：实测这个镜像惩罚"
-            "并发连接——1 个 worker 前 2 颗 60 s、稳态约 24 s/颗；2 个 worker "
-            "前 2 颗 253 s；6 个 worker 首颗 404 s、稳态约 100 s/颗。"
-            "加连接让每个请求都变慢，总时间成倍上升。"
+            "批次内并发的 h5py 句柄数。默认 1，实测调大没有意义。"
+            "单颗是 134 个串行小请求、抓取耗时占墙钟 98.2%，看着像「颗级"
+            "并行应该有效」，但 4 颗一组实测：workers=1 单颗 120.5 s、"
+            "workers=2 127.8 s、workers=4 106.1 s，只有 1.14 倍。原因是"
+            "服务端对持续请求做聚合节流（约 1.5 次/秒），开多少连接都不加"
+            "总量。要提速只能减少请求或换时段——早上约 24 s/颗、晚间约 "
+            "120 s/颗，差 5 倍。"
         ),
     )
     parser.add_argument("--limit-cells", type=int, default=None, help="每批只跑前 N 颗")
