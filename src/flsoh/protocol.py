@@ -291,16 +291,34 @@ def validate_config(cfg: dict) -> list[tuple[str, str, str]]:
         dp_enabled = False
     noise = _get(cfg, "privacy.noise_multiplier")
     if dp_enabled:
-        if not isinstance(noise, list) or len(noise) < MIN_NOISE_POINTS:
+        if not isinstance(noise, list) or not noise:
             err(
                 "C-PRIVACY",
-                f"启用 DP 时 noise_multiplier 至少 {MIN_NOISE_POINTS} 个扫描点，"
-                f"收到 {noise!r}：少于 3 点画不出隐私-效用曲线",
+                f"启用 DP 时 noise_multiplier 必须是非空列表，收到 {noise!r}",
             )
-        else:
-            for sigma in noise:
-                if not _is_number(sigma) or sigma <= 0:
-                    err("C-PRIVACY", f"noise_multiplier 元素必须为正数，收到 {sigma!r}")
+            noise = []
+        # nm=0 是**对照组**（plan §7：没有噪声就没有 DP），不是 DP 臂。
+        # 它必须被允许写进矩阵，但不算扫描点——否则"3 个点"里有 1 个是
+        # 对照，隐私-效用曲线实际只有 2 个点，而表里写着 3。
+        zeros = [s for s in noise if _is_number(s) and s == 0]
+        positive = [s for s in noise if _is_number(s) and s > 0]
+        if zeros:
+            warn(
+                "C-PRIVACY",
+                f"noise_multiplier 含 0（{len(zeros)} 个）：这是**对照组**，"
+                "只做逐样本裁剪与 Poisson 抽样、不加噪，ε=inf。"
+                "它不计入扫描点数，报告里也不能算作 DP 臂",
+            )
+        if len(positive) < MIN_NOISE_POINTS:
+            err(
+                "C-PRIVACY",
+                f"启用 DP 时**正的** noise_multiplier 至少 {MIN_NOISE_POINTS} 个"
+                f"扫描点，实际 {len(positive)} 个（{positive!r}）："
+                "少于 3 点画不出隐私-效用曲线",
+            )
+        for sigma in noise:
+            if not _is_number(sigma) or sigma < 0:
+                err("C-PRIVACY", f"noise_multiplier 元素必须是非负数，收到 {sigma!r}")
         max_grad_norm = _get(cfg, "privacy.max_grad_norm")
         if not _is_number(max_grad_norm) or max_grad_norm <= 0:
             err(

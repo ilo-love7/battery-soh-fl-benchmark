@@ -274,6 +274,34 @@ class TestPrivacy:
         cfg["privacy"]["noise_multiplier"] = []
         assert validate_config(cfg) == []
 
+    def test_zero_noise_is_a_control_arm_not_a_point(self):
+        """nm=0 是对照组，不计入「≥3 个扫描点」。
+
+        把它算进去的话，`[0, 1, 2]` 会被判成三点通过，而隐私-效用曲线
+        实际只有两个 DP 点——表里写着 3，图画出来是 2。
+        """
+        issues = validate_config(self._dp(noise_multiplier=[0, 1.0, 2.0]))
+        assert "C-PRIVACY" in codes(issues, LEVEL_ERROR)
+
+    def test_zero_plus_three_positive_is_accepted_with_a_warning(self):
+        """`[0, 1, 2, 4]` 应当通过，但要警告 0 不是 DP 臂。
+
+        plan §7：「没有噪声就没有 DP」。对照组必须能跑，但报告里不能
+        把它算作隐私保证的一档。
+        """
+        issues = validate_config(self._dp(noise_multiplier=[0, 1.0, 2.0, 4.0]))
+        assert not has_errors(issues)
+        assert "C-PRIVACY" in codes(issues, LEVEL_WARN)
+        assert any("对照组" in m for _, _, m in issues)
+
+    def test_all_zero_is_rejected(self):
+        issues = validate_config(self._dp(noise_multiplier=[0, 0]))
+        assert "C-PRIVACY" in codes(issues, LEVEL_ERROR)
+
+    def test_negative_noise_is_rejected(self):
+        issues = validate_config(self._dp(noise_multiplier=[-1.0, 1.0, 2.0]))
+        assert "C-PRIVACY" in codes(issues, LEVEL_ERROR)
+
 
 class TestAcceptance:
     def test_rejects_missing_threshold(self):

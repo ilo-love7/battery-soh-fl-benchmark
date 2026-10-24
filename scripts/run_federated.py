@@ -63,6 +63,14 @@ from flsoh.train import (  # noqa: E402
     weighted_average,
 )
 
+try:  # opacus 是可选依赖（pyproject 的 [privacy] extra）
+    from flsoh.dp import DPTrainer
+
+    _HAS_OPACUS = True
+except ImportError:  # pragma: no cover - 只在没装 opacus 时走
+    DPTrainer = None  # type: ignore[assignment,misc]
+    _HAS_OPACUS = False
+
 
 def run_federation(
     table: FeatureTable,
@@ -80,6 +88,9 @@ def run_federation(
     test_strategy: str = "test",
     log_every: int = 10,
     server: ServerAdam | None = None,
+    noise_multiplier: float | None = None,
+    max_grad_norm: float = 1.0,
+    target_delta: float = 1e-5,
 ) -> dict:
     """跑一轮完整的联邦实验，返回结果 dict（plan.md §9.3 的字段）。
 
@@ -91,6 +102,17 @@ def run_federation(
     ``fedadam`` 与 ``mu`` 不互斥：近端项在客户端侧、Adam 在服务端侧，
     两者正交。但 μ>0 时必须显式传，避免「想着 FedAvg、实际带着近端项」
     这种静默组合。
+
+    ``noise_multiplier`` 与上面几项**完全正交**（plan.md §7 的 L2 是客户端
+    侧的改动，与服务端怎么聚合同层无关）：
+
+    - ``None``：不开 DP，训练循环走原路径。
+    - ``0.0``：开 DP 机制但**不加噪**——裁剪 + Poisson 抽样照做，
+      ε 报 ``inf``。这是对照组，用来把「机制开销」与「噪声开销」分开。
+    - ``>0``：真正的本地 DP-SGD，ε 由每客户端一个的 RDP 会计器记账。
+
+    每客户端一个会计器（不是全局一个）：见 ``flsoh/dp.py`` 的论证——
+    联合机制的 ε 是各客户端 ε 的上确界，不是和。
     """
     if strategy not in ("fedavg", "fedprox", "fedadam"):
         raise ValueError(f"未知策略 {strategy!r}（fedavg/fedprox/fedadam）")
@@ -98,6 +120,12 @@ def run_federation(
         raise ValueError("fedprox 需要 mu > 0；mu=0 就是 fedavg，别混着报")
     if strategy == "fedavg" and mu > 0:
         raise ValueError(f"fedavg 不该带 mu={mu}；要近端项请用 --strategy fedprox")
+    if noise_multiplier is not None and noise_multiplier < 0:
+        raise ValueError(f"noise_multiplier 不能为负：{noise_multiplier}")
+    if noise_multiplier is not None and not _HAS_OPACUS:
+        raise ImportError(
+            "noise_multiplier 非空就需要 opacus：pip install '.[privacy]'"
+        )
 
     # 客户端数据：每个客户端只用自己的电池，且**按时间**切 train/val
     clients = {}
@@ -110,7 +138,10 @@ def run_federation(
         table, test_cells, strategy=test_strategy
     )
 
-    # 一个模型对象复用到底：每轮 load_state_dict 换参数，省掉重复构造
+    # 一个模型对象复用到底：每轮 load_state_dict 换参数，省掉重复构造。
+    # **DP 路径例外**：Opacus 的 make_private 会把模块包一层并注册前向
+    # 钩子，同一个模块被包装 N 次就会挂 N 套钩子，逐样本梯度算 N 遍。
+    # 所以开 DP 时每个客户端拿自己的模型实例，会计器也跟着活全部轮次。
     model = build_model(table.input_dim, seed=seed)
     global_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
@@ -122,16 +153,35 @@ def run_federation(
     if strategy != "fedadam" and server is not None:
         raise ValueError("只有 fedadam 才接受 ServerAdam；别让它在别的策略下静默失效")
 
+    trainers: dict[str, DPTrainer] = {}
+    if noise_multiplier is not None:
+        for cid, data in clients.items():
+            # 每客户端一套 DP 对象，构造在轮循环之外：会计器必须跨轮累积。
+            trainers[cid] = DPTrainer(
+                build_model(table.input_dim, seed=seed),
+                data.train_loader,
+                noise_multiplier=noise_multiplier,
+                max_grad_norm=max_grad_norm,
+                optimizer=optimizer,
+                lr=lr,
+                target_delta=target_delta,
+            )
+
     curve: list[dict] = []
     t0 = time.time()
     for rnd in range(1, rounds + 1):
         states, weights = [], []
         for cid, data in clients.items():
-            model.load_state_dict(global_state)
-            # FedProx 的近端项要"本轮开始时的全局参数"，必须在训练前克隆
-            gp = (
-                [p.detach().clone() for p in model.parameters()] if mu > 0 else None
-            )
+            trainer = trainers.get(cid)
+            if trainer is not None:
+                trainer.load_global(global_state)
+            else:
+                model.load_state_dict(global_state)
+            # FedProx 的近端项要"本轮开始时的全局参数"，必须在训练前克隆。
+            # 两条路径取的是同一批张量（DP 包装不换参数），所以克隆哪个
+            # 模型的 parameters() 都一样；统一走 trainer 是为了少一个分支。
+            ref = trainer.wrapped if trainer is not None else model
+            gp = [p.detach().clone() for p in ref.parameters()] if mu > 0 else None
             train_epochs(
                 model,
                 data.train_loader,
@@ -140,8 +190,10 @@ def run_federation(
                 optimizer=optimizer,
                 mu=mu,
                 global_params=gp,
+                dp=trainer,
             )
-            states.append({k: v.detach().clone() for k, v in model.state_dict().items()})
+            src = trainer.model if trainer is not None else model
+            states.append({k: v.detach().clone() for k, v in src.state_dict().items()})
             weights.append(data.n_train)
 
         averaged = weighted_average(states, weights)
@@ -188,6 +240,26 @@ def run_federation(
         result["server_beta_1"] = server.beta_1
         result["server_beta_2"] = server.beta_2
         result["server_tau"] = server.tau
+    if trainers:
+        # 隐私字段平铺到顶层（与 server_* 同一位），summarize 直接读；
+        # 每客户端的明细放嵌套 dict，账要能一笔笔对。
+        #
+        # epsilon 取 max：联合机制的隐私损失是各客户端的上确界（不是和），
+        # 见 flsoh/dp.py 的模块 docstring。客户端样本量不同时 q 不同、
+        # ε 就不同，取 max 是保守的那个。
+        records = {cid: t.privacy_record() for cid, t in trainers.items()}
+        eps = {cid: r["epsilon"] for cid, r in records.items()}
+        result["noise_multiplier"] = noise_multiplier
+        result["max_grad_norm"] = max_grad_norm
+        result["target_delta"] = target_delta
+        result["dp_epsilon"] = max(eps.values())
+        result["dp_steps"] = max(r["steps"] for r in records.values())
+        result["dp"] = {
+            "per_client": records,
+            "epsilon_min": min(eps.values()),
+            "epsilon_max": max(eps.values()),
+            "n_clients_with_dp": len(records),
+        }
     return result
 
 
@@ -207,6 +279,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="FedAdam 服务端二阶矩 β2（默认 0.99）")
     ap.add_argument("--server-tau", type=float, default=None,
                     help="FedAdam 的自适应程度 τ（默认 1e-3）")
+    ap.add_argument("--noise-multiplier", type=float, default=None,
+                    help="本地 DP-SGD 噪声倍数；0 = 只裁剪不加噪的对照组（ε=inf）。"
+                         "不给则完全不开 DP")
+    ap.add_argument("--max-grad-norm", type=float, default=None,
+                    help="DP 逐样本梯度裁剪范数（默认 1.0）")
+    ap.add_argument("--target-delta", type=float, default=None,
+                    help="DP 的 δ（默认 1e-5）")
     ap.add_argument("--rounds", type=int, default=None)
     ap.add_argument("--local-epochs", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
@@ -258,6 +337,22 @@ def main(argv: list[str] | None = None) -> int:
         f"local_epochs={local_epochs}  lr={lr}  {optimizer}  mu={mu}  seed={args.seed}",
         flush=True,
     )
+    noise_multiplier = args.noise_multiplier
+    max_grad_norm = args.max_grad_norm if args.max_grad_norm is not None else 1.0
+    target_delta = args.target_delta if args.target_delta is not None else 1e-5
+    if noise_multiplier is not None and not _HAS_OPACUS:
+        print("FAIL --noise-multiplier 需要 opacus：pip install '.[privacy]'")
+        return 2
+    if noise_multiplier is not None:
+        # 用 `is not None` 而不是 `or`：`--noise-multiplier 0` 是合法输入
+        # （对照组），`0 or default` 会静默把它换成"不开 DP"——那这一组
+        # 就跑成了非 DP 基线，而表里还会多出一行叫 nm0 的东西。
+        print(
+            f"  本地 DP-SGD：noise_multiplier={noise_multiplier:g}  "
+            f"max_grad_norm={max_grad_norm:g}  delta={target_delta:g}"
+            + ("（对照组：不加噪，ε=inf）" if noise_multiplier == 0 else ""),
+            flush=True,
+        )
     server = None
     if args.strategy == "fedadam":
         # 只把显式给了的项传进去，其余用 ServerAdam 的默认（= flwr 的默认）。
@@ -294,16 +389,23 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         test_strategy=str(cfg["train"].get("test_standardizer", "test")),
         server=server,
+        noise_multiplier=noise_multiplier,
+        max_grad_norm=max_grad_norm,
+        target_delta=target_delta,
     )
 
     scheme = payload.get("scheme") or "unknown"
     alpha = payload.get("alpha")
     # η 进文件名：扫 η 时两个只差服务端学习率的 run 会撞名，而撞名的
     # 表现是后一个静默覆盖前一个——结果目录里少一半数据且不报错。
+    # noise_multiplier 同理（M3 ② 已经为 τ 踩过一次），local_epochs 也进：
+    # le=3 与 le=10 的 FedAvg 是两个完全不同的训练量口径。
     tag = args.tag or (
         f"{args.strategy}__{scheme}"
         + (f"{alpha}" if alpha is not None else "")
+        + f"__le{local_epochs}"
         + (f"__eta{server.eta:g}" if server is not None else "")
+        + (f"__nm{noise_multiplier:g}" if noise_multiplier is not None else "")
         + f"__seed{args.seed}"
     )
     out_dir = Path(args.out)
@@ -318,6 +420,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n最终 MAE={result['final_mae']:.5f}  RMSE={result['final_rmse']:.5f}  "
           f"耗时 {result['wall_clock_s']}s")
+    if "dp_epsilon" in result:
+        eps = result["dp_epsilon"]
+        eps_txt = "inf（对照组，无隐私保证）" if eps == float("inf") else f"{eps:.2f}"
+        print(f"DP：noise_multiplier={result['noise_multiplier']:g}  "
+              f"steps/客户端={result['dp_steps']}  ε(δ={result['target_delta']:g})={eps_txt}")
     print(f"已写入 {path}")
     return 0
 

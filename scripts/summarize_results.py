@@ -110,6 +110,45 @@ def _fmt_server(server: tuple | None) -> str:
     return f" ({', '.join(parts)})" if parts else ""
 
 
+def _dp_key(run: dict) -> tuple | None:
+    """本地 DP 配置；没开 DP 的 run 返回 None。
+
+    返回三元组 ``(noise_multiplier, max_grad_norm, ε)`` 而不是只取
+    ``noise_multiplier``——理由与 :func:`_server_key` 完全相同，而且这次
+    连"只取主超参"都不够：**ε 也进键**。ε 由 (nm, 抽样率, 步数) 唯一决定，
+    所以它进键不会把本该同组的 run 拆开；但它进键之后，标签才能显示
+    「每点附 ε」（M4 的 DOD ①），而不必让 :func:`_label` 去翻 run 列表。
+
+    ``noise_multiplier=0`` 的对照组与正式臂只差 nm，必须分开——它们测的
+    是两件事：前者是「DP 机制（Poisson + 裁剪）的开销」，后者是「噪声的
+    开销」。
+    """
+    if run.get("noise_multiplier") is None:
+        return None
+    eps = run.get("dp_epsilon")
+    eps = float("inf") if eps is None else float(eps)
+    # 四舍五入到 0.01：ε 是同一个确定函数的输出，同组内逐位相同；
+    # 取整只为让标签短一点，不为合并任何东西。
+    return (
+        float(run["noise_multiplier"]),
+        float(run.get("max_grad_norm") or 0.0),
+        round(eps, 2),
+    )
+
+
+def _fmt_dp(dp: tuple | None) -> str:
+    """配置列里的隐私超参片段。"""
+    if dp is None:
+        return ""
+    nm, norm, eps = dp
+    if nm == 0.0:
+        # 对照组：没有噪声就没有 DP（plan §7）。写成"无保证"而不是 ε=∞，
+        # 因为 ∞ 在表里会被读成"数值很大"，而它的含义是"这一行不是 DP"。
+        return f" + DP 机制 (nm=0, C={norm:g}, 无保证)"
+    eps_txt = "∞" if eps == float("inf") else f"{eps:g}"
+    return f" + DP (nm={nm:g}, C={norm:g}, ε={eps_txt})"
+
+
 def _key(run: dict) -> tuple:
     """分组键。
 
@@ -126,6 +165,9 @@ def _key(run: dict) -> tuple:
     与正式实验只差一个 τ，实测 MAE 差 0.00101 / 0.00128 / 0.00173。
     见 :func:`_server_key` 的 docstring——那一维漏掉时被静默换掉的是
     某一行的数，不是行数。
+
+    **隐私配置同理**（M4 的 DP，2026-10-25）。噪声扫描五档只差一个 nm，
+    而 nm=1 与 nm=8 的 MAE 预期差一个量级。见 :func:`_dp_key`。
     """
     return (
         str(run.get("strategy", "?")),
@@ -136,12 +178,13 @@ def _key(run: dict) -> tuple:
         else run.get("epochs"),
         run.get("n_clients"),
         _server_key(run),
+        _dp_key(run),
     )
 
 
 def _label(key: tuple) -> str:
     """人读的配置名（不含编号）。"""
-    strategy, scheme, alpha, mu, _, _, server = key
+    strategy, scheme, alpha, mu, _, _, server, dp = key
     if strategy == "centralized":
         return "中心化"
     if strategy == "local":
@@ -151,10 +194,12 @@ def _label(key: tuple) -> str:
     else:
         name = "FedAvg" if strategy == "fedavg" else f"FedProx (μ={mu:g})"
     if scheme == "iid":
-        return f"{name} / IID"
-    if scheme == "dirichlet":
-        return f"{name} / Dirichlet"
-    return f"{name} / {scheme}"
+        out = f"{name} / IID"
+    elif scheme == "dirichlet":
+        out = f"{name} / Dirichlet"
+    else:
+        out = f"{name} / {scheme}"
+    return out + _fmt_dp(dp)
 
 
 # 编号与 plan.md §5 的假设表（H1→I1、H2→N1、H3→N1 vs N2）对应。
@@ -174,12 +219,20 @@ def _codes(keys: list[tuple]) -> dict[tuple, str]:
     """给每组分配编号。
 
     同一编号出现多组时（α 扫描、μ 网格、不同 local_epochs 的等训练量对照、
-    M3 的 k 扫描）追加**只在碰撞组之间取值不同**的参数，否则表里会出现
-    两个 N1 而读者分不清哪个对应哪一行。
+    M3 的 k 扫描、M4 的噪声扫描）追加**只在碰撞组之间取值不同**的参数，
+    否则表里会出现两个 N1 而读者分不清哪个对应哪一行。
+
+    DP 组单独拿一个基编号 ``D1``（D = differential privacy）：它与 I1 的
+    strategy/scheme 完全相同，只差客户端侧加没加噪。若沿用 I1，五档噪声会
+    变成 ``I1@le=3,nm=1`` 这样的后缀，读者要数五个后缀才知道自己在看
+    隐私实验；而它确实**不是**同一族实验——分母都变了。
     """
     raw = {}
     for key in keys:
-        raw[key] = _BASE_CODE.get((key[0], key[1]), key[0][:2].upper())
+        if key[7] is not None:
+            raw[key] = "D1"
+        else:
+            raw[key] = _BASE_CODE.get((key[0], key[1]), key[0][:2].upper())
 
     by_code: dict[str, list[tuple]] = {}
     for key, code in raw.items():
@@ -196,6 +249,7 @@ def _codes(keys: list[tuple]) -> dict[tuple, str]:
         varies_le = len({k[4] for k in group}) > 1
         varies_n = len({k[5] for k in group}) > 1
         varies_server = len({k[6] for k in group}) > 1
+        varies_dp = len({k[7] for k in group}) > 1
         for key in group:
             parts = []
             if varies_n and key[5] is not None:
@@ -214,17 +268,21 @@ def _codes(keys: list[tuple]) -> dict[tuple, str]:
                     parts.append(f"η={key[6][0]:g}")
                 if len(taus) > 1:
                     parts.append(f"τ={key[6][3]:g}")
+            if varies_dp:
+                # ε 由 nm 唯一决定，标 nm 就够；ε 在配置列里
+                parts.append(f"nm={key[7][0]:g}")
             out[key] = f"{code}@{','.join(parts)}" if parts else code
     return out
 
 
 def _sort_key(key: tuple, code: str):
-    """组的排序键：先按基编号，再按 N、μ、α、le、服务端 η/τ 数值排。
+    """组的排序键：先按基编号，再按 N、μ、α、le、服务端 η/τ、隐私 nm 数值排。
 
     不能直接按 code 字符串排：`"I1@N=115" < "I1@N=12"`（字典序），表里
     115 会跑到 12 前面去。所以拆成 (基编号, 数值字段) 元组。
     """
     server = key[6] or (None, None, None, None)
+    dp = key[7] or (None, None, None)
     return (
         code.split("@")[0],
         key[5] if key[5] is not None else 0,
@@ -233,6 +291,7 @@ def _sort_key(key: tuple, code: str):
         key[4] if key[4] is not None else -1,
         server[0] if server[0] is not None else -1.0,
         server[3] if server[3] is not None else -1.0,
+        dp[0] if dp[0] is not None else -1.0,
     )
 
 
@@ -312,7 +371,7 @@ def _skew_of(hetero: dict, scheme: str, n_clients: int | None = None) -> float |
 
 def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
                      hetero: dict | None = None) -> list[str]:
-    """按 plan §11.3 的阈值机械判 H1/H2/H3。
+    """按 plan §11.3 的阈值机械判 H1/H2/H3，以及 M4 的 H4。
 
     判定规则（先显著、再分档）：
     - 配对 t 的 p ≥ 0.05 → 一律「未判定」。不显著时「8% 还是 3%」的差别
@@ -354,7 +413,12 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
     # ---- H1：每个 IID FedAvg 组（不同 le 是不同口径、不同 N 是不同规模，
     #      都要分开判；MVP 口径是 le=10、N=23） ----
     out.append("H1（IID 联邦 vs 中心化，差距可以忽略？）")
-    iid_keys = [k for k in groups if k[0] == "fedavg" and k[1] == "iid"]
+    # DP 臂（k[7] is not None）不在这里判：它们也在 IID 上，但 H1 问的是
+    # **没有隐私机制时**联邦能不能追平。把五档 DP 也列进 H1，同一个 MAE 表
+    # 就会在两个假设下各出现一次，而读者无法从行上看出来它们是另一种处理。
+    # DP 的结论统一在下面的 M4 / H4 段，那里有 nm=0 机制对照做分母。
+    iid_keys = [k for k in groups
+                if k[0] == "fedavg" and k[1] == "iid" and k[7] is None]
     if not iid_keys:
         out.append("  没有 IID 的 FedAvg 结果")
     for k in sorted(iid_keys, key=lambda x: _sort_key(x, codes[x])):
@@ -380,9 +444,11 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
     # 效应混在一起——Dirichlet 相对 C0 好 35.9%，相对 IID 也好 16.3%，
     # 两个分母给出完全不同的画面。
     out.append("H2（Non-IID 下 FedAvg 显著掉点？对照组 = 同预算 IID FedAvg）")
-    dir_keys = [k for k in groups if k[0] == "fedavg" and k[1] == "dirichlet"]
+    dir_keys = [k for k in groups
+                if k[0] == "fedavg" and k[1] == "dirichlet" and k[7] is None]
     # 偏斜分片也算 Non-IID：它用标签排序构造，是压力测试档
-    rank_keys = [k for k in groups if k[0] == "fedavg" and k[1] == "sohrank"]
+    rank_keys = [k for k in groups
+                 if k[0] == "fedavg" and k[1] == "sohrank" and k[7] is None]
     if not dir_keys and not rank_keys:
         out.append("  没有 Non-IID 的 FedAvg 结果")
 
@@ -391,7 +457,7 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
         # 同 local_epochs、同 N（同 k）的 IID 组才是对照组。
         # N 也必须相同：k 扫描里「客户端更多」本身就会掉点（每客户端数据更少、
         # 梯度步更少），拿不同 N 的 IID 当分母会把 N 的效应算到偏斜头上。
-        ctrl = ("fedavg", "iid", None, 0.0, k[4], k[5], None)
+        ctrl = ("fedavg", "iid", None, 0.0, k[4], k[5], None, None)
         if ctrl not in groups:
             out.append(f"  {codes[k]}: 缺同预算（local_epochs={k[4]}、N={k[5]}）的 IID 对照组")
             continue
@@ -446,7 +512,7 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
     if not prox_keys:
         out.append("  没有 FedProx 结果")
     for k in sorted(prox_keys, key=lambda x: _sort_key(x, codes[x])):
-        avg_key = ("fedavg", k[1], k[2], 0.0, k[4], k[5], None)
+        avg_key = ("fedavg", k[1], k[2], 0.0, k[4], k[5], None, None)
         if avg_key not in groups:
             out.append(f"  {codes[k]}: 缺同划分的 FedAvg")
             continue
@@ -479,7 +545,7 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
     if not adam_keys:
         out.append("  没有 FedAdam 结果")
     for k in sorted(adam_keys, key=lambda x: _sort_key(x, codes[x])):
-        ctrl = ("fedavg", k[1], None, 0.0, k[4], k[5], None)
+        ctrl = ("fedavg", k[1], None, 0.0, k[4], k[5], None, None)
         if ctrl not in groups:
             out.append(
                 f"  {codes[k]}: 缺同预算（local_epochs={k[4]}、N={k[5]}）的 FedAvg 对照组"
@@ -504,6 +570,111 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
             f"  {codes[k]} vs {codes[ctrl]} 同预算: 改善 {improve:+.1f}%  → {verdict}"
         )
 
+    # ---- M4 / H4：本地 DP 的精度代价随噪声单调上升？ε ≤ 8 时仍可用？ ----
+    # H4 有两半，必须分开判，因为它们的对照组不同：
+    #   (a) 「代价随噪声单调上升」—— 分母是 nm=0 的机制对照组
+    #       （同 Poisson、同裁剪、只差不加噪）。没有它，nm→0 的外推点与
+    #       非 DP 基线之间的落差会被误读成"小噪声很便宜"。
+    #   (b) 「ε ≤ 8 时仍可用」—— 这是 plan §11.3 的 DP 可用性判据
+    #       （劣化 ≤30%）。ε 由 (nm, 抽样率, 步数) 决定，不是自由变量，
+    #       所以「ε ≤ 8」等价于「nm 大到某个值」，而 nm 越大噪声越狠——
+    #       这两半在同一端相遇，正是 H4 的张力所在。
+    out.append("M4 / H4（本地 DP：精度代价随噪声单调上升？ε ≤ 8 时仍可用？）")
+    dp_keys = [k for k in groups if k[7] is not None]
+    if not dp_keys:
+        out.append("  没有 DP 结果")
+        return out
+    # 按 (scheme, local_epochs, N) 分族：不同训练预算的 DP 不可比
+    families: dict[tuple, list[tuple]] = {}
+    for k in dp_keys:
+        families.setdefault((k[1], k[4], k[5]), []).append(k)
+    for fam in sorted(families, key=lambda f: (f[0], f[1] or -1, f[2] or 0)):
+        scheme, le, n_clients = fam
+        keys = sorted(families[fam], key=lambda x: _sort_key(x, codes[x]))
+        # 非 DP 的同预算基线：用来回答"DP 一共付出多少"
+        plain = ("fedavg", scheme, None, 0.0, le, n_clients, None, None)
+        plain_mae = (
+            statistics.mean(r["final_mae"] for r in groups[plain])
+            if plain in groups else None
+        )
+        # nm=0 的机制对照组：用来回答"噪声单独付出多少"
+        zero_keys = [k for k in keys if k[7][0] == 0.0]
+        zero_mae = (
+            statistics.mean(r["final_mae"] for r in groups[zero_keys[0]])
+            if zero_keys else None
+        )
+        head = f"  [{scheme} le={le} N={n_clients}]"
+        if plain_mae is not None:
+            head += f" 非 DP 同预算 {plain_mae:.5f}"
+        if zero_mae is not None:
+            head += f"；nm=0 机制对照 {zero_mae:.5f}"
+        else:
+            head += "；**缺 nm=0 对照组，噪声与机制的开销无法分离**"
+        out.append(head)
+
+        arms = [k for k in keys if k[7][0] > 0]
+        if not arms:
+            out.append("    只有对照组，没有加噪臂")
+            continue
+        maes = []
+        for k in arms:
+            nm = k[7][0]
+            eps = k[7][2]
+            mae = statistics.mean(r["final_mae"] for r in groups[k])
+            maes.append(mae)
+            bits = [f"nm={nm:g}", f"MAE={mae:.5f}"]
+            if eps != float("inf"):
+                bits.append(f"ε={eps:g}")
+            if zero_mae:
+                bits.append(f"相对机制对照 {(mae - zero_mae) / zero_mae * 100:+.1f}%")
+            if plain_mae:
+                bits.append(f"相对非 DP {(mae - plain_mae) / plain_mae * 100:+.1f}")
+            out.append("    " + "  ".join(bits))
+            if zero_mae and k[7][0] > 0:
+                res = _paired(groups[k], groups[zero_keys[0]])
+                if res is not None:
+                    sig, why = is_significant(res)
+                    out.append(
+                        f"      配对 vs nm=0: {res['mean']:+.5f} ± {res['sd']:.5f} "
+                        f"(n={res['n']}, p_t={res['p_t']:.4f}, p_sign={res['p_sign']:.4f})"
+                        f"  {'显著' if sig else '不显著：' + why}"
+                    )
+
+        # (a) 单调性：MAE 必须随 nm 不减
+        if len(maes) >= 2:
+            drops = [
+                (arms[i][7][0], arms[i + 1][7][0])
+                for i in range(len(maes) - 1)
+                if maes[i + 1] < maes[i]
+            ]
+            if drops:
+                pairs = "、".join(f"nm={a:g}→{b:g}" for a, b in drops)
+                out.append(f"    → 单调性**不成立**（{pairs} 处 MAE 下降）")
+            else:
+                out.append("    → 单调性成立（MAE 随 nm 不减）")
+        # (b) ε ≤ 8 且劣化 ≤30%（plan §11.3 的 DP 可用性判据）
+        usable = [
+            k for k in arms
+            if k[7][2] != float("inf") and k[7][2] <= 8.0
+        ]
+        if not usable:
+            out.append(
+                "    → ε ≤ 8 的一档不存在：当前步数 × 抽样率下，nm 再大也只能"
+                "把 ε 压到 8 以上（见 plan §13.4 的测算表）"
+            )
+        else:
+            for k in usable:
+                mae = statistics.mean(r["final_mae"] for r in groups[k])
+                ref = zero_mae if zero_mae else plain_mae
+                if ref is None:
+                    out.append(f"    → ε={k[7][2]:g} 缺对照组，无法判劣化")
+                    continue
+                deg = (mae - ref) / ref * 100
+                verdict = "可用" if deg <= 30 else "代价过高"
+                out.append(
+                    f"    → ε={k[7][2]:g}（nm={k[7][0]:g}）劣化 {deg:+.1f}% "
+                    f"→ {verdict}（阈值 30%）"
+                )
     return out
 
 
@@ -524,7 +695,7 @@ def build_table(runs: list[dict], baseline_prefix: str = "c0__centralized") -> l
     groups = _group(runs)
     codes = _codes(list(groups))
     for key, items in _sorted_groups(groups, codes):
-        strategy, scheme, alpha, mu, _, n_clients, _ = key
+        strategy, scheme, alpha, mu, _, n_clients, _, _ = key
         maes = [r["final_mae"] for r in items]
         rmses = [r["final_rmse"] for r in items if r.get("final_rmse") is not None]
         rel = (statistics.mean(maes) - base_mae) / base_mae * 100
@@ -571,7 +742,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--paired", action="store_true",
                     help="额外输出按 seed 配对比较（噪声大时唯一有分辨力的做法）")
     ap.add_argument("--judge", action="store_true",
-                    help="按 plan §11.3 的阈值机械判 H1/H2/H3")
+                    help="按 plan §11.3 的阈值机械判 H1/H2/H3/M4-H4")
     ap.add_argument("--hetero", default=None,
                     help="heterogeneity.json 路径；判 H2 前用它做 manipulation check")
     ap.add_argument("--write-plan", metavar="PLAN",
@@ -659,7 +830,7 @@ def main(argv: list[str] | None = None) -> int:
         for key, items in _sorted_groups(groups, codes):
             if key[0] != "fedprox":
                 continue
-            avg_key = ("fedavg", key[1], key[2], 0.0, key[4], key[5], None)
+            avg_key = ("fedavg", key[1], key[2], 0.0, key[4], key[5], None, None)
             if avg_key not in groups:
                 print(f"  {tag(key)} − FedAvg: 缺同划分的 FedAvg，跳过")
                 continue
@@ -674,7 +845,7 @@ def main(argv: list[str] | None = None) -> int:
         for key, items in _sorted_groups(groups, codes):
             if key[0] != "fedadam":
                 continue
-            avg_key = ("fedavg", key[1], None, 0.0, key[4], key[5], None)
+            avg_key = ("fedavg", key[1], None, 0.0, key[4], key[5], None, None)
             if avg_key not in groups:
                 print(f"  {tag(key)} − FedAvg: 缺同预算的 FedAvg，跳过")
                 continue
@@ -684,6 +855,32 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             avg_mae = statistics.mean(r["final_mae"] for r in groups[avg_key])
             print(_fmt_paired(tag(key), f"{codes[avg_key]} 同预算", res, avg_mae))
+        # DP 的对照有两层，都要报：
+        #   nm=0 机制对照 → 隔离"噪声"的开销；
+        #   非 DP 同预算基线 → "DP 一共"的开销（含 Poisson + 裁剪）。
+        # 只报后者会把机制开销算到噪声头上，而 plan §7 明确警告过
+        # "把梯度裁剪当成差分隐私"。
+        for key, items in _sorted_groups(groups, codes):
+            if key[7] is None or key[7][0] <= 0:
+                continue
+            zero_key = ("fedavg", key[1], None, 0.0, key[4], key[5], None,
+                        (0.0, key[7][1], float("inf")))
+            if zero_key in groups:
+                res = _paired(items, groups[zero_key])
+                if res is not None:
+                    zm = statistics.mean(r["final_mae"] for r in groups[zero_key])
+                    print(_fmt_paired(tag(key), f"{codes[zero_key]} nm=0 机制对照",
+                                      res, zm))
+            avg_key = ("fedavg", key[1], None, 0.0, key[4], key[5], None, None)
+            if avg_key not in groups:
+                print(f"  {tag(key)} − FedAvg: 缺同预算的非 DP 基线，跳过")
+                continue
+            res = _paired(items, groups[avg_key])
+            if res is None:
+                print(f"  {tag(key)} − FedAvg: 共同 seed 不足 2 个，跳过")
+                continue
+            avg_mae = statistics.mean(r["final_mae"] for r in groups[avg_key])
+            print(_fmt_paired(tag(key), f"{codes[avg_key]} 同预算非 DP", res, avg_mae))
 
     if args.judge:
         print("\n假设判定（plan §11.3：先配对 t 检验，不显著一律未判定；"

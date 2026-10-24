@@ -123,6 +123,8 @@ jobs:
         run: python scripts/check_protocol.py --config configs/mvp.toml
       - name: full.toml 必须零 ERROR
         run: python scripts/check_protocol.py --config configs/full.toml
+      - name: dp.toml 必须零 ERROR（M4 的隐私-效用矩阵）
+        run: python scripts/check_protocol.py --config configs/dp.toml
 
       # 负控：检查器必须能报错。一个永远打印 PASS 的检查器比没有检查器更糟，
       # 因为它会让「已校验」这句话变成假的。
@@ -151,6 +153,25 @@ jobs:
           fi
           python scripts/check_protocol.py --config /tmp/seeds.toml | grep -q "C-SEEDS" || {
             echo "::error::失败码不是 C-SEEDS"; exit 1; }
+      # nm=0 是**对照组**不是 DP 臂（plan §7：没有噪声就没有 DP）。
+      # 把它算进扫描点的话，[0, 1, 2] 会被判成"3 个点"通过，而曲线实际
+      # 只有两个 DP 点——表里写着 3，图画出来是 2。
+      - name: 负控 4：把 nm=0 算作扫描点必须失败
+        run: |
+          sed 's/noise_multiplier = \[0, 1, 2, 4, 8\]/noise_multiplier = [0, 1, 2]/' \
+            configs/dp.toml > /tmp/dp2.toml
+          if python scripts/check_protocol.py --config /tmp/dp2.toml; then
+            echo "::error::检查器把对照组算成了 DP 扫描点"; exit 1
+          fi
+          python scripts/check_protocol.py --config /tmp/dp2.toml | grep -q "C-PRIVACY" || {
+            echo "::error::失败码不是 C-PRIVACY"; exit 1; }
+      - name: 负控 5：噪声点全为 0 必须失败
+        run: |
+          sed 's/noise_multiplier = \[0, 1, 2, 4, 8\]/noise_multiplier = [0, 0]/' \
+            configs/dp.toml > /tmp/dp0.toml
+          if python scripts/check_protocol.py --config /tmp/dp0.toml; then
+            echo "::error::检查器对全零噪声放行了"; exit 1
+          fi
 
   # 划分泄漏检测：生成器必须全 PASS，且必须能抓出被污染的产物。
   partition:
@@ -278,10 +299,42 @@ jobs:
           # "Unable to find a usable engine"，看不出是缺 pyarrow。
           python -m pip install "flwr[simulation]==1.41.0" "torch==2.10.0" \
               "numpy>=1.26" "pandas>=2.1" "scikit-learn>=1.4" pyarrow pytest
+          # opacus 是可选依赖（pyproject 的 [privacy] extra）。装它不是为了
+          # 跑训练，是为了让 check_dp_budget.py 能算 ε——那是 M4 判据的
+          # 横坐标，算错的话整条隐私-效用曲线都是歪的。
+          python -m pip install "opacus==1.6.0"
       - name: 运行依赖 torch/flwr 的测试
         run: |
           python -m pytest tests/test_model.py tests/test_data.py \
-              tests/test_app.py tests/test_train.py -v
+              tests/test_app.py tests/test_train.py tests/test_dp.py \
+              tests/test_dp_budget.py -v
+      # M4 的预算闸门：声明的噪声扫描点里必须至少有一个达到
+      # acceptance.dp_epsilon_max。ε 由 (nm, 抽样率, 步数) 决定，而 q 与
+      # 步数由训练协议钉死——不先算就扫 nm，会扫出三档全都 ε>8 的点，
+      # 而 §11.3 的「ε ≤ 8 时劣化 ≤30%」一条都用不上。
+      #
+      # 退出码 1 的含义是「这份协议的 DP 判据不可用」，不是脚本坏了
+      # （plan §12 R5：DP 下学不动就是结论之一，如实报）。所以这里只对
+      # dp.toml 断言退出码 0——它是当前唯一声明了可达预算的配置。
+      - name: DP 预算：dp.toml 必须有可达 ε ≤ 8 的扫描点
+        run: python scripts/check_dp_budget.py --config configs/dp.toml
+      # 负控：三档全都 ε>8 时必须退出码 1。拿 nm=1 冒充「ε ≤ 8 的可用点」
+      # 是这类实验最容易犯的错——而它在图上看起来只是一个普通的点。
+      - name: 负控：噪声点全在预算外必须失败
+        run: |
+          sed 's/noise_multiplier = \[0, 1, 2, 4, 8\]/noise_multiplier = [0, 0.5, 1.0, 2.0]/' \
+            configs/dp.toml > /tmp/dp_tight.toml
+          set +e
+          python scripts/check_dp_budget.py --config /tmp/dp_tight.toml > /tmp/dpbud.log 2>&1
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "::error::负控失败：三档全都 ε>8，预算检查却通过了"
+            exit 1
+          fi
+          grep -q "没有任何正的扫描点达到" /tmp/dpbud.log || {
+            echo "::error::失败文案不对"; exit 1; }
+          echo "OK 负控生效（退出码 $code）"
       # 注意：这个 job **没有** `pip install -e .`，所以 `flsoh` 不在
       # site-packages 里。pytest 能跑是因为 `tests/conftest.py` 把 src/
       # 注入了 sys.path；裸 `python -c` 没有那层注入，会 ModuleNotFoundError。

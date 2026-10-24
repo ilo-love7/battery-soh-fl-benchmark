@@ -575,7 +575,12 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_WORKERS,
         help=(
             "批次内并发的 h5py 句柄数。默认 1，实测调大没有意义。"
-            "单颗是 134 个串行小请求、抓取耗时占墙钟 98.2%，看着像「颗级"
+            # 注意这里是全角 ％（U+FF05）而不是半角 %：argparse 会拿 help
+            # 字符串做 % 格式化，半角 % 后面跟全角逗号在 Python 3.14 上直接
+            # ValueError（unsupported format character）。写成 %% 在老版本
+            # 上又会显示成两个百分号，所以用全角最稳。tests/test_cli_help.py
+            # 钉住这件事。
+            "单颗是 134 个串行小请求、抓取耗时占墙钟 98.2％，看着像「颗级"
             "并行应该有效」，但 4 颗一组实测：workers=1 单颗 120.5 s、"
             "workers=2 127.8 s、workers=4 106.1 s，只有 1.14 倍。有效聚合"
             "速率约 1.1–1.3 次/秒，开多少连接都不涨（机制未查清，见 "

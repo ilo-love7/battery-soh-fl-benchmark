@@ -1,0 +1,96 @@
+# M4 实验矩阵 —— 本地 DP-SGD 的隐私-效用曲线（docs/plan.md §13.4、§10.1 图 3）
+#
+# 校验：python3 scripts/check_protocol.py --config configs/dp.toml
+# 预算：python3 scripts/check_dp_budget.py --config configs/dp.toml
+# 跑法：
+#   for nm in 0 1 2 4 8; do
+#     for s in 0 1 2 3 4 5 6 7; do
+#       python scripts/run_federated.py --config configs/dp.toml \
+#         --features data/mit-stanford/features.parquet \
+#         --partition-json results/partition-mvp-k5-iid.json \
+#         --strategy fedavg --local-epochs 3 --noise-multiplier $nm --seed $s
+#     done
+#   done
+#
+# 与 mvp.toml 的差别只有 [privacy] 与 [strategies]：数据、划分、训练超参
+# 完全一致——**DP 是客户端侧的改动，与服务端怎么聚合同层无关**（§7 的 L2），
+# 所以对照组必须只差这一个维度。
+
+[meta]
+name = "dp"
+plan_version = "2.0"
+description = "M4：本地 DP-SGD 隐私-效用曲线，5 个噪声点（含 nm=0 机制对照）× 8 seeds"
+# 不声明 app_config：这份配置不是 pyproject.toml 里 [tool.flwr.app.config]
+# 对应的那一份（那是 mvp.toml）。不声明就不做一致性核对，否则会把
+# 「本来就不该一致的两份」判成错误。
+
+[data]
+dataset = "mit-stanford"
+# 与 mvp.toml 同口径：140 原始 − 5 颗跨批次延续 = 135 颗。
+n_cells = 135
+partition_atom = "cell"
+
+[partitions]
+# 全局测试集按整颗电池留出（§6.2 规则 2）。135 − 20 = 115 颗进客户端，
+# 115 / 5 = 23 个客户端，每个 5 颗 × 16 训练循环 = 80 行。
+test_cells = 20
+split_seed = 0
+cells_per_client = [5]
+remainder = "spread"
+# 只跑 IID：M4 问的是「DP 的精度代价」，不是「Non-IID 下 DP 会怎样」。
+# 后者是另一个问题，混在一份矩阵里会让两个效应无法分离（§5.1）。
+schemes = ["iid"]
+
+[strategies]
+# 只跑 fedavg：DP-SGD 的原始设定就是 FedAvg + 逐样本裁剪 + 高斯噪声
+# （Abadi et al. 2016；McMahan et al. 2018 的 FL 版本）。服务端优化器
+# （FedAdam）与客户端 DP 正交，但要分开验——一次只改一个维度。
+include = ["centralized", "fedavg"]
+
+[train]
+num_rounds = 100
+# **这个数直接决定 ε**：步数 = 100 × le × 2 = 600。
+# 取 3 而不是 mvp 的 10，理由有两条，都必须写下来：
+#   1. 与 M3 ② 的等训练量对照同口径（fedadam@le=3、fedavg@le=3 都在这
+#      一档），DP 的代价才能与已有的数直接相减；
+#   2. le=10 会把步数抬到 2000，ε 再翻几倍——而 M3 ② 已证明 le=3 是
+#      「联邦掉点最多」的一档，在那里测 DP 才能看到最坏情况。
+local_epochs = 3
+optimizer = "adam"
+learning_rate = 0.001
+batch_size = 64
+# **batch_size 也是隐私超参**：q = 1/ceil(80/64) = 1/2 = 0.5。
+# 减小 batch 会降 q，但每 epoch 批次数上升、总步数也上升，ε 不一定降——
+# 见 scripts/check_dp_budget.py 的输出，别凭直觉调。
+fraction_fit = 1.0
+baseline_epochs = 300
+
+[seeds]
+values = [0, 1, 2, 3, 4, 5, 6, 7]
+min_required = 3
+
+[privacy]
+enabled = true
+# 0 是**对照组**：逐样本裁剪与 Poisson 抽样照做，不加噪，ε=inf。
+# 没有它，「DP 一共付出多少」与「噪声单独付出多少」分不开——而 plan §7
+# 明确警告「把梯度裁剪当成差分隐私」。所以 0 必须占一个扫描位，
+# 但 check_protocol 不把它算进「≥3 个扫描点」。
+#
+# 1/2/4/8 四档是**先算预算再定的**，不是随手取的。scripts/
+# check_dp_budget.py 在本协议下（q=0.5、600 步、δ=1e-5）算出：
+#   nm=1 → ε≈152    nm=2 → ε≈49    nm=4 → ε≈19    nm=8 → ε≈7.8
+# 只有 nm=8 落在 acceptance.dp_epsilon_max=8 以内，而它对应的噪声 Std
+# （加在批均值梯度上）= 8 × 1.0 / 40 = 0.2，与实测信号 0.147–0.223
+# 同量级。**H4 的两半在这里迎面撞上**，这正是 M4 要测的东西。
+noise_multiplier = [0, 1, 2, 4, 8]
+max_grad_norm = 1.0
+target_delta = 1e-5
+
+[acceptance]
+# §11.3 的判据阈值。全部是相对量，不是绝对 MAE。
+iid_degradation_max = 0.05
+non_iid_degradation_min = 0.10
+fedprox_improvement_min = 0.05
+seed_cv_max = 0.10
+dp_degradation_max = 0.30
+dp_epsilon_max = 8.0

@@ -19,7 +19,8 @@ import summarize_results as sr
 def _run(strategy, seed, mae, *, scheme=None, alpha=None, mu=None,
          n_clients=23, rmse=None, le=None, epochs=None, run_id=None,
          server_lr=None, server_tau=None, server_beta_1=None,
-         server_beta_2=None):
+         server_beta_2=None, noise_multiplier=None, max_grad_norm=None,
+         dp_epsilon=None):
     d = {
         "strategy": strategy,
         "scheme": scheme,
@@ -42,6 +43,14 @@ def _run(strategy, seed, mae, *, scheme=None, alpha=None, mu=None,
         d["server_beta_1"] = 0.9 if server_beta_1 is None else server_beta_1
         d["server_beta_2"] = 0.99 if server_beta_2 is None else server_beta_2
         d["server_tau"] = 1e-3 if server_tau is None else server_tau
+    if noise_multiplier is not None:
+        # 与 run_federated.py 一致：noise_multiplier 一写就连带 max_grad_norm
+        # 与 dp_epsilon。只写 nm 会让「同 nm 不同裁剪范数」的两个 run 在
+        # 测试里也塌成一组——正是 τ 那年踩过的坑。
+        d["noise_multiplier"] = noise_multiplier
+        d["max_grad_norm"] = 1.0 if max_grad_norm is None else max_grad_norm
+        d["target_delta"] = 1e-5
+        d["dp_epsilon"] = dp_epsilon
     return d
 
 
@@ -735,3 +744,178 @@ class TestFedAdamVerdict:
         assert "改善" not in out
 
 
+
+
+class TestNoiseMultiplierGrouping:
+    """M4 的 DP：nm 与裁剪范数必须进分组键。
+
+    与 η 当年同一类事故：噪声扫描五档只差一个 nm，而 nm=1 与 nm=8 的
+    效用预期差一个量级。漏掉这一维时被换掉的是某一行的数——`_by_seed`
+    用后一个文件覆盖 seed 0，行数/seeds 列/均值全都正常。
+    """
+
+    @staticmethod
+    def _sweep_runs():
+        runs = [_run("centralized", s, 0.0020, n_clients=None, epochs=300,
+                     run_id=f"c0__centralized__seed{s}") for s in range(3)]
+        # 非 DP 的同预算基线（le=3，与 M3 ② 的等训练量对照同口径）
+        runs += [_run("fedavg", s, m, scheme="iid", le=3)
+                 for s, m in enumerate([0.0120, 0.0130, 0.0110])]
+        # 五档：nm=0 是对照组（ε=inf），其余是 DP 臂
+        for nm, maes in ((0.0, [0.0125, 0.0135, 0.0115]),
+                         (1.0, [0.0130, 0.0140, 0.0120]),
+                         (2.0, [0.0150, 0.0160, 0.0140]),
+                         (4.0, [0.0250, 0.0260, 0.0240]),
+                         (8.0, [0.0600, 0.0610, 0.0590])):
+            eps = float("inf") if nm == 0 else {1.0: 152.31, 2.0: 49.11,
+                                                4.0: 18.65, 8.0: 7.84}[nm]
+            for s, m in enumerate(maes):
+                runs.append(_run("fedavg", s, m, scheme="iid", le=3,
+                                 noise_multiplier=nm, dp_epsilon=eps,
+                                 run_id=f"fedavg__iid__le3__nm{nm:g}__seed{s}"))
+        return runs
+
+    def test_noise_multiplier_splits_groups(self):
+        groups = sr._group(self._sweep_runs())
+        dp = [k for k in groups if k[7] is not None]
+        assert len(dp) == 5
+        assert {k[7][0] for k in dp} == {0.0, 1.0, 2.0, 4.0, 8.0}
+
+    def test_control_arm_does_not_merge_with_formal_runs(self):
+        """nm=0 与 nm=1 只差一个数，但测的是两件事，不许塌成一组。
+
+        合并后「DP 机制开销」会被算进「噪声开销」，而 plan §7 明确警告
+        过「把梯度裁剪当成差分隐私」。
+        """
+        groups = sr._group(self._sweep_runs())
+        dp = [k for k in groups if k[7] is not None]
+        assert len({k[7][0] for k in dp}) == 5
+        zero = [k for k in dp if k[7][0] == 0.0]
+        assert len(zero) == 1
+        assert zero[0][7][2] == float("inf")
+
+    def test_max_grad_norm_is_part_of_the_key(self):
+        """同 nm 不同裁剪范数是两个实验（敏感度上界不同，ε 也不同）。"""
+        runs = [_run("centralized", s, 0.0020, n_clients=None, epochs=300,
+                     run_id=f"c0__centralized__seed{s}") for s in range(3)]
+        for norm in (1.0, 0.5):
+            runs += [_run("fedavg", s, m, scheme="iid", le=3,
+                          noise_multiplier=1.0, max_grad_norm=norm,
+                          dp_epsilon=10.0 * (1.0 / norm))
+                     for s, m in enumerate([0.013, 0.014, 0.012])]
+        groups = sr._group(runs)
+        dp = [k for k in groups if k[7] is not None]
+        assert len(dp) == 2, "只差 max_grad_norm 的两组被合并了"
+        assert {k[7][1] for k in dp} == {1.0, 0.5}
+
+    def test_codes_get_nm_suffix_and_base_code_d1(self):
+        codes = sr._codes(list(sr._group(self._sweep_runs())))
+        dp = {c for k, c in codes.items() if k[7] is not None}
+        assert dp == {f"D1@nm={nm:g}" for nm in (0, 1, 2, 4, 8)}
+        # 非 DP 的同预算基线不拿 D 编号——它不是 DP 臂。夹具里只有一个 le
+        # 的 FedAvg，所以 varies_le 为假、没有后缀；这不影响要断言的那件事：
+        # 它的基编号仍是 I1，没有被并进 D1。
+        plain = [c for k, c in codes.items()
+                 if k[0] == "fedavg" and k[7] is None and k[4] == 3]
+        assert plain == ["I1"], plain
+
+    def test_label_carries_epsilon(self):
+        """DOD ① 要求「每点附 ε」：ε 必须出现在配置列里。"""
+        key = sr._key(_run("fedavg", 0, 0.013, scheme="iid", le=3,
+                           noise_multiplier=1.0, dp_epsilon=152.31))
+        assert sr._label(key) == "FedAvg / IID + DP (nm=1, C=1, ε=152.31)"
+        zero = sr._key(_run("fedavg", 0, 0.0125, scheme="iid", le=3,
+                            noise_multiplier=0.0, dp_epsilon=float("inf")))
+        assert "无保证" in sr._label(zero)
+        assert "ε=∞" not in sr._label(zero)
+
+    def test_each_row_keeps_its_own_mean(self):
+        rows = sr.build_table(self._sweep_runs())
+        d1 = [r for r in rows if r.startswith("| D1")]
+        assert len(d1) == 5
+        # nm=8 那一行必须真的是它自己的均值（0.060），不是五档的平均
+        assert any("0.06000 ±" in r for r in d1), d1
+
+
+class TestDPVerdict:
+    """judge 的 M4 段：单调性 + ε ≤ 8 可用性，且对照组必须是 nm=0。"""
+
+    @staticmethod
+    def _runs(maes, *, include_zero=True, include_plain=True):
+        runs = [_run("centralized", s, 0.0020, n_clients=None, epochs=300,
+                     run_id=f"c0__centralized__seed{s}") for s in range(3)]
+        if include_plain:
+            runs += [_run("fedavg", s, m, scheme="iid", le=3)
+                     for s, m in enumerate([0.0120, 0.0130, 0.0110])]
+        eps = {0.0: float("inf"), 1.0: 152.31, 2.0: 49.11,
+               4.0: 18.65, 8.0: 7.84}
+        for nm, triple in maes.items():
+            if nm == 0.0 and not include_zero:
+                continue
+            for s, m in enumerate(triple):
+                runs.append(_run("fedavg", s, m, scheme="iid", le=3,
+                                 noise_multiplier=nm, dp_epsilon=eps[nm],
+                                 run_id=f"fedavg__iid__le3__nm{nm:g}__seed{s}"))
+        return runs
+
+    def test_monotone_and_usable_arm_gets_a_verdict(self):
+        runs = self._runs({
+            0.0: [0.0125, 0.0135, 0.0115],
+            1.0: [0.0130, 0.0140, 0.0120],
+            8.0: [0.0140, 0.0150, 0.0130],   # ε=7.84 ≤ 8，劣化 12% ≤ 30%
+        })
+        out = "\n".join(sr.judge_hypotheses(runs))
+        assert "M4 / H4" in out
+        assert "单调性成立" in out
+        assert "ε=7.84" in out
+        assert "可用" in out
+
+    def test_non_monotone_is_reported(self):
+        """MAE 随 nm 下降必须报出来——那不是「DP 免费」，是某处不对。"""
+        runs = self._runs({
+            0.0: [0.0125, 0.0135, 0.0115],
+            1.0: [0.0300, 0.0310, 0.0290],   # 反而更差
+            8.0: [0.0140, 0.0150, 0.0130],   # 又变好
+        })
+        out = "\n".join(sr.judge_hypotheses(runs))
+        assert "单调性**不成立**" in out
+        assert "nm=1→8" in out
+
+    def test_missing_control_arm_is_reported(self):
+        """没有 nm=0 对照组时必须明说，不许把机制开销算到噪声头上。"""
+        runs = self._runs({1.0: [0.013, 0.014, 0.012],
+                           8.0: [0.060, 0.061, 0.059]}, include_zero=False)
+        out = "\n".join(sr.judge_hypotheses(runs))
+        assert "缺 nm=0 对照组" in out
+
+    def test_no_arm_reaches_epsilon_target(self):
+        """三档全都 ε>8 时必须直说，不拿 nm=1 冒充「ε ≤ 8 的可用点」。"""
+        runs = self._runs({0.0: [0.0125, 0.0135, 0.0115],
+                           1.0: [0.013, 0.014, 0.012],
+                           2.0: [0.015, 0.016, 0.014]})
+        out = "\n".join(sr.judge_hypotheses(runs))
+        assert "ε ≤ 8 的一档不存在" in out
+
+    def test_no_dp_runs_at_all(self):
+        runs = [_run("centralized", s, 0.0020, n_clients=None, epochs=300,
+                     run_id=f"c0__centralized__seed{s}") for s in range(3)]
+        out = "\n".join(sr.judge_hypotheses(runs))
+        assert "没有 DP 结果" in out
+
+    def test_dp_arms_are_not_judged_under_h1(self):
+        """DP 臂也在 IID 上，但不该在 H1 段再判一次。
+
+        否则同一批 MAE 会出现在两个假设下，而读者从行上看不出它们是另一种
+        处理（H1 问的是没有隐私机制时联邦能否追平）。DP 的结论只属于 M4 段，
+        那里的分母是 nm=0 机制对照。
+        """
+        runs = self._runs({
+            0.0: [0.0125, 0.0135, 0.0115],
+            1.0: [0.0300, 0.0310, 0.0290],
+            8.0: [0.0600, 0.0610, 0.0590],
+        })
+        out = "\n".join(sr.judge_hypotheses(runs))
+        h1 = out.split("H1（")[1].split("H2（")[0]
+        assert "nm=0" not in h1 and "nm=1" not in h1 and "nm=8" not in h1
+        # 但 M4 段必须还在
+        assert "M4 / H4" in out

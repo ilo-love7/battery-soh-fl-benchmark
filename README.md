@@ -4,15 +4,15 @@
 
 **A federated-learning research plan and executable harness for estimating battery SOH from crowdsourced charging data — without uploading the raw curves.**
 
-[![Stage](https://img.shields.io/badge/stage-second%20batch%20·%20results%20provisional-yellow)](./docs/plan.md)
+[![Stage](https://img.shields.io/badge/stage-third%20batch%20·%20results%20provisional-yellow)](./docs/plan.md)
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-210%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-452%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-> **Status: second experimental batch complete (2026-10-24), results still provisional.**
+> **Status: third experimental batch complete (2026-10-25), results still provisional.**
 > With 8 seeds per configuration all three hypotheses are now settled:
 > **H1 rejected** (federated beats centralized by 23.5% at 3.3× the training
 > budget; at equal budget it is 6.4× worse — the two framings disagree in sign),
@@ -27,6 +27,13 @@
 > 1/3.3 of the training budget — but adds nothing once local epochs suffice.
 > FedBN is deferred (the model deliberately has no BatchNorm, and no second
 > chemistry's ΔQ(V) features are available locally).
+> **M4 added local DP-SGD** (`docs/memo-m4.md`): H4 splits in two. Monotonicity
+> is **supported** (MAE rises strictly with the noise multiplier, 8/8 seeds,
+> p_sign=0.0078), but usability at ε ≤ 8 is **rejected** — the only arm that
+> reaches it (nm=8, ε=7.84) degrades +186.3% against the mechanism control and
+> is **34.7% worse than not federating at all**. ε is not a free variable:
+> q=0.5 and 600 steps put nm=1 at ε=152.31, so the DOD's literal "ε ≤ 8 at
+> noise=1.0" is structurally unreachable under this protocol.
 > Every number in the table is regenerated from `results/*.json` by CI,
 > so nothing in it can be hand-edited.
 
@@ -56,14 +63,16 @@ So this repo treats the *checkers* as the deliverable, not the training loop.
 | **`src/flsoh/matr.py`** | Remote random-access reader for the 7.7 GiB MATR `.mat` files: HTTP Range + h5py `fileobj`. Pulls ~33 MB instead of 3 GB per batch |
 | **`src/flsoh/data.py`** | Feature-table I/O, per-client loaders, and the `LocalStandardizer` that makes "no global normalization" an assertion rather than a comment |
 | **`src/flsoh/app/`** | Flower 1.41 client/server apps (`ClientApp` + `@app.train()` + `flwr.serverapp.strategy`) |
+| **`src/flsoh/dp.py`** | Opacus DP-SGD wrapper. One accountant **per client**, never multiplied by N (the joint mechanism is a product, so `ε_joint = max_i ε_i`) — and the accountant must outlive the rounds, or ε is undercounted 100× |
+| **`scripts/check_dp_budget.py`** | Computes ε **before** you sweep `noise_multiplier`. ε is not a free variable: `q` and the step count are fixed by the protocol, and nm=1 lands at ε=152.31 here |
 | **`scripts/check_continuations.py`** | Proves that 5 batch-2 cells are continuations of 5 batch-1 cells, using four independent lines of evidence. Wrong pairing would delete healthy cells invisibly |
 | **`scripts/build_manifest.py`** | Generates `cells.txt` / `manifest.json` **from the data**, so `P-UNKNOWN` cannot pass against an invented ID list |
 | **`scripts/build_features.py`** | Builds the per-cycle ΔQ(V) feature table, **resumably** — one parquet part per cell, so an interrupted run resumes instead of restarting. Records every dropped curve in `features.spec.json` |
 | **`scripts/check_partition.py`** | Audits a partition file for cross-client leakage, test-set contamination, empty clients |
 | **`scripts/check_protocol.py`** | Audits a TOML matrix before you burn GPU-hours on it |
 | **`scripts/run_local_baseline.py`** | C0 (centralized ceiling) and C1 (local-only floor) baselines — no federated runtime needed |
-| **`configs/mvp.toml`, `configs/full.toml`** | The machine-readable experiment matrix: 135 MIT-Stanford cells, 20 held out, k ∈ {2, 5}, α scan, DP scan |
-| **`tests/`** | 275 tests. Every checker is proven to *fail* on a broken input — a checker that only ever prints PASS is worse than none |
+| **`configs/mvp.toml`, `configs/full.toml`, `configs/dp.toml`** | The machine-readable experiment matrix: 135 MIT-Stanford cells, 20 held out, k ∈ {2, 5}, α scan, DP scan |
+| **`tests/`** | 452 tests. Every checker is proven to *fail* on a broken input — a checker that only ever prints PASS is worse than none |
 
 ## Quick start
 
@@ -167,6 +176,40 @@ mean SOH. N, cells per client, total data and training budget are all unchanged
 — only *which* cells go where changes — and the skew rises to 47.1%. It uses the
 labels, so it is a stress test, not a deployable scenario.
 
+### ε is not a free variable — compute the budget before sweeping `noise_multiplier`
+
+`noise_multiplier` is the knob you turn; ε is what you report. They are not
+freely exchangeable. ε is determined by three quantities, two of which the
+training protocol pins down:
+
+    q     = 1 / ceil(rows per client / batch_size)   # 1/2 = 0.5 here
+    steps = rounds × local_epochs × batches          # 100 × 3 × 2 = 600
+    ε     = RDP(q, noise_multiplier, steps) at δ
+
+With q=0.5, subsampling barely amplifies anything, so ε runs into the hundreds
+fast. Sweeping {0.5, 1, 2} without checking first yields three arms that are all
+ε > 8 — and the acceptance criterion ("≤ 30% degradation at ε ≤ 8") can then
+never be applied to any of them.
+
+```bash
+python3 scripts/check_dp_budget.py --config configs/dp.toml
+```
+
+Two further traps that this repo pays for explicitly:
+
+- **The accountant is per-client and is never multiplied by N.** The joint
+  mechanism is a *product* of mechanisms: changing one record in client *i*
+  changes only client *i*'s update (the other N−1 are bit-identical), so
+  `ε_joint = max_i ε_i`. Multiplying by N inflates the guarantee 23× and *looks*
+  more rigorous — which is what makes it hard to catch.
+- **`noise_multiplier=0` is a control arm, not a DP arm.** It still does
+  per-sample clipping and Poisson sampling but adds no noise, so ε = ∞. Without
+  it you cannot separate "what DP cost in total" from "what the noise alone
+  cost" — here the mechanism costs +39.2% (not significant) and the noise adds
+  another +82%–186% on top.
+
+Full analysis: [`docs/memo-m4.md`](./docs/memo-m4.md).
+
 ### On `flwr run`
 
 `scripts/run_federated.py` is a **local federation loop**, not the Flower
@@ -221,6 +264,8 @@ On Windows, use **Python 3.11 or 3.12**: `flwr[simulation]==1.41.0` pins
 - **Execution plan (v2.1)** — [`docs/plan.md`](./docs/plan.md), the primary document
 - **§3.4 API calibration** — what was verified against the installed `flwr` 1.41.0, including the two discrepancies found
 - **v1 archive** — [`docs/archive/plan-v1.md`](./docs/archive/plan-v1.md), kept for diffing
+- **Milestone memos** — `docs/memo-m2.md` (H1–H3), `docs/memo-m3.md` (skew sweep + FedAdam), `docs/memo-m4.md` (local DP)
+- **Figures** — `docs/figures/fig1-rounds-mae.png` (H1), `fig2-skew-mae.png` (H2), `fig3-privacy-utility.png` (H4); each is generated by its `scripts/make_figure*.py`, never hand-drawn
 - **Flower version notes** — `docs/plan.md` §2: `flwr` 1.41.0 uses `ClientApp` + `@app.train()` + `flwr.serverapp.strategy`, not `NumPyClient`
 
 ## Contributing
@@ -233,7 +278,7 @@ Contributions are welcome, with two rules that are not negotiable:
 ```bash
 python3 -m pytest tests -v        # stdlib-only, runs in CI
 pip install -e ".[train,dev]"     # for the torch/flwr tests
-python3 -m pytest tests -v        # all 200
+python3 -m pytest tests -v        # all 452
 ```
 
 ## License

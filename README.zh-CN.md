@@ -4,15 +4,15 @@
 
 **面向众包充电数据的电池 SOH 估计联邦学习研究平台——原始充电曲线不上传，只联合训练模型。**
 
-[![Stage](https://img.shields.io/badge/stage-second%20batch%20·%20results%20provisional-yellow)](./docs/plan.md)
+[![Stage](https://img.shields.io/badge/stage-third%20batch%20·%20results%20provisional-yellow)](./docs/plan.md)
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-210%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-452%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-> **状态：第二批实验已完成（2026-10-24），结果仍暂定。** 每个配置补到 8 个 seed 后，
+> **状态：第三批实验已完成（2026-10-25），结果仍暂定。** 每个配置补到 8 个 seed 后，
 > 三个假设都有了判定：**H1 推翻**（联邦在 3.3 倍训练量下比中心化好 23.5%，等训练量下
 > 差 6.4 倍——两种口径反号）、**H2 接受**（SOH 排序分片偏斜 47.1%，相对同预算 IID
 > 劣化 +24.2%，p_t=0.0013）、**H3 推翻**（μ=0.01 与 μ=0.1 都差于 μ=0，不存在可用
@@ -21,6 +21,11 @@
 > 服务端动量补回了 `local_epochs=3` 损失的 86.1%（p_t=0.0056，8/8 同向），用三分之
 > 一的训练量达到中心化水平的 MAE；但本地 epoch 已经够用时没有额外收益。FedBN 暂缓
 > （模型刻意不含 BatchNorm，且本地没有第二个化学体系的 ΔQ(V) 特征）。
+> **M4 补上本地 DP-SGD**（`docs/memo-m4.md`）：H4 的答案分成两半。**单调性支持**
+> （MAE 随噪声倍数严格递增，8/8 同向，p_sign=0.0078）；**「ε ≤ 8 时仍可用」推翻**——
+> 唯一达标的那一档（nm=8，ε=7.84）相对机制对照劣化 +186.3%，而且比**完全不联邦
+> 还差 34.7%**。ε 不是自由变量：q=0.5、600 步之下 nm=1 对应 ε=152.31，所以 DOD 字面
+> 写的「noise=1.0 处 ε ≤ 8」在本协议下结构上不可达。
 > 表里每个数都由 CI 从 `results/*.json` 重新生成，手改不了。
 
 ---
@@ -50,14 +55,16 @@
 | **`src/flsoh/matr.py`** | 7.7 GiB MATR `.mat` 的远端随机读：HTTP Range + h5py `fileobj`。每批只拉约 33 MB，不是 3 GB |
 | **`src/flsoh/data.py`** | 特征表读写、按客户端的 DataLoader，以及把「不许全局标准化」从注释变成断言的 `LocalStandardizer` |
 | **`src/flsoh/app/`** | Flower 1.41 客户端/服务端 App（`ClientApp` + `@app.train()` + `flwr.serverapp.strategy`） |
+| **`src/flsoh/dp.py`** | Opacus DP-SGD 包装。会计器**每客户端一个、绝不乘 N**（联合机制是乘积，`ε_joint = max_i ε_i`），而且必须跨轮存活，否则 ε 少算 100 倍 |
+| **`scripts/check_dp_budget.py`** | 在扫 `noise_multiplier` **之前**把 ε 算出来。ε 不是自由变量：q 与步数由协议钉死，本协议下 nm=1 对应 ε=152.31 |
 | **`scripts/check_continuations.py`** | 用四条独立证据证明批次 2 的 5 颗是批次 1 的延续段。配错一对就会静默删掉正常电池 |
 | **`scripts/build_manifest.py`** | **从数据**生成 `cells.txt` / `manifest.json`，让 `P-UNKNOWN` 不可能对着虚构 ID 说 PASS |
 | **`scripts/build_features.py`** | 生成 per-cycle 的 ΔQ(V) 特征表，**可断点续跑**——每颗落一块 parquet 分片，中断后重跑同一条命令即可。丢弃的曲线逐条记进 `features.spec.json` |
 | **`scripts/check_partition.py`** | 对账划分文件：跨客户端泄漏、测试集污染、空客户端 |
 | **`scripts/check_protocol.py`** | 在烧掉 GPU 小时之前先校验实验矩阵 |
 | **`scripts/run_local_baseline.py`** | C0（中心化上限）与 C1（本地独立下限）基线——不需要联邦运行时 |
-| **`configs/mvp.toml`、`configs/full.toml`** | 机器可读的实验矩阵：MIT-Stanford 135 颗电池、留出 20 颗、k ∈ {2, 5}、α 扫描、DP 扫描 |
-| **`tests/`** | 275 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
+| **`configs/mvp.toml`、`configs/full.toml`、`configs/dp.toml`** | 机器可读的实验矩阵：MIT-Stanford 135 颗电池、留出 20 颗、k ∈ {2, 5}、α 扫描、DP 扫描 |
+| **`tests/`** | 452 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
 
 ## 快速开始
 
@@ -156,6 +163,34 @@ run 实际用到的划分。
 全都不变，只改哪些电池分给谁**，偏斜拉到 47.1%。它用到了标签，所以是压力
 测试档，不是可部署场景。
 
+### ε 不是自由变量——扫 `noise_multiplier` 之前先算预算
+
+`noise_multiplier` 是你拧的旋钮，ε 是你报的数，两者不能自由换算。ε 由三个量决定，
+其中两个被训练协议钉死：
+
+    q     = 1 / ceil(每客户端行数 / batch_size)   # 本仓库 1/2 = 0.5
+    步数  = 轮数 × local_epochs × 每 epoch 批次数  # 100 × 3 × 2 = 600
+    ε     = RDP(q, noise_multiplier, 步数) at δ
+
+q=0.5 时 subsampling 几乎没有放大作用，ε 很快就冲到几百。不先算预算就扫
+{0.5, 1, 2}，三档会全部落在 ε > 8，那么「ε ≤ 8 时劣化 ≤ 30%」这条判据一档都用不上。
+
+```bash
+python3 scripts/check_dp_budget.py --config configs/dp.toml
+```
+
+另外两个本仓库显式付过学费的坑：
+
+- **会计器每客户端一个，且绝不乘 N。** 联合机制是 N 个机制的**乘积**：改动客户端 i
+  的一条记录只影响客户端 i 自己的更新（其余 N−1 个逐位不变），所以
+  `ε_joint = max_i ε_i`。乘 N 会让隐私保证凭空紧 23 倍，而**虚高的 ε 看起来很
+  「严谨」，所以这个错特别难被发现**。
+- **`noise_multiplier=0` 是对照组，不是 DP 臂。** 它仍做逐样本裁剪与 Poisson 抽样，
+  只是不加噪，ε 报 `inf`。没有它，「DP 一共付出多少」与「噪声单独付出多少」分不开
+  ——本仓库实测机制开销 +39.2%（不显著），噪声在其上再加 +82%～+186%。
+
+完整分析见 [`docs/memo-m4.md`](./docs/memo-m4.md)。
+
 ### 关于 `flwr run`
 
 `scripts/run_federated.py` 是**本地联邦循环**，不是 Flower 运行时。它存在的原因很具体：
@@ -208,6 +243,8 @@ Windows 上请用 **Python 3.11 或 3.12**：`flwr[simulation]==1.41.0` 硬钉
 - **执行方案（v2.1）** — [`docs/plan.md`](./docs/plan.md)，主文档
 - **§3.4 API 实测校准** — 对照安装的 `flwr` 1.41.0 逐项核对的结果，含发现的两处差异
 - **v1 归档** — [`docs/archive/plan-v1.md`](./docs/archive/plan-v1.md)，保留用于对比
+- **里程碑备忘** — `docs/memo-m2.md`（H1–H3）、`docs/memo-m3.md`（偏斜扫描 + FedAdam）、`docs/memo-m4.md`（本地 DP）
+- **图** — `docs/figures/fig1-rounds-mae.png`（H1）、`fig2-skew-mae.png`（H2）、`fig3-privacy-utility.png`（H4）；每张都由对应的 `scripts/make_figure*.py` 生成，不手绘
 - **Flower 版本说明** — `docs/plan.md` §2：`flwr` 1.41.0 用的是 `ClientApp` + `@app.train()` + `flwr.serverapp.strategy`，不是 `NumPyClient`
 
 ## 参与贡献
@@ -222,7 +259,7 @@ Windows 上请用 **Python 3.11 或 3.12**：`flwr[simulation]==1.41.0` 硬钉
 ```bash
 python3 -m pytest tests -v        # 纯标准库，CI 里跑的就是这些
 pip install -e ".[train,dev]"     # 装 torch/flwr 后才能跑另外 112 条
-python3 -m pytest tests -v        # 全部 275 条
+python3 -m pytest tests -v        # 全部 452 条
 ```
 
 ## 许可证

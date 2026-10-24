@@ -171,9 +171,15 @@ def main(argv: list[str] | None = None) -> int:
                         alpha=0.32, zorder=1)
             ax.plot(xs, [band[x]["mean"] for x in xs], color=colour, lw=2.0,
                     zorder=3, label=f"{label} (n={band[xs[0]]['n']}, mean)")
-        # C0 参考带：它没有「轮」，画成水平带
-        ax.axhline(c0_mean, color="k", ls="--", lw=1.2, zorder=2,
-                   label=f"C0 centralized, 300 epochs (n={len(c0_maes)})")
+        # C0 参考带：它没有「轮」，画成水平带。
+        # **不要用 axhline(..., label=...)**：axhline 用的是混合变换
+        # （x 轴分数、y 数据），而 y 轴是对数的。2026-10-25 实测
+        # matplotlib 3.11.2 在这种情况下会把图例排乱——条目顺序错、
+        # 句柄画成横贯整个坐标区的长线。改用 get_xaxis_transform() 的
+        # 普通 Line2D：横向上还是满宽，但句柄在图例里是正常的一小段。
+        ax.plot([0, 1], [c0_mean, c0_mean], color="k", ls="--", lw=1.2,
+                zorder=2, transform=ax.get_xaxis_transform(),
+                label=f"C0 centralized, 300 epochs (n={len(c0_maes)})")
         ax.fill_between(
             [1, 100], [c0_mean - c0_sd] * 2, [c0_mean + c0_sd] * 2,
             color="k", alpha=0.10, lw=0, zorder=0,

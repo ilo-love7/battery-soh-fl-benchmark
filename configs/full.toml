@@ -52,7 +52,16 @@ min_required = 3
 
 [privacy]
 enabled = true
-noise_multiplier = [0.5, 1.0, 2.0]
+# 0 是**对照组**（只裁剪不加噪，ε=inf），不计入扫描点数。
+# 1/2/4/8 与 configs/dp.toml 同一套，理由见那边的注释与
+# scripts/check_dp_budget.py 的输出：q 与步数由训练协议钉死，
+# ε 不是自由变量。
+#
+# **注意 full.toml 的 num_rounds=200、local_epochs=1，且 k=2 时每客户端
+# 只有 32 行 → 1 批 → q=1.0**（比 dp.toml 的 0.5 更贵）。跑全矩阵前
+# 必须重算一次预算，否则扫出来的点可能一个都达不到 dp_epsilon_max：
+#   python scripts/check_dp_budget.py --config configs/full.toml
+noise_multiplier = [0, 1, 2, 4, 8]
 max_grad_norm = 1.0
 target_delta = 1e-5
 

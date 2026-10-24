@@ -26,12 +26,19 @@ Adam 1e-3    0.00415
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch.utils.data import DataLoader
 
 from flsoh.data import label_offset
 from flsoh.model import MLP
+
+if TYPE_CHECKING:
+    # 只为类型标注。运行期不导入：train.py 属于默认 CI job（只装 pytest），
+    # 而 opacus 是可选依赖，顶部导入会让整个模块在没有 opacus 的机器上
+    # 直接 ImportError。
+    from flsoh.dp import DPTrainer
 
 
 def make_optimizer(model: MLP, name: str, lr: float):
@@ -44,10 +51,15 @@ def make_optimizer(model: MLP, name: str, lr: float):
     raise ValueError(f"未知优化器 {name!r}（adam/sgd）")
 
 
-def _proximal_term(
+def proximal_term(
     model: MLP, global_params: list[torch.Tensor], mu: float
 ) -> torch.Tensor:
     """FedProx 的近端项 ``(μ/2)·‖w − w_global‖²``。
+
+    公开而不是私有，因为 DP 路径（``_train_epochs_dp``）也要用它——近端项
+    加在损失上、与逐样本梯度怎么算无关，所以两条训练路径必须共享同一个
+    实现。写成两份的话，FedProx + DP 的组合会只在其中一条上生效，而那种
+    "某条路径少了近端项"的差异在曲线上看不出来。
 
     没有这一项时 FedProx 就退化成 FedAvg，而它退化得**完全静默**——
     训练照跑、曲线照出，只是「FedProx 组」和「FedAvg 组」的数一模一样。
@@ -72,12 +84,21 @@ def train_epochs(
     optimizer: str = "adam",
     mu: float = 0.0,
     global_params: list[torch.Tensor] | None = None,
+    dp: DPTrainer | None = None,
 ) -> float:
     """在 ``loader`` 上训练 ``epochs`` 轮，返回最后一个 epoch 的平均 loss。
 
     用 MSE 而不是 MAE：SOH 是回归量，MSE 对离群循环更敏感，而 MAE 在
     接近 0 时梯度不降。两个指标都报，但训练目标只有一个（plan.md §10.2）。
+
+    ``dp`` 给一个 :class:`flsoh.dp.DPTrainer` 时走 DP-SGD 分支：模型、
+    优化器、数据加载器全部换成 DP 包装过的那些（``model``/``loader`` 两
+    个参数被忽略）。**两条分支共享同一个函数入口**是故意的——调用方
+    （``run_federated``）不需要记得"DP 要调另一个函数"，而少一个分支
+    就少一处静默走错路的机会。
     """
+    if dp is not None:
+        return _train_epochs_dp(dp, epochs=epochs, mu=mu, global_params=global_params)
     opt = make_optimizer(model, optimizer, lr)
     loss_fn = torch.nn.MSELoss()
     model.train()
@@ -88,9 +109,50 @@ def train_epochs(
             opt.zero_grad()
             loss = loss_fn(model(x).squeeze(-1), y)
             if mu > 0:
-                loss = loss + _proximal_term(model, global_params, mu)
+                loss = loss + proximal_term(model, global_params, mu)
             loss.backward()
             opt.step()
+            total += float(loss.detach()) * x.shape[0]
+            seen += x.shape[0]
+        last = total / max(seen, 1)
+    return last
+
+
+def _train_epochs_dp(
+    dp: DPTrainer,
+    *,
+    epochs: int,
+    mu: float,
+    global_params: list[torch.Tensor] | None,
+) -> float:
+    """DP-SGD 版的训练循环。与非 DP 分支逐行对应，差异只有三处：
+
+    1. ``opt`` 是 ``DPOptimizer``：``step()`` 里做逐样本裁剪、加噪、
+       再按期望批大小缩放，然后才调真正的 Adam。
+    2. ``loader`` 是 Poisson 抽样的（批大小随机，期望 40 而不是 64）。
+    3. 每步 ``dp.steps += 1``——这是会计器的账，漏加会让 ε 少算。
+
+    为什么把循环放在这里而不是 ``flsoh/dp.py``：plan.md §3.3 的模块契约
+    要求"一个模型在若干 loader 上训练"只有一个实现。DP 与非 DP 的差别
+    全在被训练的对象上，不在循环的结构上；分成两个文件就等于允许两边
+    各自演化，而演化方向一定是漂移。
+    """
+    loss_fn = torch.nn.MSELoss()
+    dp.wrapped.train()
+    last = float("nan")
+    for _ in range(epochs):
+        total, seen = 0.0, 0
+        for x, y in dp.loader:
+            dp.optimizer.zero_grad()
+            loss = loss_fn(dp.wrapped(x).squeeze(-1), y)
+            if mu > 0:
+                loss = loss + proximal_term(dp.wrapped, global_params, mu)
+            loss.backward()
+            dp.optimizer.step()
+            dp.steps += 1
+            # Poisson 抽样下 x.shape[0] 每批都不同，所以 loss 必须按实际
+            # 样本数加权，不能按批数平均——按批数平均会让"小批"和"大批"
+            # 等权，而它们的信息量差一倍。
             total += float(loss.detach()) * x.shape[0]
             seen += x.shape[0]
         last = total / max(seen, 1)

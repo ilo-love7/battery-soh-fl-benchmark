@@ -176,11 +176,15 @@ def main(argv: list[str] | None = None) -> int:
             ax.annotate(f"k={k}\nN={n}", (x, y), textcoords="offset points",
                         xytext=(6, 6), fontsize=7.5, color=colour)
 
-    # C0 参考线
+    # C0 参考线。不用 `axhline(..., label=...)`：本图 y 轴是线性的所以现在
+    # 看不出来，但一旦改成对数轴，matplotlib 3.11.2 会把图例排乱（图 1 已经
+    # 踩过，见 tests/test_figure_style.py）。用 get_xaxis_transform() 的
+    # 普通 Line2D 是两种轴上都安全的写法。
     c0 = [r["final_mae"] for r in runs if r.get("strategy") == "centralized"]
     if c0:
-        ax.axhline(statistics.mean(c0), color="k", ls="--", lw=1.1, zorder=1,
-                   label=f"C0 centralized, 300 epochs (n={len(c0)})")
+        ax.plot([0, 1], [statistics.mean(c0)] * 2, color="k", ls="--", lw=1.1,
+                zorder=1, transform=ax.get_xaxis_transform(),
+                label=f"C0 centralized, 300 epochs (n={len(c0)})")
 
     ceiling = (hetero.get("ceiling") or {}).get("between_client_variance_fraction")
     if ceiling:

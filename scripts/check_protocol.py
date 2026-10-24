@@ -110,6 +110,13 @@ def main(argv: list[str] | None = None) -> int:
     if matrix:
         summary = "  ".join(f"k={m['cells_per_client']}→N={m['n_clients']}" for m in matrix)
         print(f"  客户端数：{summary}")
+    # DP 预算提醒。**不作为 issue**：validate_config 约定纯标准库（§3.2），
+    # 算 ε 要 opacus 的 RDP 会计器。真正算账的是 scripts/check_dp_budget.py，
+    # 这里只负责在启用 DP 时把人引过去——因为 ε 不是自由变量，而
+    # 「nm 取小一点就能既私密又好用」是最容易犯的误判。
+    if cfg.get("privacy", {}).get("enabled"):
+        print("  提醒：ε 由 (noise_multiplier, 抽样率, 步数) 决定，跑 DP 前先算预算：")
+        print("        python scripts/check_dp_budget.py --config " + args.config)
     if not issues:
         print("  协议齐备：划分原子、iid 对照、centralized 基线、seed 数、判据阈值均在场")
     return 1 if n_errors else 0
