@@ -9,6 +9,7 @@ from flsoh.protocol import (
     LEVEL_ERROR,
     LEVEL_WARN,
     ProtocolError,
+    check_app_config_agreement,
     expected_clients_for,
     has_errors,
     load_config,
@@ -354,3 +355,72 @@ class TestCopySafety:
         original = copy.deepcopy(base_config())
         mutate("data.n_cells", 1)
         assert base_config() == original
+
+
+class TestAppConfigAgreement:
+    """pyproject 的 run_config 与协议配置必须一致。
+
+    两边分开维护、改一份忘另一份时**谁都不报错**——只是官方运行时与本地
+    循环跑的不是同一个实验。2026-10-24 实际发生过（pyproject 停在 2 轮 ×
+    2 ep，configs/mvp.toml 已是 100 轮 × 10 ep），所以要有这条检查。
+    """
+
+    def _pyproject(self, tmp_path, **app_cfg):
+        body = "\n".join(f"{k} = {v!r}" if isinstance(v, str) else f"{k} = {v}"
+                         for k, v in app_cfg.items())
+        p = tmp_path / "pyproject.toml"
+        p.write_text("[tool.flwr.app]\nconfig = {}\n" if not app_cfg else
+                     f"[tool.flwr.app.config]\n{body}\n", encoding="utf-8")
+        return p
+
+    def _cfg(self):
+        cfg = base_config()
+        cfg["train"]["baseline_epochs"] = 300
+        return cfg
+
+    def test_matching_values_pass(self, tmp_path):
+        p = self._pyproject(tmp_path, **{
+            "num-server-rounds": 100,
+            "local-epochs": 1,
+            "learning-rate": 0.001,
+            "batch-size": 64,
+        })
+        issues = check_app_config_agreement(self._cfg(), p)
+        assert issues == []
+
+    def test_rounds_mismatch_is_error(self, tmp_path):
+        p = self._pyproject(tmp_path, **{
+            "num-server-rounds": 2,          # 配置里是 100
+            "local-epochs": 1,
+            "learning-rate": 0.001,
+            "batch-size": 64,
+        })
+        issues = check_app_config_agreement(self._cfg(), p)
+        assert "C-APP" in codes(issues, LEVEL_ERROR)
+
+    def test_float_tolerance(self, tmp_path):
+        """0.001 在 TOML 里是浮点，不能因为表示误差判成不一致。"""
+        p = self._pyproject(tmp_path, **{
+            "num-server-rounds": 100,
+            "local-epochs": 1,
+            "learning-rate": 0.001,
+            "batch-size": 64,
+        })
+        assert not has_errors(check_app_config_agreement(self._cfg(), p))
+
+    def test_missing_key_is_warning(self, tmp_path):
+        p = self._pyproject(tmp_path, **{"num-server-rounds": 100})
+        issues = check_app_config_agreement(self._cfg(), p)
+        assert "C-APP" in codes(issues, LEVEL_WARN)
+        assert not has_errors(issues)
+
+    def test_missing_file_is_warning(self, tmp_path):
+        issues = check_app_config_agreement(
+            self._cfg(), tmp_path / "nope.toml"
+        )
+        assert "C-APP" in codes(issues, LEVEL_WARN)
+
+    def test_empty_app_config_is_warning(self, tmp_path):
+        p = self._pyproject(tmp_path)
+        issues = check_app_config_agreement(self._cfg(), p)
+        assert "C-APP" in codes(issues, LEVEL_WARN)

@@ -279,10 +279,30 @@ jobs:
         run: |
           python -m pytest tests/test_model.py tests/test_data.py \
               tests/test_app.py tests/test_train.py -v
+      # 注意：这个 job **没有** `pip install -e .`，所以 `flsoh` 不在
+      # site-packages 里。pytest 能跑是因为 `tests/conftest.py` 把 src/
+      # 注入了 sys.path；裸 `python -c` 没有那层注入，会 ModuleNotFoundError。
+      # 这个坑藏了很久——heavy-tests 是手动触发的，第一次真跑才暴露。
       - name: App 三层可导入
-        run: python -c "import flsoh.app.client_app, flsoh.app.server_app; print('apps import OK')"
+        env:
+          PYTHONPATH: src
+        run: |
+          python -c "import flsoh.app.client_app, flsoh.app.server_app; print('apps import OK')"
       # M1 DOD ①：`flwr` 的官方仿真运行时必须真的跑通一次。这条只能在
       # Linux runner 上验证——Windows + 中文主机名会让 raylet 启动即崩
       # （protobuf 拒绝非 UTF-8 主机名），本地无法替代。
       - name: flwr 官方仿真冒烟（M1 DOD ①）
         run: python scripts/ci_smoke_flwr.py
+
+      # 冒烟脚本为了不跑 100 轮，会临时把 pyproject 的 num-server-rounds
+      # 改成 2，跑完在 finally 里改回。进程被 SIGKILL 时 finally 不执行，
+      # 仓库就会留一个「配置说 2 轮」的假状态（这件事真发生过：pyproject
+      # 曾停在 2 轮 × 2 ep，而 configs/mvp.toml 是 100 轮 × 10 ep）。
+      # 所以跑完必须证明它被改回来了。
+      - name: pyproject 必须已恢复（否则下一次提交会带上错的轮数）
+        run: |
+          if ! git diff --exit-code -- pyproject.toml; then
+            echo "::error::ci_smoke_flwr.py 没有恢复 pyproject.toml，轮数/epoch 已被改写"
+            exit 1
+          fi
+          python scripts/check_protocol.py --config configs/mvp.toml

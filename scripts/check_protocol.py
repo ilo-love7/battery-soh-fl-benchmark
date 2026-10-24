@@ -17,12 +17,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from flsoh.protocol import (  # noqa: E402
     LEVEL_ERROR,
+    LEVEL_WARN,
     ProtocolError,
+    check_app_config_agreement,
     expected_clients_for,
     has_errors,
     load_config,
     validate_config,
 )
+
+_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _fmt(level: str, code: str, message: str) -> str:
@@ -32,6 +36,16 @@ def _fmt(level: str, code: str, message: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="校验实验协议 TOML")
     parser.add_argument("--config", required=True, help="配置文件路径")
+    parser.add_argument(
+        "--pyproject",
+        default=str(_ROOT / "pyproject.toml"),
+        help="flwr app 的 run_config 所在文件；官方运行时读它，与 --config 必须一致",
+    )
+    parser.add_argument(
+        "--no-pyproject",
+        action="store_true",
+        help="跳过 pyproject 一致性检查（只在本机没有 pyproject 时用）",
+    )
     parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     args = parser.parse_args(argv)
 
@@ -45,6 +59,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     issues = validate_config(cfg)
+    if not args.no_pyproject:
+        if cfg.get("meta", {}).get("app_config"):
+            issues = issues + check_app_config_agreement(cfg, args.pyproject)
+        else:
+            # pyproject 只能承载一组值。没声明 app_config 的配置（如 full.toml
+            # 的论文全矩阵）本来就不该与它一致，核对会把对的判成错的。
+            issues.append(
+                (
+                    LEVEL_WARN,
+                    "C-APP",
+                    "meta.app_config 未置 true：这份配置与 pyproject.toml 的 "
+                    "run_config 不做一致性核对，官方运行时不会用它",
+                )
+            )
     name = cfg.get("meta", {}).get("name", Path(args.config).stem)
     n_errors = sum(1 for level, _, _ in issues if level == LEVEL_ERROR)
     n_warns = len(issues) - n_errors

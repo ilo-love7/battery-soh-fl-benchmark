@@ -9,6 +9,12 @@
 name = "mvp"
 plan_version = "2.0"
 description = "FedAvg/FedProx × IID/Non-IID，3 seeds，出轮数-精度曲线与表 1"
+# 声明「这份配置就是 pyproject.toml 里 [tool.flwr.app.config] 对应的那一份」。
+# 只有声明了，check_protocol 才会核对两边的轮数/epoch/lr/batch 是否一致。
+# 为什么需要这个开关：pyproject 只能承载一组值，而 configs/ 下可以有多份
+# 矩阵（full.toml 是论文全矩阵，官方运行时不会用它）。不声明就核对，
+# 会把「本来就不该一致的两份」判成错误。
+app_config = true
 
 [data]
 dataset = "mit-stanford"

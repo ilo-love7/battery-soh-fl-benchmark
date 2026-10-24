@@ -342,3 +342,67 @@ def expected_clients_for(cfg: dict, cells_per_client: int) -> int:
         int(cells_per_client),
         str(_get(cfg, "partitions.remainder", "spread")),
     )
+
+
+# pyproject 的 [tool.flwr.app.config] 与协议配置里同义键的对照表。
+# 键名在两边不同（flwr 用连字符、TOML 用下划线嵌套），所以必须显式映射。
+_APP_CONFIG_AGREEMENT = {
+    "num-server-rounds": ("train", "num_rounds"),
+    "local-epochs": ("train", "local_epochs"),
+    "learning-rate": ("train", "learning_rate"),
+    "batch-size": ("train", "batch_size"),
+}
+
+
+def check_app_config_agreement(cfg: dict, pyproject: str | Path) -> list[tuple[str, str, str]]:
+    """检查 pyproject 的 run_config 是否与协议配置一致。
+
+    为什么必须查：**官方运行时读 pyproject，本地联邦循环读 configs/*.toml。**
+    这两份是分开维护的，改了一份忘了另一份时两边都不会报错——只是跑出来的
+    轮数与本地 epoch 数不一样，而结果 JSON 里记的是本地那份。
+
+    2026-10-24 实际发生过：`configs/mvp.toml` 已经是 100 轮 × 10 ep，
+    `pyproject.toml` 还停在 2 轮 × 2 ep。没人发现，因为 heavy-tests 是手动
+    触发的，而那一步的检查又是坏的（ModuleNotFoundError）。
+    """
+    issues: list[tuple[str, str, str]] = []
+    path = Path(pyproject)
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return [(LEVEL_WARN, "C-APP", f"读不出 {path}：{exc}")]
+    except tomllib.TOMLDecodeError as exc:
+        return [(LEVEL_ERROR, "C-APP", f"{path} 不是合法 TOML：{exc}")]
+
+    app_cfg = (
+        data.get("tool", {}).get("flwr", {}).get("app", {}).get("config", {})
+    )
+    if not app_cfg:
+        return [(LEVEL_WARN, "C-APP", f"{path} 里没有 [tool.flwr.app.config]")]
+
+    for app_key, (section, key) in _APP_CONFIG_AGREEMENT.items():
+        dotted = f"{section}.{key}"
+        expected = _get(cfg, dotted)
+        if expected is None:
+            continue  # 协议里没这一项，无从对照
+        if app_key not in app_cfg:
+            issues.append(
+                (LEVEL_WARN, "C-APP", f"{path.name} 缺 {app_key}，官方运行时会用默认值")
+            )
+            continue
+        got = app_cfg[app_key]
+        if _is_number(got) and _is_number(expected):
+            same = abs(float(got) - float(expected)) < 1e-12
+        else:
+            same = got == expected
+        if not same:
+            issues.append(
+                (
+                    LEVEL_ERROR,
+                    "C-APP",
+                    f"{path.name} 的 {app_key}={got!r} 与配置的 {dotted}={expected!r} "
+                    "不一致：官方运行时读 pyproject、本地循环读 TOML，"
+                    "两份会跑出不同的训练量",
+                )
+            )
+    return issues

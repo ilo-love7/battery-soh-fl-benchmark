@@ -60,8 +60,8 @@ clientapp = "flsoh.app.client_app:app"
 # 键名必须用连字符（flwr 的约定），且与 src/flsoh/app/*.py 里读取的一致——
 # 少一个键不会在启动时报错，会在第一轮训练时 KeyError。
 [tool.flwr.app.config]
-num-server-rounds = 2
-local-epochs = 2
+num-server-rounds = 100
+local-epochs = 10
 optimizer = "adam"
 learning-rate = 0.001
 proximal-mu = 0.0
