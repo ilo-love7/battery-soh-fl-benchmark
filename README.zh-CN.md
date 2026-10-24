@@ -76,18 +76,47 @@ mvp.toml  cells=135  test=20
 
 ```bash
 python3 scripts/check_partition.py --config configs/mvp.toml \
+    --cells-file data/mit-stanford/cells.txt \
     --emit results/partition.json --emit-k 5 --emit-scheme iid
 python3 scripts/check_partition.py --config configs/mvp.toml \
+    --cells-file data/mit-stanford/cells.txt \
     --partition-json results/partition.json
 ```
+
+生成时 `--cells-file` 不能省：省了它会退回占位 ID（`cell-000`…），
+于是对账报出「135 颗电池不在清单内」——那个错指向划分，而真实原因是漏了参数。
 
 跑基线（需要 `pip install -e ".[train]"`）：
 
 ```bash
 python3 scripts/run_local_baseline.py --config configs/mvp.toml \
-    --features data/mit-stanford/features.csv \
+    --features data/mit-stanford/features.parquet \
     --partition-json results/partition.json --out results/
 ```
+
+跑一档联邦配置，再把所有 run 汇总成表 1：
+
+```bash
+python3 scripts/run_federated.py --config configs/mvp.toml \
+    --features data/mit-stanford/features.parquet \
+    --partition-json results/partition.json \
+    --strategy fedavg --rounds 100 --seed 0 --out results/
+python3 scripts/summarize_results.py --results results/
+```
+
+### 关于 `flwr run`
+
+`scripts/run_federated.py` 是**本地联邦循环**，不是 Flower 运行时。它存在的原因很具体：
+Flower 1.41 的仿真后端只有 ray，而 ray 的 raylet 在本开发机上启动即崩——主机名是 GBK
+编码的中文，protobuf 拒绝这种非 UTF-8 数据。`RAY_raylet_start_wait_time_s`、
+`_node_ip_address`、`COMPUTERNAME` 覆盖三种绕法都无效。
+
+官方运行时改在 CI 里验证（`scripts/ci_smoke_flwr.py`，Linux runner，合成数据跑 2 轮）。
+两条路径共用 `flsoh/train.py`，所以可能产生差异的只有聚合，而聚合被
+`tests/test_train.py` 钉住。完整排查过程见 [`docs/env-limitations.md`](docs/env-limitations.md)。
+
+Windows 上请用 **Python 3.11 或 3.12**：`flwr[simulation]==1.41.0` 硬钉
+`ray==2.55.1`，而该版本没有 cp313 的 Windows wheel。
 
 ## 每次实验前的七道检查
 

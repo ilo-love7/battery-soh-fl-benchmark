@@ -109,15 +109,25 @@ class TestPartitionIdMapping:
 
 class TestNumExamplesReported:
     def test_train_reports_num_examples(self, wired):
+        """num-examples 必须是**实际参与训练的行数**。
+
+        client-0 只有 1 颗电池、20 个循环，按时间切 80% 后训练集是 16 行。
+        这条原来断言 20——那是按电池切的结果（1 颗电池全进训练，val 集为空），
+        而 plan.md §6.2 规则 1 要求客户端内按时间切。数字变了不是回归，
+        是切分口径修对了：val 从"空"变成 4 个未来循环。
+        """
         out = ca.train(_query(), _Ctx(partition_id=0))
         metrics = dict(out.content["metrics"])
         assert "num-examples" in metrics
-        assert metrics["num-examples"] == 20  # 1 颗电池 × 20 循环
+        assert metrics["num-examples"] == 16  # 20 循环 × 80%
 
     def test_evaluate_reports_num_examples(self, wired):
         out = ca.train(_query(), _Ctx(partition_id=0))
         metrics = dict(ca.evaluate(out, _Ctx(partition_id=0)).content["metrics"])
         assert "num-examples" in metrics
+        # 按时间切之后本地 val 不再是空的（按电池切时 client-0 只有 1 颗电池，
+        # cells[1:] 为空，evaluate 会走"没有验证集"分支返回 0）
+        assert metrics["num-examples"] == 4  # 20 循环 × 20%
 
     def test_train_loss_is_finite(self, wired):
         out = ca.train(_query(), _Ctx(partition_id=0))

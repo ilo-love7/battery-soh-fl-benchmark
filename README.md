@@ -74,18 +74,51 @@ Emit a partition for a run, then audit the file that was actually used:
 
 ```bash
 python3 scripts/check_partition.py --config configs/mvp.toml \
+    --cells-file data/mit-stanford/cells.txt \
     --emit results/partition.json --emit-k 5 --emit-scheme iid
 python3 scripts/check_partition.py --config configs/mvp.toml \
+    --cells-file data/mit-stanford/cells.txt \
     --partition-json results/partition.json
 ```
+
+`--cells-file` is not optional when you emit: without it the checkers fall back
+to placeholder IDs (`cell-000`…), and the audit will then report 135 unknown
+cells — pointing at the partition instead of at the missing flag.
 
 Run the baselines (needs `pip install -e ".[train]"`):
 
 ```bash
 python3 scripts/run_local_baseline.py --config configs/mvp.toml \
-    --features data/mit-stanford/features.csv \
+    --features data/mit-stanford/features.parquet \
     --partition-json results/partition.json --out results/
 ```
+
+Run one federated configuration, then summarize everything into Table 1:
+
+```bash
+python3 scripts/run_federated.py --config configs/mvp.toml \
+    --features data/mit-stanford/features.parquet \
+    --partition-json results/partition.json \
+    --strategy fedavg --rounds 100 --seed 0 --out results/
+python3 scripts/summarize_results.py --results results/
+```
+
+### On `flwr run`
+
+`scripts/run_federated.py` is a **local federation loop**, not the Flower
+runtime. It exists because Flower 1.41's simulation backend is ray-only, and
+ray's raylet aborts on this development machine: the hostname is GBK-encoded
+Chinese, and protobuf rejects it as invalid UTF-8. `RAY_raylet_start_wait_time_s`,
+`_node_ip_address` and a `COMPUTERNAME` override all fail to work around it.
+
+The official runtime is exercised in CI instead
+(`scripts/ci_smoke_flwr.py`, Linux runner, 2 rounds on synthetic data). Both
+paths share `flsoh/train.py`, so the only thing that can differ is aggregation,
+and aggregation is pinned by `tests/test_train.py`. See
+[`docs/env-limitations.md`](docs/env-limitations.md) for the full trace.
+
+On Windows, use **Python 3.11 or 3.12**: `flwr[simulation]==1.41.0` pins
+`ray==2.55.1`, which ships no cp313 Windows wheel.
 
 ## The seven checks that gate every experiment
 

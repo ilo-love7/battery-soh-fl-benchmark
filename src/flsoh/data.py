@@ -55,6 +55,7 @@ from flsoh.features import (  # noqa: F401 —— re-export，调用方一直从
     CELL_COL,
     CYCLE_COL,
     FEATURE_PREFIX,
+    SOH_CENTER,
     SOH_COL,
     DataContractError,
     FeatureTable,
@@ -81,17 +82,50 @@ class CellDataset(Dataset):
     只认 ``cell_id`` 集合，不做任何时间切分——时间切分的规则是
     plan.md §6.2 规则 1（以电池为最小原子，客户端内再按时间切 train/val），
     属于调用方的策略，不是加载器该决定的事。
+
+    **标签在这里中心化**（``y = soh - label_center``，默认 :data:`SOH_CENTER`）。
+    放在这一层的理由：它是数据契约的一部分，所有训练与评估路径都必须经过
+    同一个变换；只要有一处忘了加回，指标就会莫名其妙地差 1.0。
+    ``label_center`` 是实例属性，评估方从 loader.dataset 读它加回，
+    不靠调用方自己记。
+
+    不中心化的代价是实测过的：C0 中心化基线 300 ep 的测试 MAE 从 0.00155
+    劣化到 0.11333（73 倍），因为损失几乎全被「输出偏置差 1.0」占据。
     """
 
-    def __init__(self, table: FeatureTable, cell_ids, scaler=None) -> None:
+    def __init__(
+        self,
+        table: FeatureTable,
+        cell_ids,
+        scaler=None,
+        *,
+        label_center: float = SOH_CENTER,
+        cycles=None,
+    ) -> None:
         wanted = list(dict.fromkeys(cell_ids))
         unknown = set(wanted) - set(table.cells)
         if unknown:
             raise DataContractError(f"电池不在特征表里：{sorted(unknown)[:5]}")
+        if not isinstance(label_center, (int, float)):
+            raise DataContractError(f"label_center 必须是数值，收到 {label_center!r}")
         sub = table.subset(wanted)
+        if cycles is not None:
+            # 客户端内按时间切 train/val（plan.md §6.2 规则 1）。切的是**循环号**
+            # 而不是电池：同一颗电池的前 80% 循环进训练、后 20% 进验证，
+            # 这样验证集测的是"能不能外推到未来循环"，而不是"能不能认出另一颗电池"。
+            keep = np.isin(sub[CYCLE_COL].to_numpy(), np.asarray(list(cycles)))
+            sub = sub[keep]
+            if len(sub) == 0:
+                raise DataContractError(
+                    f"按循环过滤后一行不剩：cells={wanted[:3]} cycles={sorted(cycles)[:5]}…"
+                )
         self.cell_ids = wanted
         self.cycles = sub[CYCLE_COL].to_numpy()
-        self.y = torch.tensor(sub[SOH_COL].to_numpy(dtype=float), dtype=torch.float32)
+        self.label_center = float(label_center)
+        self.y = torch.tensor(
+            sub[SOH_COL].to_numpy(dtype=float) - self.label_center,
+            dtype=torch.float32,
+        )
         x = sub.loc[:, list(table.feats)].to_numpy(dtype=float)
         if scaler is not None:
             x = scaler.transform(x)
@@ -105,10 +139,28 @@ class CellDataset(Dataset):
         return self.x[idx], self.y[idx]
 
 
+def label_offset(loader: DataLoader) -> float:
+    """读回 ``loader`` 用的标签中心化偏移，评估时必须加回。
+
+    从 ``loader.dataset`` 读而不是让调用方自己传一个常量，是因为
+    「训练时减了什么」和「评估时加什么」必须是同一个数。调用方各自记一份，
+    迟早会漂移，而漂移的表现是指标整体差 1.0——看起来像模型崩了。
+
+    读不到就抛错，不返回 0：返回 0 会让指标静默地错 1.0，比崩掉更难查。
+    """
+    dataset = getattr(loader, "dataset", None)
+    center = getattr(dataset, "label_center", None)
+    if center is None:
+        raise DataContractError(
+            "loader 的 dataset 没有 label_center 属性，评估无法还原 SOH 尺度。"
+            "请用 CellDataset 构造数据集，不要自己拼 TensorDataset。"
+        )
+    return float(center)
+
+
 @dataclass
 class ClientData:
     """一个客户端的训练/验证 DataLoader 对，附带审计信息。"""
-
     train_loader: DataLoader
     val_loader: DataLoader
     train_cells: tuple[str, ...]
@@ -126,12 +178,16 @@ def make_client_loaders(
     batch_size: int = 64,
     seed: int = 0,
     num_workers: int = 0,
+    label_center: float = SOH_CENTER,
 ) -> ClientData:
     """构造一个客户端的 DataLoader 对（plan.md §3.2 的模块契约入口）。
 
     标准化器只拟合 ``train_cell_ids``，随后断言 ``val_cell_ids`` 没参与。
     ``shuffle`` 用派生自 ``seed`` 的 generator，不用全局随机——否则
     plan.md §2.3 的"固定 seed"是一条空话。
+
+    标签按 ``label_center`` 中心化（默认 :data:`SOH_CENTER`），见
+    :class:`CellDataset`。
     """
     if batch_size <= 0:
         raise DataContractError(f"batch_size 必须为正，收到 {batch_size}")
@@ -147,8 +203,12 @@ def make_client_loaders(
     scaler = LocalStandardizer().fit(table, train_cells)
     scaler.check_no_leak(val_cells, label="本地验证集")
 
-    train_ds = CellDataset(table, train_cells, scaler)
-    val_ds = CellDataset(table, val_cells, scaler) if val_cells else None
+    train_ds = CellDataset(table, train_cells, scaler, label_center=label_center)
+    val_ds = (
+        CellDataset(table, val_cells, scaler, label_center=label_center)
+        if val_cells
+        else None
+    )
 
     g = torch.Generator()
     g.manual_seed(int(seed))
@@ -172,6 +232,100 @@ def make_client_loaders(
     )
 
 
+def split_cycles_by_time(
+    table: FeatureTable, cell_ids, *, train_fraction: float = 0.8
+) -> tuple[list[int], list[int]]:
+    """把该客户端所有电池的循环号按时间切成 train / val 两段。
+
+    plan.md §6.2 规则 1 要求「客户端内再按时间切 train/val」。按**电池**切
+    （``cells[:split]`` / ``cells[split:]``）看起来也像切分，但它测的是
+    「能不能认出另一颗电池」，而 SOH 预测真正要问的是「能不能外推到未来
+    循环」。两者不是一回事，且前者会给出虚高的本地 val 指标。
+
+    切的是循环号而不是行：同一颗电池的前 80% 循环进训练、后 20% 进验证，
+    所以 train 与 val 的电池集合**相同**——这正是按时间切与按电池切的
+    关键区别，调用方不要拿「有没有交集」来判泄漏（那种检查在这里是反的）。
+    """
+    if not 0.0 < train_fraction < 1.0:
+        raise DataContractError(f"train_fraction 必须在 (0,1)，收到 {train_fraction}")
+    wanted = list(dict.fromkeys(cell_ids))
+    if not wanted:
+        raise DataContractError("cell_ids 为空，无法按时间切分")
+    cycles = np.sort(np.unique(table.subset(wanted)[CYCLE_COL].to_numpy()))
+    if len(cycles) < 2:
+        raise DataContractError(
+            f"只有 {len(cycles)} 个循环号，无法切成 train/val"
+        )
+    cut = int(len(cycles) * train_fraction)
+    cut = min(max(cut, 1), len(cycles) - 1)  # 两边都至少留一个循环
+    return cycles[:cut].tolist(), cycles[cut:].tolist()
+
+
+def make_client_loaders_by_time(
+    table: FeatureTable,
+    cell_ids,
+    *,
+    batch_size: int = 64,
+    seed: int = 0,
+    num_workers: int = 0,
+    label_center: float = SOH_CENTER,
+    train_fraction: float = 0.8,
+    scaler=None,
+) -> ClientData:
+    """按时间切 train/val 的客户端 loader 对（plan.md §6.2 规则 1）。
+
+    与 :func:`make_client_loaders` 的区别只有一处：这里的 train/val 是
+    **同一批电池的不同循环**，不是两批电池。所以不套用「train 与 val 电池
+    不得有交集」那条断言——那条断言属于按电池切的场景。
+
+    ``scaler`` 显式给出时直接用它，不再本地拟合。**这不是给生产用的**：
+    传一个从全部客户端数据拟合的 scaler 就等于全局标准化（plan.md §14 坑 1）。
+    它存在的唯一理由是跑对照实验，量化「本地标准化本身带来多少劣化」——
+    那个数不给出来，就分不清联邦掉点是数据异质还是标准化噪声。
+    """
+    if batch_size <= 0:
+        raise DataContractError(f"batch_size 必须为正，收到 {batch_size}")
+    cells = list(dict.fromkeys(cell_ids))
+    if not cells:
+        raise DataContractError("cell_ids 为空，无法构造客户端数据")
+    train_cycles, val_cycles = split_cycles_by_time(
+        table, cells, train_fraction=train_fraction
+    )
+
+    if scaler is None:
+        scaler = LocalStandardizer().fit(table, cells)
+
+    train_ds = CellDataset(
+        table, cells, scaler, label_center=label_center, cycles=train_cycles
+    )
+    val_ds = CellDataset(
+        table, cells, scaler, label_center=label_center, cycles=val_cycles
+    )
+
+    g = torch.Generator()
+    g.manual_seed(int(seed))
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=g,
+        num_workers=num_workers,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+    return ClientData(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        train_cells=tuple(cells),
+        val_cells=tuple(cells),
+        standardizer_fitted_on=scaler.fitted_on,
+        n_train=len(train_ds),
+        n_val=len(val_ds),
+    )
+
+
 def make_global_test_loader(
     table: FeatureTable,
     test_cell_ids,
@@ -179,6 +333,7 @@ def make_global_test_loader(
     strategy: str = "test",
     fixed_scale: np.ndarray | None = None,
     batch_size: int = 64,
+    label_center: float = SOH_CENTER,
 ) -> tuple[DataLoader, str]:
     """服务器端全局测试集的 DataLoader（plan.md §11.2 的 C0/C1 共用）。
 
@@ -202,7 +357,7 @@ def make_global_test_loader(
     else:
         raise DataContractError(f"未知的全局测试标准化策略 {strategy!r}（test/fixed/none）")
 
-    ds = CellDataset(table, cells, scaler)
+    ds = CellDataset(table, cells, scaler, label_center=label_center)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
     return loader, strategy
 

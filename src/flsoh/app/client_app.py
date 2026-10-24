@@ -14,14 +14,24 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
 from torch.utils.data import DataLoader
 
-from flsoh.data import ClientData, FeatureTable, make_client_loaders
+from flsoh.data import (
+    ClientData,
+    FeatureTable,
+    label_offset,
+    load_feature_table,
+    make_client_loaders_by_time,
+)
 from flsoh.model import MLP, build_model
 from flsoh.partition import client_order
+from flsoh.train import evaluate as evaluate_metrics
+from flsoh.train import train_epochs
 
 app = ClientApp()
 
@@ -31,6 +41,40 @@ _TABLE: FeatureTable | None = None
 _PARTITION: dict[str, list[str]] | None = None
 _ORDER: list[str] = []
 _CLIENTS: dict[str, ClientData] = {}
+
+# 仿真运行时（ray 后端）把 ClientApp 序列化到独立进程，模块级注入不会跟过去。
+# 这两个环境变量是子进程唯一能拿到的入口。名字写死在这里，运行脚本照抄。
+ENV_FEATURES = "FLSOH_FEATURES"
+ENV_PARTITION = "FLSOH_PARTITION"
+
+
+def _ensure_loaded() -> None:
+    """未 ``configure()`` 时，从环境变量把特征表与划分装进来。
+
+    为什么需要这一层：flwr 1.41 的仿真后端把 ``ClientApp`` 序列化到独立
+    actor 进程，``configure()`` 设的模块级变量只活在父进程里。子进程
+    import 本模块时 ``_TABLE`` 又是 None，于是第一轮训练就抛
+    「未 configure()」——而这个错在父进程里完全看不出来。
+
+    加载的仍然是 ``check_partition.py --emit`` 的**产物文件**，不是现场
+    重新划分一次。这点很重要：现场划分会让「跑的到底是哪份划分」不可查。
+    """
+    if _TABLE is not None and _PARTITION is not None:
+        return
+    feat = os.environ.get(ENV_FEATURES)
+    part = os.environ.get(ENV_PARTITION)
+    if not feat or not part:
+        raise RuntimeError(
+            f"client_app 未 configure()，且环境变量 {ENV_FEATURES} / "
+            f"{ENV_PARTITION} 未设置。仿真运行请用 scripts/run_federated.py，"
+            "它会设好这两个变量。"
+        )
+    import json
+    from pathlib import Path
+
+    table = FeatureTable.from_frame(load_feature_table(feat))
+    payload = json.loads(Path(part).read_text(encoding="utf-8"))
+    configure(table, payload["partition"])
 
 
 def configure(table: FeatureTable, partition: dict[str, list[str]], **loader_kwargs) -> None:
@@ -70,59 +114,23 @@ def _client_data(cid: str, run_config: dict, node_config: dict) -> ClientData:
         raise RuntimeError("client_app 未 configure()：特征表缺失")
     if cid not in _CLIENTS:
         cells = _PARTITION[cid]
-        # 客户端内按时间切 train/val：取前 80% 循环训练，后 20% 验证。
-        # 切分单位是循环而不是电池——同一颗电池的循环不能跨 train/val
-        # 之外的边界，但 train/val 之间按时间是允许的（plan.md §6.2 规则 1）。
-        split = max(1, int(len(cells) * 0.8))
-        _CLIENTS[cid] = make_client_loaders(
+        # 客户端内按**时间**切 train/val（plan.md §6.2 规则 1）：同一批电池的
+        # 前 80% 循环训练、后 20% 验证。这里原来写的是 cells[:split] /
+        # cells[split:]，也就是按电池切——注释说的和代码做的是两件事。
+        # 按电池切测的是"能不能认出另一颗电池"，不是"能不能外推到未来循环"，
+        # 且本地 val 会虚高。
+        _CLIENTS[cid] = make_client_loaders_by_time(
             _TABLE,
-            cells[:split],
-            cells[split:],
+            cells,
             batch_size=int(run_config.get("batch-size", 64)),
             seed=int(node_config.get("partition-id", 0)),
         )
     return _CLIENTS[cid]
 
 
-def _train_one_round(
-    model: MLP, loader: DataLoader, local_epochs: int, lr: float
-) -> float:
-    """本地训练。返回最后一个 epoch 的平均 loss。
-
-    用 MSE 而不是 MAE：SOH 是回归量，MSE 对离群循环更敏感，
-    而 MAE 在接近 0 时梯度不降。两者都要报（plan.md §10.2 表 1）。
-    """
-    opt = torch.optim.SGD(model.parameters(), lr=lr)
-    loss_fn = torch.nn.MSELoss()
-    model.train()
-    last = float("nan")
-    for _ in range(local_epochs):
-        total, seen = 0.0, 0
-        for x, y in loader:
-            opt.zero_grad()
-            pred = model(x).squeeze(-1)
-            loss = loss_fn(pred, y)
-            loss.backward()
-            opt.step()
-            total += float(loss.detach()) * x.shape[0]
-            seen += x.shape[0]
-        last = total / max(seen, 1)
-    return last
-
-
-def _mae(model: MLP, loader: DataLoader) -> float:
-    model.eval()
-    total, seen = 0.0, 0
-    with torch.no_grad():
-        for x, y in loader:
-            pred = model(x).squeeze(-1)
-            total += float((pred - y).abs().sum())
-            seen += x.shape[0]
-    return total / max(seen, 1)
-
-
 @app.train()
 def train(msg: Message, context: Context) -> Message:
+    _ensure_loaded()
     model = MLP(int(context.run_config["input-dim"]))
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
 
@@ -131,8 +139,24 @@ def train(msg: Message, context: Context) -> Message:
 
     local_epochs = int(context.run_config.get("local-epochs", 1))
     lr = float(msg.content["config"]["lr"])
+    optimizer = str(context.run_config.get("optimizer", "adam"))
+    mu = float(context.run_config.get("proximal-mu", 0.0))
 
-    train_loss = _train_one_round(model, data.train_loader, local_epochs, lr)
+    # FedProx 的近端项需要"本轮开始时的全局参数"。它就是 msg 里带过来的那份，
+    # 所以在训练前先克隆下来——训练开始后 model 会被就地更新，再取就晚了。
+    global_params = (
+        [p.detach().clone() for p in model.parameters()] if mu > 0 else None
+    )
+
+    train_loss = train_epochs(
+        model,
+        data.train_loader,
+        epochs=local_epochs,
+        lr=lr,
+        optimizer=optimizer,
+        mu=mu,
+        global_params=global_params,
+    )
 
     arrays = ArrayRecord.from_torch_state_dict(model.state_dict())
     metrics = MetricRecord(
@@ -147,6 +171,7 @@ def train(msg: Message, context: Context) -> Message:
 
 @app.evaluate()
 def evaluate(msg: Message, context: Context) -> Message:
+    _ensure_loaded()
     model = MLP(int(context.run_config["input-dim"]))
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
 
@@ -160,6 +185,6 @@ def evaluate(msg: Message, context: Context) -> Message:
             reply_to=msg,
         )
 
-    mae = _mae(model, data.val_loader)
-    metrics = MetricRecord({"mae": mae, "num-examples": data.n_val})
+    m = evaluate_metrics(model, data.val_loader)
+    metrics = MetricRecord({"mae": m["mae"], "num-examples": data.n_val})
     return Message(content=RecordDict({"metrics": metrics}), reply_to=msg)

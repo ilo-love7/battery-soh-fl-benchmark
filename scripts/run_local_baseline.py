@@ -28,10 +28,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
 
 from flsoh.data import (  # noqa: E402
+    CellDataset,
     FeatureTable,
     LocalStandardizer,
+    label_offset,
     load_feature_table,
     make_global_test_loader,
 )
@@ -45,14 +48,21 @@ from flsoh.protocol import (  # noqa: E402
 
 
 def _evaluate(model: MLP, loader) -> dict:
-    """统一测试集上的 MAE / RMSE / 样本数。"""
+    """统一测试集上的 MAE / RMSE / 样本数，在 SOH 原始尺度上。
+
+    标签在 :class:`CellDataset` 里中心化过。MAE/RMSE 平移不变，所以中心化
+    不改变这两个数；显式加回偏移是为了让 pred 处于 SOH 尺度（将来报偏差、
+    R² 时口径才正确）。偏移从 loader 自己读，不靠调用方传。
+    """
+    offset = label_offset(loader)
     model.eval()
     se = ae = n = 0.0
     with torch.no_grad():
         for x, y in loader:
-            pred = model(x).squeeze(-1)
-            se += float(((pred - y) ** 2).sum())
-            ae += float((pred - y).abs().sum())
+            pred = model(x).squeeze(-1) + offset
+            target = y + offset
+            se += float(((pred - target) ** 2).sum())
+            ae += float((pred - target).abs().sum())
             n += x.shape[0]
     return {
         "mae": ae / max(n, 1),
@@ -61,8 +71,22 @@ def _evaluate(model: MLP, loader) -> dict:
     }
 
 
-def _train(model, loader, *, epochs: int, lr: float) -> float:
-    opt = torch.optim.SGD(model.parameters(), lr=lr)
+def _make_optimizer(model, name: str, lr: float):
+    """与 client_app 用同一套选择逻辑，避免基线和联邦走不同优化器。
+
+    默认 adam：plan 的 ``SGD lr=1e-3`` 是在没有真实数据时定的，实测它把
+    C0 训成废的（100 ep 测试 MAE 0.0239 vs Adam 0.00415）。
+    """
+    name = (name or "adam").lower()
+    if name == "adam":
+        return torch.optim.Adam(model.parameters(), lr=lr)
+    if name == "sgd":
+        return torch.optim.SGD(model.parameters(), lr=lr)
+    raise ValueError(f"未知优化器 {name!r}（adam/sgd）")
+
+
+def _train(model, loader, *, epochs: int, lr: float, optimizer: str = "adam") -> float:
+    opt = _make_optimizer(model, optimizer, lr)
     loss_fn = torch.nn.MSELoss()
     model.train()
     last = float("nan")
@@ -111,8 +135,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="check_partition.py --emit 的产物，含 test_cells")
     ap.add_argument("--out", default="results")
     ap.add_argument("--epochs", type=int, default=None,
-                    help="默认取 train.num_rounds（按 epoch 折算，plan.md §11.2）")
+                    help="默认取 train.baseline_epochs（按 epoch 折算，plan.md §11.2）")
     ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--optimizer", default=None, choices=["adam", "sgd"],
+                    help="默认取 train.optimizer；adam 是实测可用的那个")
     args = ap.parse_args(argv)
 
     try:
@@ -141,8 +167,12 @@ def main(argv: list[str] | None = None) -> int:
         print("FAIL 训练电池与全局测试电池有交集，先跑 check_partition.py --partition-json")
         return 1
 
-    epochs = args.epochs or int(cfg["train"]["num_rounds"])
+    # 基线是单模型训练，与联邦的"100 轮 × local_epochs"不是一回事。
+    # 实测 300 ep 是甜点：100 ep 欠拟合（0.00415），500 ep 过拟合（0.00406 回升），
+    # 300 ep 得 0.00155。所以单独一个配置项，不从 num_rounds 推。
+    epochs = args.epochs or int(cfg["train"].get("baseline_epochs", 300))
     lr = args.lr or float(cfg["train"]["learning_rate"])
+    optimizer = args.optimizer or str(cfg["train"].get("optimizer", "adam"))
     batch = int(cfg["train"].get("batch_size", 64))
     seeds = list(cfg["seeds"]["values"])
     out_dir = Path(args.out)
@@ -154,26 +184,14 @@ def main(argv: list[str] | None = None) -> int:
     # C0 用全局统计量标准化是**允许的**：它本来就是"数据全在一处"的上限参考，
     # 不参与隐私比较。这与联邦场景禁止全局标准化不矛盾。
     scaler = LocalStandardizer().fit(table, train_cells)
-    c0_rows = table.frame[table.frame["cell_id"].isin(train_cells)]
-    from torch.utils.data import DataLoader
-
-    class _DS(torch.utils.data.Dataset):
-        def __init__(self, frame, feats, scaler):
-            self.x = torch.tensor(scaler.transform(frame.loc[:, list(feats)].to_numpy(float)), dtype=torch.float32)
-            self.y = torch.tensor(frame["soh"].to_numpy(float), dtype=torch.float32)
-
-        def __len__(self):
-            return self.x.shape[0]
-
-        def __getitem__(self, i):
-            return self.x[i], self.y[i]
-
-    c0_loader = DataLoader(_DS(c0_rows, table.feats, scaler), batch_size=batch, shuffle=True)
+    c0_loader = DataLoader(
+        CellDataset(table, train_cells, scaler), batch_size=batch, shuffle=True
+    )
 
     for seed in seeds:
         t0 = time.time()
         model = build_model(table.input_dim, seed=seed)
-        _train(model, c0_loader, epochs=epochs, lr=lr)
+        _train(model, c0_loader, epochs=epochs, lr=lr, optimizer=optimizer)
         wall = round(time.time() - t0, 3)
         m = _evaluate(model, test_loader)
         run = _result(
@@ -182,7 +200,8 @@ def main(argv: list[str] | None = None) -> int:
             mae=m["mae"], rmse=m["rmse"], wall=wall,
             notes=(
                 f"test_standardizer={std_strategy}; 全局统计量（C0 允许）; "
-                f"训练电池 {len(train_cells)} 颗，单模型（无客户端概念，n_clients 留空）"
+                f"训练电池 {len(train_cells)} 颗，单模型（无客户端概念，n_clients 留空）; "
+                f"optimizer={optimizer}; label_center=SOH_CENTER"
             ),
         )
         (out_dir / f"{run['run_id']}.json").write_text(
@@ -197,10 +216,11 @@ def main(argv: list[str] | None = None) -> int:
         for cid, cells in sorted(partition.items()):
             # C1 每个客户端用自己的统计量——与联邦时一致，否则下限参考线失真
             local = LocalStandardizer().fit(table, cells)
-            loader = DataLoader(_DS(table.subset(cells), table.feats, local),
-                                batch_size=batch, shuffle=True)
+            loader = DataLoader(
+                CellDataset(table, cells, local), batch_size=batch, shuffle=True
+            )
             model = build_model(table.input_dim, seed=seed)
-            _train(model, loader, epochs=epochs, lr=lr)
+            _train(model, loader, epochs=epochs, lr=lr, optimizer=optimizer)
             m = _evaluate(model, test_loader)
             maes.append(m["mae"])
             rmses.append(m["rmse"])
@@ -213,7 +233,8 @@ def main(argv: list[str] | None = None) -> int:
             mae=sum(maes) / len(maes), rmse=sum(rmses) / len(rmses), wall=wall,
             notes=(
                 f"test_standardizer={std_strategy}; "
-                f"{len(partition)} 个客户端各训各的，指标为均值（非平均模型）"
+                f"{len(partition)} 个客户端各训各的，指标为均值（非平均模型）; "
+                f"optimizer={optimizer}"
             ),
         )
         (out_dir / f"{run['run_id']}.json").write_text(

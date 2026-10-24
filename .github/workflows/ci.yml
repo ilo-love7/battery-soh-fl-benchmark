@@ -261,6 +261,13 @@ jobs:
           python -m pip install "flwr[simulation]==1.41.0" "torch==2.10.0" \
               "numpy>=1.26" "pandas>=2.1" "scikit-learn>=1.4" pytest
       - name: 运行依赖 torch/flwr 的测试
-        run: python -m pytest tests/test_model.py tests/test_data.py tests/test_app.py -v
+        run: |
+          python -m pytest tests/test_model.py tests/test_data.py \
+              tests/test_app.py tests/test_train.py -v
       - name: App 三层可导入
         run: python -c "import flsoh.app.client_app, flsoh.app.server_app; print('apps import OK')"
+      # M1 DOD ①：`flwr` 的官方仿真运行时必须真的跑通一次。这条只能在
+      # Linux runner 上验证——Windows + 中文主机名会让 raylet 启动即崩
+      # （protobuf 拒绝非 UTF-8 主机名），本地无法替代。
+      - name: flwr 官方仿真冒烟（M1 DOD ①）
+        run: python scripts/ci_smoke_flwr.py

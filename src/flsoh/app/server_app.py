@@ -13,14 +13,20 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord
 from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import FedAvg, FedProx
 from torch.utils.data import DataLoader
 
-from flsoh.data import FeatureTable, make_global_test_loader
+from flsoh.data import FeatureTable, label_offset, make_global_test_loader
 from flsoh.model import MLP, build_model
+
+# 与 client_app 共用同一组环境变量名（见 client_app.ENV_FEATURES 的注释）
+ENV_FEATURES = "FLSOH_FEATURES"
+ENV_PARTITION = "FLSOH_PARTITION"
 
 app = ServerApp()
 
@@ -56,6 +62,36 @@ def configure(
     _assert_no_test_leak(partition)
 
 
+def _ensure_loaded() -> None:
+    """未 ``configure()`` 时，从环境变量加载特征表与划分。
+
+    与 client_app 同一套机制、同一组变量名。server 端在 ``flwr run`` 里
+    也是独立进程，模块级注入同样不会跟过去。
+    """
+    if _TABLE is not None:
+        return
+    feat = os.environ.get(ENV_FEATURES)
+    part = os.environ.get(ENV_PARTITION)
+    if not feat or not part:
+        raise RuntimeError(
+            f"server_app 未 configure()，且环境变量 {ENV_FEATURES} / "
+            f"{ENV_PARTITION} 未设置。仿真运行请用 scripts/run_federated.py。"
+        )
+    import json
+    from pathlib import Path
+
+    from flsoh.data import load_feature_table
+
+    table = FeatureTable.from_frame(load_feature_table(feat))
+    payload = json.loads(Path(part).read_text(encoding="utf-8"))
+    configure(
+        table,
+        payload["test_cells"],
+        payload["partition"],
+        strategy=os.environ.get("FLSOH_TEST_STRATEGY", "test"),
+    )
+
+
 def _assert_no_test_leak(partition: dict[str, list[str]]) -> None:
     """全局测试集与客户端数据不相交。这是 §6.2 规则 2 的执行点。
 
@@ -89,12 +125,16 @@ def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
     model.load_state_dict(arrays.to_torch_state_dict())
     model.eval()
 
+    # 标签在数据层中心化过（CellDataset），这里加回让 pred 处于 SOH 尺度。
+    # MAE/RMSE 本身平移不变，所以中心化不改变这两个数；显式还原是为了
+    # 让 pred 的量纲正确——将来报偏差、R² 时漏掉会静默偏 1.0。
+    offset = label_offset(_TEST_LOADER)
     se, ae, n = 0.0, 0.0, 0
     with torch.no_grad():
         for x, y in _TEST_LOADER:
-            pred = model(x).squeeze(-1)
-            se += float(((pred - y) ** 2).sum())
-            ae += float((pred - y).abs().sum())
+            pred = model(x).squeeze(-1) + offset
+            se += float(((pred - (y + offset)) ** 2).sum())
+            ae += float((pred - (y + offset)).abs().sum())
             n += x.shape[0]
     mae = ae / max(n, 1)
     rmse = (se / max(n, 1)) ** 0.5
@@ -118,6 +158,7 @@ def test_standardizer_name() -> str:
 
 @app.main()
 def main(grid: Grid, context: Context) -> None:
+    _ensure_loaded()
     if _TABLE is None:
         raise RuntimeError("server_app 未 configure()")
 

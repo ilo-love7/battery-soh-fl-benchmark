@@ -23,6 +23,7 @@ from flsoh.data import (  # noqa: E402
     CELL_COL,
     CYCLE_COL,
     SOH_COL,
+    SOH_CENTER,
     CellDataset,
     DataContractError,
     FeatureTable,
@@ -31,6 +32,7 @@ from flsoh.data import (  # noqa: E402
     delta_q_curve,
     delta_q_features,
     feature_columns,
+    label_offset,
     load_feature_table,
     make_client_loaders,
     make_global_test_loader,
@@ -255,14 +257,17 @@ class TestMakeClientLoaders:
         assert not torch.equal(xa, xb)
 
     def test_val_loader_is_not_shuffled(self, table, split):
-        # 验证集顺序固定，否则同一模型两次评估的指标会有微小差异
+        # 验证集顺序固定，否则同一模型两次评估的指标会有微小差异。
+        # 标签在 CellDataset 里中心化过，所以这里比的是「加回偏移后的值」——
+        # 直接比 soh 会因为差 1.0 而失败，那是尺度约定变了，不是顺序变了。
         train, val, _ = split
         cd = make_client_loaders(table, train, val, seed=0)
         ys = torch.cat([y for _, y in cd.val_loader])
+        offset = label_offset(cd.val_loader)
         expected = torch.tensor(
             table.subset(val)[SOH_COL].to_numpy(dtype=float), dtype=torch.float32
         )
-        assert torch.equal(ys, expected)
+        assert torch.allclose(ys + offset, expected)
 
     def test_rejects_bad_batch_size(self, table, split):
         train, val, _ = split
@@ -366,6 +371,91 @@ class TestCellDataset:
         raw = CellDataset(table, train)
         scaled = CellDataset(table, train, sc)
         assert not torch.allclose(raw.x, scaled.x)
+
+
+class TestLabelCenter:
+    """标签中心化。这一条是实测换来的，不是洁癖。
+
+    不加中心化时，SOH 落在 1.0 附近而模型输出初值在 0 附近，MSE 损失几乎
+    全被「输出偏置差 1.0」占据，真实信号（std 仅 0.006）被淹没。C0 中心化
+    基线 300 ep 实测：不中心化 0.11333，中心化到 1.0 得 0.00155——73 倍。
+
+    所以这里钉的不是"实现了某个函数"，而是三条会真的坏掉的性质：
+    1. 数据集产出的 y 确实减了 1.0；
+    2. 评估方能把偏移读回来（忘了就抛错，不静默返回 0）；
+    3. 偏移可换（换数据集或换基准时不必改代码）。
+    """
+
+    def test_default_center_is_physical_one(self, table, split):
+        """默认基准必须是 1.0（SOH 的物理定义），不是训练集均值。"""
+        assert SOH_CENTER == 1.0
+        train, _, _ = split
+        ds = CellDataset(table, train)
+        assert ds.label_center == 1.0
+
+    def test_y_is_centered(self, table, split):
+        """产出的 y 必须等于 soh - 1.0，而不是 soh 本身。"""
+        train, _, _ = split
+        ds = CellDataset(table, train)
+        raw = table.subset(train)[SOH_COL].to_numpy(dtype=float)
+        got = ds.y.numpy().astype(float)
+        assert np.allclose(got, raw - 1.0)
+
+    def test_centering_is_not_zero_centering(self, table, split):
+        """反面对照：y 的均值不该被压到 0。
+
+        用 1.0 中心化后，y 的均值等于「soh 均值 - 1」≈ 0.0023，不是 0。
+        如果有人把中心化误实现成"减训练集均值"，这条会红——那是一个
+        会泄露统计量的实现，必须挡住。
+        """
+        train, _, _ = split
+        ds = CellDataset(table, train)
+        assert abs(float(ds.y.mean())) > 1e-6
+
+    def test_label_offset_roundtrip(self, table, split):
+        """label_offset 读回的必须是同一个数，加回去能还原原始 SOH。"""
+        train, val, _ = split
+        cd = make_client_loaders(table, train, val, seed=0)
+        assert label_offset(cd.train_loader) == 1.0
+        ys = torch.cat([y for _, y in cd.val_loader])
+        expected = torch.tensor(
+            table.subset(val)[SOH_COL].to_numpy(dtype=float), dtype=torch.float32
+        )
+        assert torch.allclose(ys + label_offset(cd.val_loader), expected)
+
+    def test_custom_center_is_honoured(self, table, split):
+        """偏移可换：传 0 时 y 必须等于原始 soh（证明没有硬编码）。"""
+        train, _, _ = split
+        ds = CellDataset(table, train, label_center=0.0)
+        raw = table.subset(train)[SOH_COL].to_numpy(dtype=float)
+        assert np.allclose(ds.y.numpy().astype(float), raw)
+        assert ds.label_center == 0.0
+
+    def test_make_client_loaders_forwards_center(self, table, split):
+        train, val, _ = split
+        cd = make_client_loaders(table, train, val, seed=0, label_center=0.5)
+        assert label_offset(cd.train_loader) == 0.5
+        assert label_offset(cd.val_loader) == 0.5
+
+    def test_global_test_loader_forwards_center(self, table, split):
+        _, _, test = split
+        loader, _ = make_global_test_loader(table, test, strategy="none",
+                                            label_center=0.5)
+        assert label_offset(loader) == 0.5
+
+    def test_label_offset_rejects_foreign_dataset(self, table, split):
+        """负控：dataset 没有 label_center 时必须抛错，不能返回 0。
+
+        返回 0 的后果是指标静默偏 1.0——比崩掉难查得多。
+        """
+        from torch.utils.data import DataLoader, TensorDataset
+
+        train, _, _ = split
+        ds = CellDataset(table, train)
+        bare = TensorDataset(ds.x, ds.y)
+        loader = DataLoader(bare, batch_size=8)
+        with pytest.raises(DataContractError, match="label_center"):
+            label_offset(loader)
 
 
 # ---------------------------------------------------------------------------
