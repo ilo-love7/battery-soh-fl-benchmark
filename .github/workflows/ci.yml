@@ -353,12 +353,17 @@ jobs:
       # 判 H2 的闸门：任何 Non-IID 划分的偏斜不高于 IID 基线时，判定必须
       # 输出「处理未施加」而不是「推翻」。这条防的是「拿一个没通电的电路
       # 去证明断路器好用」。
+      #
+      # 两个失败文案都要拦：「缺 heterogeneity.json」（整个文件没有）和
+      # 「找不到该 N 的划分」（文件在、但没有这一档 k 的记录——M3 的 k 扫描
+      # 新增四档 N，只重跑一部分测量就会落进这个洞）。少拦任何一个，
+      # manipulation check 都会在被跳过的情况下看起来依然绿。
       - name: H2 判定前必须查偏斜
         run: |
           python scripts/summarize_results.py --judge \
               --hetero results/heterogeneity.json 2>&1 | tee /tmp/judge.log
-          if grep -q "缺 heterogeneity.json" /tmp/judge.log; then
-            echo "::error::判定拿不到 heterogeneity.json，manipulation check 失效"
+          if grep -qE "缺 heterogeneity.json|找不到该 N 的划分" /tmp/judge.log; then
+            echo "::error::判定拿不到偏斜数据，manipulation check 失效"
             exit 1
           fi
           echo "OK manipulation check 有数据可用"

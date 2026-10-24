@@ -228,11 +228,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # ---- 模式 0：单独生成一份不在配置矩阵里的划分 ----
-    # sohrank 是压力测试用的划分（它用到了标签），不该出现在
-    # configs/mvp.toml 的 schemes 矩阵里——那会让每次普通检查都要带上它。
+    # 两种情形走这里，都**不是**配置矩阵里的常规组合：
+    #   1. sohrank：压力测试用的划分（它用到了标签），不该进 schemes 矩阵，
+    #      否则每次普通检查都要带 --cell-soh-json。
+    #   2. 配置里没有的 k：做偏斜扫描时要生成 k=1/2/10 的对照划分，而
+    #      configs/mvp.toml 的 cells_per_client 只有一档 [5]。
     # 但产物仍然必须过同一套泄漏检测，所以走这里而不是绕过去。
-    if args.emit and args.emit_scheme not in parts.get("schemes", []):
-        k = args.emit_k if args.emit_k is not None else parts["cells_per_client"][0]
+    want_k = args.emit_k if args.emit_k is not None else parts["cells_per_client"][0]
+    off_matrix = (
+        args.emit_scheme not in parts.get("schemes", [])
+        or want_k not in parts.get("cells_per_client", [])
+    )
+    if args.emit and off_matrix:
+        k = want_k
         try:
             partition, n_clients = _build(
                 cfg, client_cells, k, args.emit_scheme, args.emit_alpha,

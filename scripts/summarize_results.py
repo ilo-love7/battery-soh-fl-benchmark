@@ -81,6 +81,12 @@ def _key(run: dict) -> tuple:
 
     用字段而不是 run_id 前缀：run_id 是人起的名字，改个后缀就会让分组
     静默错位，而字段是脚本自己写进 JSON 的。
+
+    **`n_clients` 必须在键里**（M3 的 k 扫描，2026-10-24）。sohrank 的
+    k=1/2/5/10 四档共用同一个 (strategy, scheme, local_epochs)，实测 MAE
+    却是 0.0038 / 0.0038 / 0.0015 / 0.0014——差 2.7 倍。少了这一维，四档
+    会塌成一行，均值描述的是任何一个都不存在的实验，而表看起来照样正常。
+    同一维度还决定「每客户端拿几颗电池」，是 k 扫描要控制的混杂量本身。
     """
     return (
         str(run.get("strategy", "?")),
@@ -89,12 +95,13 @@ def _key(run: dict) -> tuple:
         float(run.get("mu") or 0.0),
         run.get("local_epochs") if run.get("local_epochs") is not None
         else run.get("epochs"),
+        run.get("n_clients"),
     )
 
 
 def _label(key: tuple) -> str:
     """人读的配置名（不含编号）。"""
-    strategy, scheme, alpha, mu, _ = key
+    strategy, scheme, alpha, mu, _, _ = key
     if strategy == "centralized":
         return "中心化"
     if strategy == "local":
@@ -122,9 +129,9 @@ _BASE_CODE = {
 def _codes(keys: list[tuple]) -> dict[tuple, str]:
     """给每组分配编号。
 
-    同一编号出现多组时（α 扫描、μ 网格、不同 local_epochs 的等训练量对照）
-    追加**只在碰撞组之间取值不同**的参数，否则表里会出现两个 N1 而读者
-    分不清哪个对应哪一行。
+    同一编号出现多组时（α 扫描、μ 网格、不同 local_epochs 的等训练量对照、
+    M3 的 k 扫描）追加**只在碰撞组之间取值不同**的参数，否则表里会出现
+    两个 N1 而读者分不清哪个对应哪一行。
     """
     raw = {}
     for key in keys:
@@ -143,8 +150,11 @@ def _codes(keys: list[tuple]) -> dict[tuple, str]:
         varies_mu = len({k[3] for k in group}) > 1
         varies_alpha = len({k[2] for k in group}) > 1
         varies_le = len({k[4] for k in group}) > 1
+        varies_n = len({k[5] for k in group}) > 1
         for key in group:
             parts = []
+            if varies_n and key[5] is not None:
+                parts.append(f"N={key[5]}")
             if varies_mu:
                 parts.append(f"μ={key[3]:g}")
             if varies_alpha and key[2] is not None:
@@ -153,6 +163,25 @@ def _codes(keys: list[tuple]) -> dict[tuple, str]:
                 parts.append(f"le={key[4]}")
             out[key] = f"{code}@{','.join(parts)}" if parts else code
     return out
+
+
+def _sort_key(key: tuple, code: str):
+    """组的排序键：先按基编号，再按 N、μ、α、le 数值排。
+
+    不能直接按 code 字符串排：`"I1@N=115" < "I1@N=12"`（字典序），表里
+    115 会跑到 12 前面去。所以拆成 (基编号, 数值字段) 元组。
+    """
+    return (
+        code.split("@")[0],
+        key[5] if key[5] is not None else 0,
+        key[3],
+        key[2] if key[2] is not None else -1.0,
+        key[4] if key[4] is not None else -1,
+    )
+
+
+def _sorted_groups(groups: dict, codes: dict) -> list[tuple]:
+    return sorted(groups.items(), key=lambda kv: _sort_key(kv[0], codes[kv[0]]))
 
 
 def _group(runs: list[dict]) -> dict[tuple, list[dict]]:
@@ -208,11 +237,20 @@ def _heterogeneity(hetero_path: Path | None) -> dict:
         return {}
 
 
-def _skew_of(hetero: dict, scheme: str) -> float | None:
-    """取某个划分方案造出的标签偏斜（客户端身份解释的方差占比）。"""
+def _skew_of(hetero: dict, scheme: str, n_clients: int | None = None) -> float | None:
+    """取某个划分方案造出的标签偏斜（客户端身份解释的方差占比）。
+
+    `n_clients` 必须一起给：M3 的 k 扫描让同一 scheme 对应四份划分
+    （N=12/23/58/115），偏斜从 4.7% 到 70.4%。不给 N 就会永远返回文件里
+    第一份匹配项——k=10 的实验拿到 k=1 的偏斜，manipulation check 随之
+    失效，而输出看起来完全正常。
+    """
     for name, rep in (hetero.get("partitions") or {}).items():
-        if f"-{scheme}" in name or name.endswith(f"{scheme}.json"):
-            return rep.get("between_client_variance_fraction")
+        if not (f"-{scheme}" in name or name.endswith(f"{scheme}.json")):
+            continue
+        if n_clients is not None and rep.get("n_clients") != n_clients:
+            continue
+        return rep.get("between_client_variance_fraction")
     return None
 
 
@@ -257,12 +295,13 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
         return (statistics.mean(r["final_mae"] for r in groups[key])
                 - other_mae) / other_mae * 100
 
-    # ---- H1：每个 IID FedAvg 组（不同 le 是不同口径，要分开判） ----
+    # ---- H1：每个 IID FedAvg 组（不同 le 是不同口径、不同 N 是不同规模，
+    #      都要分开判；MVP 口径是 le=10、N=23） ----
     out.append("H1（IID 联邦 vs 中心化，差距可以忽略？）")
     iid_keys = [k for k in groups if k[0] == "fedavg" and k[1] == "iid"]
     if not iid_keys:
         out.append("  没有 IID 的 FedAvg 结果")
-    for k in sorted(iid_keys, key=lambda x: codes[x]):
+    for k in sorted(iid_keys, key=lambda x: _sort_key(x, codes[x])):
         res = _paired(groups[k], groups[base_key])
         if res is None:
             out.append(f"  {codes[k]}: 共同 seed 不足 2 个")
@@ -291,34 +330,46 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
     if not dir_keys and not rank_keys:
         out.append("  没有 Non-IID 的 FedAvg 结果")
 
-    for k in sorted(dir_keys + rank_keys, key=lambda x: codes[x]):
+    for k in sorted(dir_keys + rank_keys, key=lambda x: _sort_key(x, codes[x])):
         scheme = k[1]
-        # 同 local_epochs 的 IID 组才是对照组
-        ctrl = ("fedavg", "iid", None, 0.0, k[4])
+        # 同 local_epochs、同 N（同 k）的 IID 组才是对照组。
+        # N 也必须相同：k 扫描里「客户端更多」本身就会掉点（每客户端数据更少、
+        # 梯度步更少），拿不同 N 的 IID 当分母会把 N 的效应算到偏斜头上。
+        ctrl = ("fedavg", "iid", None, 0.0, k[4], k[5])
         if ctrl not in groups:
-            out.append(f"  {codes[k]}: 缺同预算（local_epochs={k[4]}）的 IID 对照组")
+            out.append(f"  {codes[k]}: 缺同预算（local_epochs={k[4]}、N={k[5]}）的 IID 对照组")
             continue
         res = _paired(groups[k], groups[ctrl])
         if res is None:
             out.append(f"  {codes[k]}: 与 IID 的共同 seed 不足 2 个")
             continue
         r = rel_to(k, ctrl)
-        skew = _skew_of(hetero, scheme)
-        base_skew = _skew_of(hetero, "iid")
+        skew = _skew_of(hetero, scheme, k[5])
+        base_skew = _skew_of(hetero, "iid", k[5])
         if skew is None or base_skew is None:
             out.append(
                 f"  {codes[k]}: 相对同预算 IID {r:+.1f}%  → "
-                "未判定（缺 heterogeneity.json，无法做 manipulation check；"
-                "先跑 scripts/measure_heterogeneity.py --out results/heterogeneity.json）"
+                "未判定（heterogeneity.json 里找不到该 N 的划分，无法做 "
+                "manipulation check；先跑 scripts/measure_heterogeneity.py "
+                "--out results/heterogeneity.json）"
             )
             continue
-        if skew <= base_skew:
+        if skew < base_skew:
             out.append(
                 f"  {codes[k]}: 相对同预算 IID {r:+.1f}%  → "
                 f"未判定（处理未施加：该划分的标签偏斜 {skew * 100:.1f}% "
-                f"≤ IID 基线的 {base_skew * 100:.1f}%。"
-                "把 21 颗电池合成一个客户端会把电池间的 SOH 差异平均掉，"
+                f"< IID 同 N 基线的 {base_skew * 100:.1f}%。"
+                "把多颗电池合成一个客户端会把电池间的 SOH 差异平均掉，"
                 "所以这个划分实际上比 IID 更均匀）"
+            )
+            continue
+        if skew == base_skew:
+            out.append(
+                f"  {codes[k]}: 相对同预算 IID {r:+.1f}%  → "
+                f"未判定（处理未施加：该划分与 IID 同 N 划分的标签偏斜"
+                f"完全相同（{skew * 100:.1f}%）。一颗电池一个客户端时，"
+                "排序只改客户端的标签、不改客户端均值的分布，划分在统计上"
+                "与 IID 等价——这一档是图 2 的内部校准点，不是处理组）"
             )
             continue
         sig, why = is_significant(res)
@@ -330,7 +381,7 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
             verdict = f"推翻（{r:+.1f}% ≤ 5%，没有掉点；{why}）"
         else:
             verdict = f"未判定（{r:+.1f}% 落在 5%–10%；{why}）"
-        out.append(f"  {codes[k]}: 偏斜 {skew * 100:.1f}%（IID {base_skew * 100:.1f}%）"
+        out.append(f"  {codes[k]}: 偏斜 {skew * 100:.1f}%（IID 同 N {base_skew * 100:.1f}%）"
                    f"  → 相对同预算 IID {r:+.1f}%  → {verdict}")
 
     # ---- H3：FedProx vs 同划分 FedAvg ----
@@ -338,8 +389,8 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
     prox_keys = [k for k in groups if k[0] == "fedprox"]
     if not prox_keys:
         out.append("  没有 FedProx 结果")
-    for k in sorted(prox_keys, key=lambda x: codes[x]):
-        avg_key = ("fedavg", k[1], k[2], 0.0, k[4])
+    for k in sorted(prox_keys, key=lambda x: _sort_key(x, codes[x])):
+        avg_key = ("fedavg", k[1], k[2], 0.0, k[4], k[5])
         if avg_key not in groups:
             out.append(f"  {codes[k]}: 缺同划分的 FedAvg")
             continue
@@ -380,12 +431,10 @@ def build_table(runs: list[dict], baseline_prefix: str = "c0__centralized") -> l
     ]
     groups = _group(runs)
     codes = _codes(list(groups))
-    for key, items in sorted(groups.items(), key=lambda kv: codes[kv[0]]):
-        strategy, scheme, alpha, mu, _ = key
+    for key, items in _sorted_groups(groups, codes):
+        strategy, scheme, alpha, mu, _, n_clients = key
         maes = [r["final_mae"] for r in items]
         rmses = [r["final_rmse"] for r in items if r.get("final_rmse") is not None]
-        n_clients = next((r.get("n_clients") for r in items
-                          if r.get("n_clients") is not None), None)
         rel = (statistics.mean(maes) - base_mae) / base_mae * 100
         if key == _key(base[0]):
             rel_cell = "—"
@@ -487,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
     # seed 波动：plan.md §11.3 要求相对标准差 <10%，超了要加 seed 数
     print("\nseed 波动检查（相对标准差，阈值 10%）：")
     bad = []
-    for key, items in sorted(groups.items(), key=lambda kv: codes[kv[0]]):
+    for key, items in _sorted_groups(groups, codes):
         maes = [r["final_mae"] for r in items]
         if len(maes) < 2:
             print(f"  {tag(key)}: 只有 {len(maes)} 个 seed，无法评估波动")
@@ -506,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n配对比较（同 seed 相减，消掉 seed 共同波动）：")
         base_key = _key(base[0])
         base_mae = statistics.mean(r["final_mae"] for r in base)
-        for key, items in sorted(groups.items(), key=lambda kv: codes[kv[0]]):
+        for key, items in _sorted_groups(groups, codes):
             if key == base_key:
                 continue
             res = _paired(items, groups[base_key])
@@ -515,10 +564,10 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             print(_fmt_paired(tag(key), "C0", res, base_mae))
         # FedProx 的对照是 FedAvg，不是 C0（§11.3：H3 是「比 FedAvg 改善」）
-        for key, items in sorted(groups.items(), key=lambda kv: codes[kv[0]]):
+        for key, items in _sorted_groups(groups, codes):
             if key[0] != "fedprox":
                 continue
-            avg_key = ("fedavg", key[1], key[2], 0.0, key[4])
+            avg_key = ("fedavg", key[1], key[2], 0.0, key[4], key[5])
             if avg_key not in groups:
                 print(f"  {tag(key)} − FedAvg: 缺同划分的 FedAvg，跳过")
                 continue

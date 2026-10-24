@@ -277,9 +277,9 @@ class TestJudge:
         # 高于 IID」的假数据，让 H2 走到正常分档。
         hetero = {"partitions": {
             "partition-mvp-k5-iid.json":
-                {"between_client_variance_fraction": 0.173},
+                {"between_client_variance_fraction": 0.173, "n_clients": 23},
             "partition-mvp-k5-dirichlet0.5.json":
-                {"between_client_variance_fraction": 0.471},
+                {"between_client_variance_fraction": 0.471, "n_clients": 23},
         }}
         out = "\n".join(sr.judge_hypotheses(self._runs(), hetero=hetero))
         h2 = out.split("H2")[1].split("H3")[0]
@@ -332,17 +332,25 @@ class TestH2ManipulationCheck:
 
     @staticmethod
     def _hetero(dir_skew: float, iid_skew: float, rank_skew: float | None = None):
+        """heterogeneity.json 的 fixture。
+
+        `n_clients` 必须写：判定器按 (scheme, N) 取偏斜，缺了这个字段
+        就等于「找不到该 N 的划分」，manipulation check 会被跳过。
+        """
         parts = {
             "partition-mvp-k5-iid.json": {
-                "between_client_variance_fraction": iid_skew
+                "between_client_variance_fraction": iid_skew,
+                "n_clients": 23,
             },
             "partition-mvp-k5-dirichlet0.5.json": {
-                "between_client_variance_fraction": dir_skew
+                "between_client_variance_fraction": dir_skew,
+                "n_clients": 23,
             },
         }
         if rank_skew is not None:
             parts["partition-mvp-k5-sohrank.json"] = {
-                "between_client_variance_fraction": rank_skew
+                "between_client_variance_fraction": rank_skew,
+                "n_clients": 23,
             }
         return {"partitions": parts}
 
@@ -451,4 +459,141 @@ class TestH2ControlIsIidNotC0:
             runs, hetero=TestH2ManipulationCheck._hetero(0.122, 0.173, 0.471)
         ))
         h2 = out.split("H2")[1].split("H3")[0]
-        assert "缺同预算（local_epochs=3）的 IID 对照组" in h2
+        assert "缺同预算（local_epochs=3、N=23）的 IID 对照组" in h2
+
+    def test_different_n_are_separate_controls(self):
+        """N 不同也不是同一个实验：k 扫描里每档都要同 N 的 IID 对照。
+
+        sohrank k=2（N=58）不能拿 k=5 的 IID（N=23）当分母——「客户端多了
+        35 个」本身就会改变每客户端数据量与梯度步数，这个效应会被算到
+        偏斜头上。
+        """
+        runs = TestH2ManipulationCheck._runs()   # IID N=23
+        for s, mae in enumerate([0.0040, 0.0042, 0.0038]):
+            runs.append(_run("fedavg", s, mae, scheme="sohrank", le=10,
+                             n_clients=58,
+                             run_id=f"fedavg__sohrank_k2__seed{s}"))
+        out = "\n".join(sr.judge_hypotheses(
+            runs, hetero=TestH2ManipulationCheck._hetero(0.122, 0.173, 0.471)
+        ))
+        h2 = out.split("H2")[1].split("H3")[0]
+        assert "缺同预算（local_epochs=10、N=58）的 IID 对照组" in h2
+
+
+class TestKSweepGrouping:
+    """M3 的 k 扫描：同一 (strategy, scheme, le) 会对应四个 N。
+
+    不把 N 放进分组键的后果不是「少一行」，而是四档实验塌成一行、
+    均值描述任何一个都不存在的配置——而表看起来照样正常。
+    """
+
+    @staticmethod
+    def _ksweep_runs():
+        runs = []
+        for s, mae in enumerate([0.0022, 0.0024, 0.0020]):
+            runs.append(_run("centralized", s, mae, n_clients=None,
+                             epochs=300, run_id=f"c0__centralized__seed{s}"))
+        for n in (12, 23, 58, 115):
+            for s, mae in enumerate([0.0020, 0.0022, 0.0018]):
+                runs.append(_run("fedavg", s, mae, scheme="sohrank", le=10,
+                                 n_clients=n,
+                                 run_id=f"fedavg__sohrank_k{n}__seed{s}"))
+        return runs
+
+    def test_n_clients_splits_groups(self):
+        groups = sr._group(self._ksweep_runs())
+        rank = [k for k in groups if k[0] == "fedavg"]
+        assert len(rank) == 4
+        assert {k[5] for k in rank} == {12, 23, 58, 115}
+
+    def test_codes_get_n_suffix(self):
+        codes = sr._codes(list(sr._group(self._ksweep_runs())))
+        fedavg = {c for k, c in codes.items() if k[0] == "fedavg"}
+        assert fedavg == {"P1@N=12", "P1@N=23", "P1@N=58", "P1@N=115"}
+
+    def test_table_sorts_n_numerically(self):
+        """字典序会把 N=115 排到 N=12 前面（"115" < "12"）。"""
+        rows = sr.build_table(self._ksweep_runs())
+        order = [r.split("|")[1].strip() for r in rows if r.startswith("| P1")]
+        assert order == ["P1@N=12", "P1@N=23", "P1@N=58", "P1@N=115"]
+
+    def test_each_row_keeps_its_own_mean(self):
+        """塌成一组会把四档平均成一个数；分开后每行是自己的均值。"""
+        rows = sr.build_table(self._ksweep_runs())
+        assert len([r for r in rows if r.startswith("| P1")]) == 4
+        for r in rows:
+            if r.startswith("| P1"):
+                assert "0.00200 ± 0.00020" in r
+
+    def test_skew_lookup_is_per_n(self):
+        """同一 scheme 四份划分，偏斜必须按 N 取，不能永远返回第一份。"""
+        hetero = {"partitions": {
+            "partition-mvp-k10-sohrank.json": {
+                "between_client_variance_fraction": 0.392, "n_clients": 12},
+            "partition-mvp-k5-sohrank.json": {
+                "between_client_variance_fraction": 0.471, "n_clients": 23},
+            "partition-mvp-k2-sohrank.json": {
+                "between_client_variance_fraction": 0.572, "n_clients": 58},
+            "partition-mvp-k1-sohrank.json": {
+                "between_client_variance_fraction": 0.704, "n_clients": 115},
+        }}
+        assert sr._skew_of(hetero, "sohrank", 12) == 0.392
+        assert sr._skew_of(hetero, "sohrank", 115) == 0.704
+        assert sr._skew_of(hetero, "sohrank", 999) is None
+
+    def test_equal_skew_blocks_the_verdict(self):
+        """k=1 时 sohrank 与 IID 的偏斜完全相同——处理未被施加。
+
+        一颗电池一个客户端，排序只改客户端标签、不改客户端均值的分布，
+        所以这一对测出任何差异都只能是噪声。它是图 2 的内部校准点。
+        """
+        runs = []
+        for s, mae in enumerate([0.0022, 0.0024, 0.0020]):
+            runs.append(_run("centralized", s, mae, n_clients=None,
+                             epochs=300, run_id=f"c0__centralized__seed{s}"))
+        for s, mae in enumerate([0.0030, 0.0032, 0.0028]):
+            runs.append(_run("fedavg", s, mae, scheme="iid", le=10,
+                             n_clients=115,
+                             run_id=f"fedavg__iid_k1__seed{s}"))
+        for s, mae in enumerate([0.0031, 0.0033, 0.0029]):
+            runs.append(_run("fedavg", s, mae, scheme="sohrank", le=10,
+                             n_clients=115,
+                             run_id=f"fedavg__sohrank_k1__seed{s}"))
+        hetero = {"partitions": {
+            "partition-mvp-k1-iid.json": {
+                "between_client_variance_fraction": 0.704, "n_clients": 115},
+            "partition-mvp-k1-sohrank.json": {
+                "between_client_variance_fraction": 0.704, "n_clients": 115},
+        }}
+        out = "\n".join(sr.judge_hypotheses(runs, hetero=hetero))
+        h2 = out.split("H2")[1].split("H3")[0]
+        assert "处理未施加" in h2
+        assert "完全相同" in h2
+        assert "校准点" in h2
+
+    def test_same_n_pair_gets_a_real_verdict(self):
+        """同 N 的 sohrank/IID 配对 + 偏斜更高 → 正常按阈值判。"""
+        runs = []
+        for s, mae in enumerate([0.0022, 0.0024, 0.0020]):
+            runs.append(_run("centralized", s, mae, n_clients=None,
+                             epochs=300, run_id=f"c0__centralized__seed{s}"))
+        for s, mae in enumerate([0.0020, 0.0022, 0.0018]):
+            runs.append(_run("fedavg", s, mae, scheme="iid", le=10,
+                             n_clients=58,
+                             run_id=f"fedavg__iid_k2__seed{s}"))
+        for s, mae in enumerate([0.0030, 0.0032, 0.0028]):
+            runs.append(_run("fedavg", s, mae, scheme="sohrank", le=10,
+                             n_clients=58,
+                             run_id=f"fedavg__sohrank_k2__seed{s}"))
+        hetero = {"partitions": {
+            "partition-mvp-k2-iid.json": {
+                "between_client_variance_fraction": 0.325, "n_clients": 58},
+            "partition-mvp-k2-sohrank.json": {
+                "between_client_variance_fraction": 0.572, "n_clients": 58},
+        }}
+        out = "\n".join(sr.judge_hypotheses(runs, hetero=hetero))
+        h2 = out.split("H2")[1].split("H3")[0]
+        assert "处理未施加" not in h2
+        assert "57.2%" in h2 and "32.5%" in h2
+        # 只有一组 sohrank、一组 IID，编号不带 N 后缀（后缀只在碰撞时出现）
+        assert "P1: 偏斜 57.2%" in h2

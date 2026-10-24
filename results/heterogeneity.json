@@ -12,6 +12,78 @@
     "size_ratio": 1.0
   },
   "partitions": {
+    "partition-mvp-k1-iid.json": {
+      "between_client_variance_fraction": 0.7041265797731359,
+      "cell_mean_std": 0.004862357592019686,
+      "cell_within_std_median": 0.0006563685040329416,
+      "global_std": 0.005797026384614765,
+      "n_cells": 135,
+      "n_clients": 115,
+      "size_gini": 0.0,
+      "size_max": 1,
+      "size_min": 1,
+      "size_ratio": 1.0
+    },
+    "partition-mvp-k1-sohrank.json": {
+      "between_client_variance_fraction": 0.7041265797731359,
+      "cell_mean_std": 0.004862357592019686,
+      "cell_within_std_median": 0.0006563685040329416,
+      "global_std": 0.005797026384614765,
+      "n_cells": 135,
+      "n_clients": 115,
+      "size_gini": 0.0,
+      "size_max": 1,
+      "size_min": 1,
+      "size_ratio": 1.0
+    },
+    "partition-mvp-k10-iid.json": {
+      "between_client_variance_fraction": 0.04723082845911299,
+      "cell_mean_std": 0.004862357592019686,
+      "cell_within_std_median": 0.0006563685040329416,
+      "global_std": 0.005797026384614765,
+      "n_cells": 135,
+      "n_clients": 12,
+      "size_gini": 0.025362318840579712,
+      "size_max": 10,
+      "size_min": 9,
+      "size_ratio": 1.1111111111111112
+    },
+    "partition-mvp-k10-sohrank.json": {
+      "between_client_variance_fraction": 0.39242580639479907,
+      "cell_mean_std": 0.004862357592019686,
+      "cell_within_std_median": 0.0006563685040329416,
+      "global_std": 0.005797026384614765,
+      "n_cells": 135,
+      "n_clients": 12,
+      "size_gini": 0.025362318840579712,
+      "size_max": 10,
+      "size_min": 9,
+      "size_ratio": 1.1111111111111112
+    },
+    "partition-mvp-k2-iid.json": {
+      "between_client_variance_fraction": 0.3251125944716585,
+      "cell_mean_std": 0.004862357592019686,
+      "cell_within_std_median": 0.0006563685040329416,
+      "global_std": 0.005797026384614765,
+      "n_cells": 135,
+      "n_clients": 58,
+      "size_gini": 0.008545727136431784,
+      "size_max": 2,
+      "size_min": 1,
+      "size_ratio": 2.0
+    },
+    "partition-mvp-k2-sohrank.json": {
+      "between_client_variance_fraction": 0.5720074908340498,
+      "cell_mean_std": 0.004862357592019686,
+      "cell_within_std_median": 0.0006563685040329416,
+      "global_std": 0.005797026384614765,
+      "n_cells": 135,
+      "n_clients": 58,
+      "size_gini": 0.008545727136431784,
+      "size_max": 2,
+      "size_min": 1,
+      "size_ratio": 2.0
+    },
     "partition-mvp-k5-dirichlet0.5.json": {
       "between_client_variance_fraction": 0.12193108879135627,
       "cell_mean_std": 0.004862357592019686,
