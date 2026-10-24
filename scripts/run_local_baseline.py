@@ -139,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--optimizer", default=None, choices=["adam", "sgd"],
                     help="默认取 train.optimizer；adam 是实测可用的那个")
+    ap.add_argument("--seeds", default="",
+                    help="逗号分隔的 seed 列表，覆盖配置里的 seeds.values")
     args = ap.parse_args(argv)
 
     try:
@@ -174,7 +176,12 @@ def main(argv: list[str] | None = None) -> int:
     lr = args.lr or float(cfg["train"]["learning_rate"])
     optimizer = args.optimizer or str(cfg["train"].get("optimizer", "adam"))
     batch = int(cfg["train"].get("batch_size", 64))
-    seeds = list(cfg["seeds"]["values"])
+    # --seeds 覆盖配置里的列表：补 seed 时不该重跑已有的那几个
+    # （跑一次 C0 是 50 s，重跑纯属浪费；联邦那边一次 200 s 更浪费）。
+    if args.seeds:
+        seeds = [int(s) for s in args.seeds.replace(",", " ").split()]
+    else:
+        seeds = list(cfg["seeds"]["values"])
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 

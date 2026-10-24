@@ -41,6 +41,7 @@ from flsoh.partition import (  # noqa: E402
     check_partition,
     expected_n_clients,
     make_cell_ids,
+    partition_by_soh_rank,
     partition_dirichlet,
     partition_iid,
     partition_sizes,
@@ -52,6 +53,19 @@ from flsoh.protocol import (  # noqa: E402
     load_config,
     validate_config,
 )
+
+
+def _load_cell_soh(path: str | None) -> dict[str, float] | None:
+    """读 `{cell_id: 平均 SOH}`。由 scripts/measure_heterogeneity.py 生成。"""
+    if not path:
+        return None
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PartitionError(f"读不出 {path}：{exc}") from exc
+    if not isinstance(raw, dict) or not raw:
+        raise PartitionError(f"{path} 必须是 {{cell_id: soh}} 的非空对象")
+    return {str(k): float(v) for k, v in raw.items()}
 
 
 def _load_cells(path: str | None, n_cells: int) -> list[str]:
@@ -78,7 +92,7 @@ def _n_clients_for(cfg: dict, n_available: int, k: int) -> int:
     )
 
 
-def _build(cfg, cells, k, scheme, alpha, seed):
+def _build(cfg, cells, k, scheme, alpha, seed, cell_soh=None):
     n_clients = _n_clients_for(cfg, len(cells), k)
     if scheme == "iid":
         return partition_iid(cells, n_clients, seed), n_clients
@@ -86,6 +100,12 @@ def _build(cfg, cells, k, scheme, alpha, seed):
         if alpha is None:
             raise PartitionError("dirichlet 方案缺少 alpha")
         return partition_dirichlet(cells, n_clients, alpha, seed), n_clients
+    if scheme == "sohrank":
+        if not cell_soh:
+            raise PartitionError(
+                "sohrank 方案需要 --cell-soh-json（每颗电池的平均 SOH）"
+            )
+        return partition_by_soh_rank(cells, n_clients, cell_soh, seed), n_clients
     raise PartitionError(f"未知划分方案 {scheme!r}")
 
 
@@ -126,6 +146,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--emit-k", type=int, default=None, help="--emit 用哪档 k，默认取第一档")
     parser.add_argument("--emit-scheme", default="iid", help="--emit 用哪个方案")
     parser.add_argument("--emit-alpha", type=float, default=None, help="--emit 的 Dirichlet α")
+    parser.add_argument("--cell-soh-json", default=None,
+                        help="每颗电池的平均 SOH（sohrank 方案需要）")
     parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     args = parser.parse_args(argv)
 
@@ -203,6 +225,53 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {code}: {message}")
             return 1
         print(f"PASS {args.partition_json}  N={len(partition)} test={len(used_test)}")
+        return 0
+
+    # ---- 模式 0：单独生成一份不在配置矩阵里的划分 ----
+    # sohrank 是压力测试用的划分（它用到了标签），不该出现在
+    # configs/mvp.toml 的 schemes 矩阵里——那会让每次普通检查都要带上它。
+    # 但产物仍然必须过同一套泄漏检测，所以走这里而不是绕过去。
+    if args.emit and args.emit_scheme not in parts.get("schemes", []):
+        k = args.emit_k if args.emit_k is not None else parts["cells_per_client"][0]
+        try:
+            partition, n_clients = _build(
+                cfg, client_cells, k, args.emit_scheme, args.emit_alpha,
+                split_seed, _load_cell_soh(args.cell_soh_json),
+            )
+        except PartitionError as exc:
+            print(f"FAIL 构造划分：{exc}")
+            return 2
+        issues = check_partition(
+            partition,
+            all_cells=all_cells,
+            test_cells=test_cells,
+            expected_clients=n_clients,
+        )
+        if issues:
+            print(f"FAIL {args.emit_scheme} k={k} 划分没通过泄漏检测")
+            for code, message in issues:
+                print(f"  {code}: {message}")
+            return 1
+        out = Path(args.emit)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(
+                {
+                    "config": args.config,
+                    "k": k,
+                    "scheme": args.emit_scheme,
+                    "alpha": args.emit_alpha,
+                    "split_seed": split_seed,
+                    "test_cells": test_cells,
+                    "partition": partition,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"已写出划分：{out}  N={len(partition)}  "
+              f"（{args.emit_scheme} k={k}，泄漏检测 PASS）")
         return 0
 
     # ---- 模式 1：检查生成器 ----

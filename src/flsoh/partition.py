@@ -201,6 +201,65 @@ def partition_dirichlet(
     return out
 
 
+def partition_by_soh_rank(
+    cells: list[str],
+    n_clients: int,
+    cell_soh: dict[str, float],
+    seed: int,
+) -> dict[str, list[str]]:
+    """方案 E：按电池平均 SOH 排序后切成连续分片（pathological non-IID）。
+
+    **这个方案用到了标签，所以它不是可部署的场景，是一个压力测试。**
+    它的用途是回答一个前置问题：如果划分真的造出了标签偏斜，FedAvg 会不会
+    掉点？
+
+    为什么需要它：2026-10-24 实测发现本仓库原来的 Dirichlet(α=0.5) 划分
+    **造出的标签偏斜比 IID 还小**（客户端身份解释的方差 12.2% vs 17.3%），
+    因为 N=23 时它退化成「一个客户端拿 21 颗」，而把 21 颗电池合成一个客户端
+    会把电池之间的 SOH 差异平均掉。于是「Non-IID 没掉点」这个结论是无效的
+    ——处理根本没施加。本方案把偏斜拉到 k=5 时的上界（≈70%）。
+
+    参数
+    ----
+    cell_soh
+        `{cell_id: 该电池的平均 SOH}`。由调用方从特征表算好传进来，
+        这个模块本身仍然不依赖 pandas。
+
+    排序后按分片切：`n_clients` 个客户端各拿 `len(cells)//n_clients` 颗，
+    余数按 spread 政策分给前几个客户端（与 `partition_by_size` 一致）。
+    同一分片内的电池 SOH 相邻，所以每个客户端只见过一个很窄的 SOH 区间。
+    """
+    cells = list(cells)
+    if n_clients <= 0:
+        raise PartitionError(f"n_clients 必须为正，收到 {n_clients!r}")
+    missing = [c for c in cells if c not in cell_soh]
+    if missing:
+        raise PartitionError(
+            f"{len(missing)} 颗电池没有 SOH（例如 {missing[0]!r}），无法按 SOH 排序"
+        )
+    if len(cells) < n_clients:
+        raise PartitionError(
+            f"电池数 {len(cells)} 少于客户端数 {n_clients}，无法保证每个客户端非空"
+        )
+
+    # seed 只用来打散「同一 SOH 值」之间的先后，避免 tie 总是落在同一个客户端。
+    # 打散在排序**之前**做，排序本身是稳定的。
+    rng = random.Random(seed)
+    shuffled = cells[:]
+    rng.shuffle(shuffled)
+    ordered = sorted(shuffled, key=lambda c: cell_soh[c])
+
+    base = len(ordered) // n_clients
+    extra = len(ordered) % n_clients
+    out: dict[str, list[str]] = {}
+    cursor = 0
+    for i, cid in enumerate(client_ids(n_clients)):
+        take = base + (1 if i < extra else 0)
+        out[cid] = ordered[cursor : cursor + take]
+        cursor += take
+    return out
+
+
 def check_partition(
     partition: dict[str, list[str]],
     *,

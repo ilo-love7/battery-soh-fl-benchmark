@@ -123,6 +123,39 @@ python3 scripts/summarize_results.py --check-plan docs/plan.md  # verify (CI run
 document differs by even one digit. Commit the result JSONs and the updated
 `docs/plan.md` together — a table without its raw runs cannot be verified.
 
+### Before judging H2, measure the label skew
+
+A partition being *size*-skewed does not make it *label*-skewed. On this dataset
+Dirichlet α=0.5 produces **less** label skew than IID (12.2% vs 17.3% of label
+variance explained by client identity), because one client taking 21 cells
+averages the between-cell SOH differences away. Reporting "Non-IID did not hurt"
+on that partition would be reporting on a treatment that was never applied.
+
+```bash
+python3 scripts/measure_heterogeneity.py \
+    --features data/mit-stanford/features.parquet \
+    --partition-json results/partition-mvp-k5-iid.json \
+    --partition-json results/partition-mvp-k5-dirichlet0.5.json \
+    --out results/heterogeneity.json
+```
+
+Then pass it to the judge, which refuses to reject H2 on any partition whose
+skew does not exceed the IID baseline:
+
+```bash
+python3 scripts/summarize_results.py --judge \
+    --hetero results/heterogeneity.json
+```
+
+`results/heterogeneity.json` must be committed alongside the results. CI checks
+that it covers every partition any run actually used.
+
+The partition that *does* apply the treatment is
+`scripts/check_partition.py --emit-scheme sohrank`, which shards cells by their
+mean SOH. N, cells per client, total data and training budget are all unchanged
+— only *which* cells go where changes — and the skew rises to 47.1%. It uses the
+labels, so it is a stress test, not a deployable scenario.
+
 ### On `flwr run`
 
 `scripts/run_federated.py` is a **local federation loop**, not the Flower

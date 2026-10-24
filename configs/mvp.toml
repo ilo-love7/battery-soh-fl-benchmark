@@ -44,6 +44,13 @@ schemes = ["iid", "dirichlet"]
 # 客户端各只有 1 颗。Dirichlet 分的是电池不是样本，客户端一多、α 一小就会
 # 退化成"一人独占"。这是要写进报告的现象，不是 bug——但它意味着这个划分下
 # 「量偏斜」与「域偏移」已经混在一起，不能声称只考察了其中一种（§5.1）。
+#
+# 更要紧的一条（2026-10-24 实测，§11.3.4）：Dirichlet 只造成**数量偏斜**
+# （样本量基尼 0.519），它的**标签偏斜只有 12.2%，低于 IID 的 17.3%**——
+# 因为把 21 颗电池合成一个客户端会把电池间的 SOH 差异平均掉。所以
+# `schemes` 里不放 sohrank：它不在常规检查矩阵里，要用时单独
+# `--emit-scheme sohrank --cell-soh-json data/mit-stanford/cell_soh.json`
+# 生成，并且必须先跑 measure_heterogeneity.py 量出偏斜。
 dirichlet_alpha = [0.5]
 
 [strategies]

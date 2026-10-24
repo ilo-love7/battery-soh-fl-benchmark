@@ -1,0 +1,53 @@
+{
+  "ceiling": {
+    "between_client_variance_fraction": 0.7035309954412817,
+    "cell_mean_std": 0.004862357592019686,
+    "cell_within_std_median": 0.0006563685040329416,
+    "global_std": 0.005797026384614765,
+    "n_cells": 135,
+    "n_clients": 135,
+    "size_gini": 0.0,
+    "size_max": 1,
+    "size_min": 1,
+    "size_ratio": 1.0
+  },
+  "partitions": {
+    "partition-mvp-k5-dirichlet0.5.json": {
+      "between_client_variance_fraction": 0.12193108879135627,
+      "cell_mean_std": 0.004862357592019686,
+      "cell_within_std_median": 0.0006563685040329416,
+      "global_std": 0.005797026384614765,
+      "n_cells": 135,
+      "n_clients": 23,
+      "size_gini": 0.5194706994328923,
+      "size_max": 21,
+      "size_min": 1,
+      "size_ratio": 21.0
+    },
+    "partition-mvp-k5-iid.json": {
+      "between_client_variance_fraction": 0.17295443447311135,
+      "cell_mean_std": 0.004862357592019686,
+      "cell_within_std_median": 0.0006563685040329416,
+      "global_std": 0.005797026384614765,
+      "n_cells": 135,
+      "n_clients": 23,
+      "size_gini": 0.0,
+      "size_max": 5,
+      "size_min": 5,
+      "size_ratio": 1.0
+    },
+    "partition-mvp-k5-sohrank.json": {
+      "between_client_variance_fraction": 0.4706400784997768,
+      "cell_mean_std": 0.004862357592019686,
+      "cell_within_std_median": 0.0006563685040329416,
+      "global_std": 0.005797026384614765,
+      "n_cells": 135,
+      "n_clients": 23,
+      "size_gini": 0.0,
+      "size_max": 5,
+      "size_min": 5,
+      "size_ratio": 1.0
+    }
+  },
+  "source": "data/mit-stanford/features.parquet"
+}

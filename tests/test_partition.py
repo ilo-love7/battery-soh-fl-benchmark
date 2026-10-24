@@ -16,6 +16,7 @@ from flsoh.partition import (
     expected_n_clients,
     make_cell_ids,
     partition_by_size,
+    partition_by_soh_rank,
     partition_dirichlet,
     partition_iid,
     partition_sizes,
@@ -294,3 +295,107 @@ class TestCheckPartitionFaults:
         p["client-0"].append(test[0])
         codes = self._codes(check_partition(p, all_cells=cells, test_cells=test))
         assert codes == [P_TEST]
+
+
+class TestPartitionBySohRank:
+    """按 SOH 排序分片：压力测试用的 pathological non-IID。
+
+    这个方案存在的理由是 2026-10-24 的实测：Dirichlet(α=0.5) 在 N=23 时
+    造出的标签偏斜（12.2%）比 IID（17.3%）**还小**，所以「Non-IID 没掉点」
+    是处理没施加，不是算法免疫。要检验 H2 必须有一个真的偏斜的划分。
+    """
+
+    def _soh(self, cells):
+        # 单调递增的假 SOH，便于断言分片边界
+        return {c: float(i) for i, c in enumerate(sorted(cells))}
+
+    def test_same_client_count_and_sizes(self):
+        cells = make_cell_ids(115)
+        p = partition_by_soh_rank(cells, 23, self._soh(cells), seed=0)
+        assert len(p) == 23
+        sizes = set(partition_sizes(p).keys())
+        assert sizes == {5}, "k=5 时每个客户端必须正好 5 颗"
+
+    def test_covers_every_cell_exactly_once(self):
+        cells = make_cell_ids(115)
+        p = partition_by_soh_rank(cells, 23, self._soh(cells), seed=0)
+        flat = _flat(p)
+        assert sorted(flat) == sorted(cells)
+        assert len(flat) == len(set(flat))
+
+    def test_shards_are_contiguous_in_soh(self):
+        """核心性质：每个客户端只见过一个很窄的 SOH 区间。
+
+        这正是「标签偏斜」的构造方式——如果分片不连续，偏斜就不存在，
+        整个实验测的还是 IID。
+        """
+        cells = make_cell_ids(115)
+        soh = self._soh(cells)
+        p = partition_by_soh_rank(cells, 23, soh, seed=0)
+        for cid, shard in p.items():
+            vals = [soh[c] for c in shard]
+            assert max(vals) - min(vals) == len(vals) - 1, (
+                f"{cid} 的分片在 SOH 上不连续：{sorted(vals)}"
+            )
+
+    def test_client_order_matches_soh_order(self):
+        """客户端编号越大，分到的 SOH 越高——否则排序没意义。"""
+        cells = make_cell_ids(115)
+        soh = self._soh(cells)
+        p = partition_by_soh_rank(cells, 23, soh, seed=0)
+        means = [sum(soh[c] for c in p[cid]) / len(p[cid]) for cid in client_order(p)]
+        assert means == sorted(means)
+
+    def test_deterministic_given_seed(self):
+        cells = make_cell_ids(115)
+        soh = self._soh(cells)
+        assert partition_by_soh_rank(cells, 23, soh, 7) == partition_by_soh_rank(
+            cells, 23, soh, 7
+        )
+
+    def test_seed_does_not_move_shard_boundaries(self):
+        """SOH 互不相同时，换 seed 必须得到**逐字相同**的划分。
+
+        理由：分片边界由排序决定，seed 只用来打散相同 SOH 值之间的先后。
+        如果换 seed 能改变分片，那「同一个划分产物」就不可复现，后面所有
+        相对差都失去意义。这条必须比「集合相同」更强——集合相同但片内
+        顺序不同，产物文件就已经不一样了。
+        """
+        cells = make_cell_ids(20)
+        distinct = {c: float(i) for i, c in enumerate(cells)}
+        a = partition_by_soh_rank(cells, 4, distinct, seed=0)
+        b = partition_by_soh_rank(cells, 4, distinct, seed=99)
+        assert a == b
+
+    def test_ties_are_broken_by_seed(self):
+        """所有 SOH 都相同时，seed 决定谁进哪片（否则分片永远是同一批）。
+
+        用「至少两个 seed 给出不同划分」来断言，避免钉死某个 seed 的具体
+        排列——那属于实现细节，改一下 shuffle 顺序就会红。
+        """
+        cells = make_cell_ids(20)
+        flat_soh = {c: 1.0 for c in cells}
+        variants = {
+            tuple(tuple(partition_by_soh_rank(cells, 4, flat_soh, s)[cid])
+                  for cid in client_order(partition_by_soh_rank(cells, 4, flat_soh, s)))
+            for s in range(5)
+        }
+        assert len(variants) > 1, "全相同的 SOH 下 5 个 seed 给出了同一份划分，tie 没被打散"
+
+    def test_rejects_missing_soh(self):
+        cells = make_cell_ids(10)
+        soh = {c: 1.0 for c in cells[:-1]}   # 少一颗
+        with pytest.raises(PartitionError, match="没有 SOH"):
+            partition_by_soh_rank(cells, 2, soh, seed=0)
+
+    def test_rejects_too_many_clients(self):
+        cells = make_cell_ids(3)
+        soh = {c: 1.0 for c in cells}
+        with pytest.raises(PartitionError, match="少于客户端数"):
+            partition_by_soh_rank(cells, 5, soh, seed=0)
+
+    def test_rejects_non_positive_clients(self):
+        cells = make_cell_ids(10)
+        soh = {c: 1.0 for c in cells}
+        with pytest.raises(PartitionError, match="必须为正"):
+            partition_by_soh_rank(cells, 0, soh, seed=0)

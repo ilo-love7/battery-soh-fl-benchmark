@@ -305,3 +305,60 @@ jobs:
             echo "::error::冒烟跑完后工作区有改动，测试不该改写被追踪的文件"
             exit 1
           fi
+
+      # 划分的标签偏斜是可算的，不能靠人写「这个划分够异质」。
+      # 2026-10-24 实测 Dirichlet α=0.5 在 N=23 时的偏斜（12.2%）比 IID
+      # （17.3%）还小——不量的话「Non-IID 没掉点」会被读成算法免疫，
+      # 而真相是处理没施加。
+      #
+      # 注意：真实特征表 `data/mit-stanford/features.parquet` 被 gitignore，
+      # CI 里没有，所以这里**不能重算**，只能核对提交进来的
+      # `results/heterogeneity.json` 是否覆盖了所有 Non-IID 划分。
+      # 重算的命令写在 README，跑新数据时必须重跑一次。
+      - name: heterogeneity.json 必须覆盖所有 Non-IID 划分
+        run: |
+          python - <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          hetero = json.loads(
+              Path("results/heterogeneity.json").read_text(encoding="utf-8")
+          )
+          covered = set(hetero.get("partitions") or {})
+
+          # results/ 里每个 run 用的划分
+          used = set()
+          for p in sorted(Path("results").glob("*.json")):
+              try:
+                  d = json.loads(p.read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError):
+                  continue
+              src = d.get("partition_json")
+              if src:
+                  used.add(Path(str(src)).name)
+
+          missing = used - covered
+          if missing:
+              sys.exit(
+                  "::error::这些划分产物没有标签偏斜记录，H2 的 manipulation "
+                  "check 会失效：\n  " + "\n  ".join(sorted(missing))
+                  + "\n重跑：python scripts/measure_heterogeneity.py "
+                  "--features data/mit-stanford/features.parquet "
+                  "--out results/heterogeneity.json <各划分>"
+              )
+          print(f"OK heterogeneity.json 覆盖 {len(covered)} 份划分，"
+                f"results/ 用到的 {len(used)} 份全部有记录")
+          PY
+
+      # 判 H2 的闸门：任何 Non-IID 划分的偏斜不高于 IID 基线时，判定必须
+      # 输出「处理未施加」而不是「推翻」。这条防的是「拿一个没通电的电路
+      # 去证明断路器好用」。
+      - name: H2 判定前必须查偏斜
+        run: |
+          python scripts/summarize_results.py --judge \
+              --hetero results/heterogeneity.json 2>&1 | tee /tmp/judge.log
+          if grep -q "缺 heterogeneity.json" /tmp/judge.log; then
+            echo "::error::判定拿不到 heterogeneity.json，manipulation check 失效"
+            exit 1
+          fi
+          echo "OK manipulation check 有数据可用"

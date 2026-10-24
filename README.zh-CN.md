@@ -119,6 +119,37 @@ python3 scripts/summarize_results.py --check-plan docs/plan.md  # 核对（CI �
 `--check-plan` 会从 `results/*.json` 重算一遍表，与文档差一个数字就报错。
 结果 JSON 与更新后的 `docs/plan.md` 必须同一次提交——没有原始 run 的表无法被验证。
 
+### 判 H2 之前先量标签偏斜
+
+**数量偏斜不等于标签偏斜。** 本数据集上 Dirichlet α=0.5 造出的标签偏斜
+反而比 IID 更小（客户端身份解释的标签方差 12.2% vs 17.3%）——因为一个客户端
+拿走 21 颗电池，会把电池之间的 SOH 差异平均掉。在这样一份划分上报「Non-IID
+没掉点」，等于在报告一个从未被施加的处理。
+
+```bash
+python3 scripts/measure_heterogeneity.py \
+    --features data/mit-stanford/features.parquet \
+    --partition-json results/partition-mvp-k5-iid.json \
+    --partition-json results/partition-mvp-k5-dirichlet0.5.json \
+    --out results/heterogeneity.json
+```
+
+然后把它传给判定脚本。**只要某份划分的偏斜不高于 IID 基线，判定就不会判
+「推翻」，只会记「未判定（处理未施加）」**：
+
+```bash
+python3 scripts/summarize_results.py --judge \
+    --hetero results/heterogeneity.json
+```
+
+`results/heterogeneity.json` 必须与结果一起提交。CI 会检查它是否覆盖了所有
+run 实际用到的划分。
+
+真正施加了处理的划分是 `scripts/check_partition.py --emit-scheme sohrank`
+（按电池平均 SOH 排序后切连续分片）：**N、每客户端颗数、总数据量、训练预算
+全都不变，只改哪些电池分给谁**，偏斜拉到 47.1%。它用到了标签，所以是压力
+测试档，不是可部署场景。
+
 ### 关于 `flwr run`
 
 `scripts/run_federated.py` 是**本地联邦循环**，不是 Flower 运行时。它存在的原因很具体：

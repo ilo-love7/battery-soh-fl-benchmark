@@ -1,0 +1,19 @@
+{
+  "run_id": "c1__local__seed6",
+  "config": "configs/mvp.toml",
+  "strategy": "local",
+  "n_clients": 23,
+  "scheme": null,
+  "alpha": null,
+  "seed": 6,
+  "flwr_version": null,
+  "torch_version": "2.10.0+cpu",
+  "final_mae": 0.023055805829556093,
+  "final_rmse": 0.029142366357359405,
+  "rounds_to_target": null,
+  "curve": [],
+  "wall_clock_s": 90.399,
+  "epochs": 300,
+  "learning_rate": 0.001,
+  "notes": "test_standardizer=test; 23 个客户端各训各的，指标为均值（非平均模型）; optimizer=adam"
+}
