@@ -806,7 +806,7 @@ SOH 估计的绝对 MAE 强依赖数据集、划分方式、标签口径。写"�
 
 | 里程碑 | 内容 | 人日 | DOD（完成定义） |
 |---|---|---|---|
-| **M1** | 环境 + quickstart + MIT 数据接入 + 划分脚本 | 4 | ①`flwr run` 跑通官方 MNIST ②换成 MIT 数据后 IID 联邦与中心化差距 <5%（口径见下） ③`check_partition.py` 全 PASS |
+| **M1** | 环境 + quickstart + MIT 数据接入 + 划分脚本 | 4 | ①flwr 官方仿真运行时（ray 后端）跑通本仓库的 ClientApp/ServerApp ②换成 MIT 数据后 IID 联邦与中心化差距 <5%（口径见下） ③`check_partition.py` 全 PASS |
 | **M2**（MVP 截止） | FedAvg/FedProx × IID/Non-IID，3 seeds，曲线与表 | 4 | ①四条配置各有 3 个 run 的 JSON ②图 1、表 1 出图 ③H1-H3 各有 accept/reject ④2-3 页备忘 |
 | **M3** | FedAdam/FedBN + α 扫描 + 跨化学体系 | 4 | ①α 四档各 3 seeds ②FedBN 在跨化学体系场景有量化对比 ③图 2 |
 | **M4** | Opacus DP + 隐私-效用曲线 + 通信量表 | 3 | ①≥3 个 noise 点各带 ε ②图 3、表 2 ③H4 有结论 |
@@ -818,9 +818,20 @@ SOH 估计的绝对 MAE 强依赖数据集、划分方式、标签口径。写"�
 
 | DOD | 状态 | 依据 |
 |---|---|---|
-| ① `flwr run` 跑通官方 MNIST | **本机不可达 / CI 待验** | 本机因中文主机名让 raylet 的 protobuf 非法 UTF-8 而 abort（§14 坑 14、`docs/env-limitations.md`）。等价实现 `scripts/run_federated.py` 已跑通并产出全部结果；官方运行时由 `scripts/ci_smoke_flwr.py` 在 CI 的 Linux runner 上验证 |
+| ① `flwr run` 跑通官方 MNIST | **达成**（在 CI 上，非本机） | `scripts/ci_smoke_flwr.py` 在 GitHub Actions 的 Linux runner 上跑通 **flwr 1.41.0 + ray 2.55.1** 官方仿真：2 轮、4 客户端、真实 `Aggregated MetricRecord`（`train_loss` 0.00275 → 0.00084，`mae` 0.0377 → 0.0418），输出 `SMOKE OK`。本机因中文主机名让 raylet 的 protobuf 非法 UTF-8 而 abort（§14 坑 14、`docs/env-limitations.md`），这条路径**本机不可替代** |
 | ② MIT 数据后 IID 联邦与中心化差距 <5% | **未达成，且该 DOD 的写法本身有缺陷** | 见下 |
 | ③ `check_partition.py` 全 PASS | **达成** | IID / Dirichlet α=0.5 两份产物均对账通过，`errors=0`，仅 1 条可接受 WARN |
+
+**①为什么不能写成「`flwr run` 跑通 MNIST」**：原 DOD 是照 quickstart 抄的，
+但本仓库的 app 不是 MNIST 分类器，跑官方 MNIST 只能证明「装得上」，不能
+证明「本仓库的 ClientApp/ServerApp 能在官方运行时里跑」。所以冒烟改成本
+仓库自己的 app + 合成数据：验证的是 client 在独立 ray actor 里各自加载
+数据 → `num-examples` 加权聚合 → 全局评估这条链路。
+
+**①仍未覆盖的**：`flwr run` CLI（fab 打包）这条路径。它要求
+`[project].dependencies` 含 flwr，而本仓库的 `dependencies = []` 是刻意的
+（检查器要能纯标准库跑），所以走的是 `run_simulation` Python API。
+「fab 能打包」这件事没被验证，见 `docs/env-limitations.md`。
 
 **②为什么未达成，以及为什么这条 DOD 要改写。**
 
