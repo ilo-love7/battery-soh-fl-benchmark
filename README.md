@@ -4,7 +4,7 @@
 
 **A federated-learning research plan and executable harness for estimating battery SOH from crowdsourced charging data — without uploading the raw curves.**
 
-[![Stage](https://img.shields.io/badge/stage-plan%20only%20·%20no%20results-yellow)](./docs/plan.md)
+[![Stage](https://img.shields.io/badge/stage-second%20batch%20·%20results%20provisional-yellow)](./docs/plan.md)
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
@@ -12,11 +12,17 @@
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-> **Status: first experimental batch complete (2026-10-24), results provisional.**
-> Table 1 in `docs/plan.md` §10.2 now holds real numbers, but three of the four
-> hypotheses remain **undecided**: the seed-to-seed spread (5%–63%) is larger than
-> the 5% decision threshold, so only H3 (FedProx) could be settled — and it was
-> rejected. Every number in the table is regenerated from `results/*.json` by CI,
+> **Status: second experimental batch complete (2026-10-24), results still provisional.**
+> With 8 seeds per configuration all three hypotheses are now settled:
+> **H1 rejected** (federated beats centralized by 23.5% at 3.3× the training
+> budget; at equal budget it is 6.4× worse — the two framings disagree in sign),
+> **H2 accepted** (SOH-sorted shards at 47.1% label skew cost +24.2% against a
+> same-budget IID control, p_t=0.0013), **H3 rejected** (μ=0.01 and μ=0.1 are
+> both worse than μ=0, with no usable interior point). Dirichlet α=0.5 stays
+> *undecided (treatment not applied)*: its label skew (12.2%) is below the IID
+> baseline (17.3%). M3 is now scanning label skew across shard granularity
+> k=1/2/5/10, each tier against a same-k IID control.
+> Every number in the table is regenerated from `results/*.json` by CI,
 > so nothing in it can be hand-edited.
 
 ---
@@ -200,7 +206,7 @@ On Windows, use **Python 3.11 or 3.12**: `flwr[simulation]==1.41.0` pins
 
 ## What is deliberately absent
 
-- **No results.** See above.
+- **No run of the official simulation on this machine.** The ray backend aborts on a non-ASCII hostname; see `docs/env-limitations.md` and `docs/plan.md` §14 pitfall 14 for the workaround and the equivalence argument.
 - **No absolute accuracy target.** Conclusions are reported as *relative* degradation vs. the centralized baseline (C0). See `docs/plan.md` §11.
 - **No claim of deployability.** This is a simulation. `docs/plan.md` §14 pitfall 6 is about exactly that.
 - **The heavy tests are not in default CI.** `test_model.py` / `test_data.py` / `test_app.py` need torch + flwr, so they run in the manual `heavy-tests` job (Actions → CI → Run workflow). Default CI stays runnable in seconds.

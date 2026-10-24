@@ -4,7 +4,7 @@
 
 **面向众包充电数据的电池 SOH 估计联邦学习研究平台——原始充电曲线不上传，只联合训练模型。**
 
-[![Stage](https://img.shields.io/badge/stage-plan%20only%20·%20no%20results-yellow)](./docs/plan.md)
+[![Stage](https://img.shields.io/badge/stage-second%20batch%20·%20results%20provisional-yellow)](./docs/plan.md)
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
@@ -12,10 +12,13 @@
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-> **状态：第一批实验已完成（2026-10-24），结果暂定。** `docs/plan.md` §10.2 的表 1
-> 现在填的是真实数字，但四个假设里有三个仍是**未判定**：seed 间波动（5%–63%）大于
-> 5% 的判据阈值，只有 H3（FedProx）能判定——且结论是推翻。表里每个数都由 CI 从
-> `results/*.json` 重新生成，手改不了。
+> **状态：第二批实验已完成（2026-10-24），结果仍暂定。** 每个配置补到 8 个 seed 后，
+> 三个假设都有了判定：**H1 推翻**（联邦在 3.3 倍训练量下比中心化好 23.5%，等训练量下
+> 差 6.4 倍——两种口径反号）、**H2 接受**（SOH 排序分片偏斜 47.1%，相对同预算 IID
+> 劣化 +24.2%，p_t=0.0013）、**H3 推翻**（μ=0.01 与 μ=0.1 都差于 μ=0，不存在可用
+> 内点）。Dirichlet α=0.5 记**未判定（处理未施加）**：它的标签偏斜 12.2% 低于 IID
+> 基线 17.3%。M3 正在扫分片粗细 k=1/2/5/10 的标签偏斜，每档配同 k 的 IID 对照。
+> 表里每个数都由 CI 从 `results/*.json` 重新生成，手改不了。
 
 ---
 
@@ -191,7 +194,7 @@ Windows 上请用 **Python 3.11 或 3.12**：`flwr[simulation]==1.41.0` 硬钉
 
 ## 刻意没有的东西
 
-- **没有结果。** 见上文。
+- **没有官方仿真的本机运行。** ray 后端在中文主机名上直接 abort，绕行方案与等价性论证见 `docs/env-limitations.md` 与 `docs/plan.md` §14 坑 14。
 - **没有绝对精度目标。** 所有结论以相对中心化基线（C0）的劣化百分比表述，见 `docs/plan.md` §11。
 - **不宣称可部署。** 这是仿真。`docs/plan.md` §14 坑 6 讲的就是这件事。
 - **重依赖测试不进默认 CI。** `test_model.py` / `test_data.py` / `test_app.py` 需要 torch + flwr，
@@ -211,7 +214,7 @@ Windows 上请用 **Python 3.11 或 3.12**：`flwr[simulation]==1.41.0` 硬钉
 1. **每一条硬约束都要有可执行的检查。** 往方案里加规则，就要同时加上检查器，
    或加上一条在规则被破坏时会失败的测试。只有「我们应该验证 X」而没有检查器，
    正是 `docs/archive/plan-v1.md` 产生的原因。
-2. **没有运行结果就没有数字。** §10.2 保持 `—`，直到 `results/*.json` 存在。
+2. **没有运行结果就没有数字。** §10.2 的结果表由脚本从 `results/*.json` 重算、CI 逐字核对；没有 run 就没有行，手改一个数字就红。
 
 ```bash
 python3 -m pytest tests -v        # 纯标准库，CI 里跑的就是这些
