@@ -12,7 +12,12 @@
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-> **Status: plan stage. This repository contains no experimental results.** Every number in `docs/plan.md` §10.2 is a placeholder. Filling it in before the runs exist would be fabrication, and CI enforces that.
+> **Status: first experimental batch complete (2026-10-24), results provisional.**
+> Table 1 in `docs/plan.md` §10.2 now holds real numbers, but three of the four
+> hypotheses remain **undecided**: the seed-to-seed spread (5%–63%) is larger than
+> the 5% decision threshold, so only H3 (FedProx) could be settled — and it was
+> rejected. Every number in the table is regenerated from `results/*.json` by CI,
+> so nothing in it can be hand-edited.
 
 ---
 
@@ -100,8 +105,23 @@ python3 scripts/run_federated.py --config configs/mvp.toml \
     --features data/mit-stanford/features.parquet \
     --partition-json results/partition.json \
     --strategy fedavg --rounds 100 --seed 0 --out results/
-python3 scripts/summarize_results.py --results results/
+python3 scripts/summarize_results.py --results results/ --paired
 ```
+
+`--paired` subtracts per-seed differences between configurations. With the
+seed-to-seed spread measured here (5%–63%), that is the only comparison with
+enough resolution to settle a hypothesis.
+
+Table 1 in `docs/plan.md` §10.2 is a **generated block**. Do not hand-edit it:
+
+```bash
+python3 scripts/summarize_results.py --write-plan docs/plan.md  # regenerate
+python3 scripts/summarize_results.py --check-plan docs/plan.md  # verify (CI runs this)
+```
+
+`--check-plan` recomputes the table from `results/*.json` and fails if the
+document differs by even one digit. Commit the result JSONs and the updated
+`docs/plan.md` together — a table without its raw runs cannot be verified.
 
 ### On `flwr run`
 

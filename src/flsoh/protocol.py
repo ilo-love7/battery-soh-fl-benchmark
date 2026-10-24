@@ -235,12 +235,27 @@ def validate_config(cfg: dict) -> list[tuple[str, str, str]]:
     local_epochs = _get(cfg, "train.local_epochs")
     if not _is_int(local_epochs) or local_epochs < 1:
         err("C-TRAIN", f"train.local_epochs 必须是正整数，收到 {local_epochs!r}")
-    elif local_epochs > 2:
-        warn(
-            "C-TRAIN",
-            f"local_epochs={local_epochs} 在 Non-IID 下漂移会明显放大（§14 坑 2）；"
-            "先降到 1-2 拿到基线，再讨论要不要加",
-        )
+    elif _is_int(num_rounds) and num_rounds >= 1:
+        # 判据不是「local_epochs 大不大」，而是「联邦的总本地 epoch 与中心化
+        # 基线对不对等」。同一条 le=10，在每客户端 80 行数据下是**必要的**
+        # （le=2 只有 400 步、欠拟合到 0.0222），在每客户端上万样本下才是漂移
+        # 风险。所以只有拿总训练量比才有意义。
+        #
+        # 这条不是风格建议：本仓库实测同一份划分、同一批 seed，只把
+        # local_epochs 从 10 降到 3（与基线的 300 ep 对齐），相对差就从
+        # −20.9% 变成 +772%（§14 坑 15）。不声明训练量的相对差会反号。
+        base_epochs = _get(cfg, "train.baseline_epochs")
+        if _is_int(base_epochs) and base_epochs >= 1:
+            fed_epochs = num_rounds * local_epochs
+            ratio = fed_epochs / base_epochs
+            if ratio > 1.25 or ratio < 0.8:
+                warn(
+                    "C-TRAIN",
+                    f"训练量不对等：联邦 {num_rounds} 轮 × {local_epochs} ep = "
+                    f"{fed_epochs} 个本地 epoch，中心化基线 {base_epochs} ep，"
+                    f"比值 {ratio:.2f}。相对差会随这个比值反号（§14 坑 15），"
+                    "报结果时必须写明该比值，或另跑一组等训练量对照",
+                )
     fraction_fit = _get(cfg, "train.fraction_fit")
     if not _is_number(fraction_fit) or not (0 < fraction_fit <= 1):
         err("C-TRAIN", f"train.fraction_fit 必须落在 (0,1]，收到 {fraction_fit!r}")

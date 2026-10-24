@@ -12,8 +12,10 @@
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-> **状态：方案阶段。本仓库没有任何实验结果。** `docs/plan.md` §10.2 的每一格都是占位符。
-> 实验还没跑就把数字填进去就是造假，这一点由 CI 强制。
+> **状态：第一批实验已完成（2026-10-24），结果暂定。** `docs/plan.md` §10.2 的表 1
+> 现在填的是真实数字，但四个假设里有三个仍是**未判定**：seed 间波动（5%–63%）大于
+> 5% 的判据阈值，只有 H3（FedProx）能判定——且结论是推翻。表里每个数都由 CI 从
+> `results/*.json` 重新生成，手改不了。
 
 ---
 
@@ -101,8 +103,21 @@ python3 scripts/run_federated.py --config configs/mvp.toml \
     --features data/mit-stanford/features.parquet \
     --partition-json results/partition.json \
     --strategy fedavg --rounds 100 --seed 0 --out results/
-python3 scripts/summarize_results.py --results results/
+python3 scripts/summarize_results.py --results results/ --paired
 ```
+
+`--paired` 按 seed 相减，比较两档配置的配对差。本仓库实测 seed 间波动为 5%–63%，
+在这个噪声水平下它是唯一有分辨力的比较方式。
+
+`docs/plan.md` §10.2 的表 1 是**生成区**，不要手改：
+
+```bash
+python3 scripts/summarize_results.py --write-plan docs/plan.md  # 重新生成
+python3 scripts/summarize_results.py --check-plan docs/plan.md  # 核对（CI 会跑）
+```
+
+`--check-plan` 会从 `results/*.json` 重算一遍表，与文档差一个数字就报错。
+结果 JSON 与更新后的 `docs/plan.md` 必须同一次提交——没有原始 run 的表无法被验证。
 
 ### 关于 `flwr run`
 

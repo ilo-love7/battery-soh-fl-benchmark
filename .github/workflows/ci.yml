@@ -204,9 +204,16 @@ jobs:
             echo "::error::失败码不是 P-TEST"; exit 1
           fi
 
-  # 反造假闸门：方案阶段不许出现实验结果。
-  # 这一步防的是「先写结论再补实验」的写作顺序——一旦有人往 §10.2 里填了数，
-  # 而仓库里又没有对应的 results/*.json，CI 会直接红。
+  # 反造假闸门：§10.2 的结果表必须能被 results/*.json 重新算出来。
+  #
+  # 这条闸门的第一版是「结果列必须全是占位符 —」，那在**还没有实验结果**
+  # 的时候是对的：它拦的是「先写结论再补实验」。第一批结果落地后那条断言
+  # 只剩一个作用——拦住所有真实结果，于是它红了（2026-10-24 的 run
+  # 40060578763）。但直接删掉它等于把闸门拆了。
+  #
+  # 所以改成更强的版本：文档里的表与 `summarize_results.py` 从原始 JSON
+  # 重新算出来的表**逐字比对**。旧版只能拦住"提前填数"，拦不住"填错的数"；
+  # 新版连一个数字被手改都会红。
   no-fabricated-results:
     runs-on: ubuntu-latest
     steps:
@@ -214,33 +221,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: §10.2 结果表必须仍为占位状态
+
+      - name: §10.2 结果表必须与 results/ 重新算出的结果逐字一致
+        run: python scripts/summarize_results.py --check-plan docs/plan.md
+
+      # 负控：检查器必须有负控，否则它可能只是个永远打印 OK 的摆设。
+      # 改掉生成区里的第一个数字，断言闸门报错（退出码 3）。
+      - name: 负控：改掉表里一个数，闸门必须报错
         run: |
+          cp docs/plan.md /tmp/plan.bak
           python - <<'PY'
-          import re, sys, pathlib
-          text = pathlib.Path("docs/plan.md").read_text(encoding="utf-8")
-          m = re.search(r"### 10\.2 结果表（当前为空）(.*?)(?=\n### )", text, re.S)
+          import pathlib, re
+          p = pathlib.Path("docs/plan.md")
+          t = p.read_text(encoding="utf-8")
+          b = t.index("<!-- BEGIN GENERATED: results-table -->")
+          e = t.index("<!-- END GENERATED: results-table -->")
+          block = t[b:e]
+          m = re.search(r"\d\.\d{5}", block)
           if not m:
-              sys.exit("::error::docs/plan.md 里找不到 §10.2 结果表，请人工核对")
-          body = m.group(1)
-          if "本仓库尚无实验结果" not in body:
-              sys.exit("::error::§10.2 的声明句被删了：先确认实验阶段，再决定要不要恢复")
-          rows = [l for l in body.splitlines() if l.strip().startswith("|")]
-          # 结果列是最后三列（MAE / RMSE / 收敛轮数），协议参数列（如客户端数）
-          # 是允许有数字的。占位符必须全是「—」。
-          bad = []
-          for line in rows:
-              if "---" in line or any("配置" in c for c in line.split("|")[1:3]):
-                  continue  # 表头与分隔行
-              cells = [c.strip() for c in line.split("|")]
-              if len(cells) < 8:
-                  continue
-              if cells[5:8] != ["—", "—", "—"]:
-                  bad.append(line)
-          if bad:
-              sys.exit("::error::结果列出现非占位符，但本阶段不应有实验结果：\n" + "\n".join(bad))
-          print(f"OK：{len(rows)} 行的结果列全部为占位符")
+              raise SystemExit("::error::生成区里找不到可扰动的数字，负控失效")
+          print(f"扰动 {m.group(0)} → 0.00999")
+          p.write_text(t[:b] + block[:m.start()] + "0.00999" + block[m.end():] + t[e:],
+                       encoding="utf-8")
           PY
+          set +e
+          python scripts/summarize_results.py --check-plan docs/plan.md > /tmp/nc.log 2>&1
+          code=$?
+          set -e
+          cp /tmp/plan.bak docs/plan.md
+          if [ "$code" -eq 0 ]; then
+            echo "::error::负控失败：手改了数字，闸门却通过了"
+            exit 1
+          fi
+          echo "OK 负控生效（退出码 $code）"
+          # 还原后必须重新通过，证明失败不是别的原因造成的
+          python scripts/summarize_results.py --check-plan docs/plan.md
 
   # data / model / app 依赖 torch + flwr。它们**默认不在 CI 里跑**：
   # 上面的 tests job 用纯标准库就能验证检查器，不需要为了跑检查去解析

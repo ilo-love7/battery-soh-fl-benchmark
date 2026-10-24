@@ -197,10 +197,31 @@ class TestTrain:
         issues = validate_config(mutate("train.fraction_fit", 1.5))
         assert "C-TRAIN" in codes(issues, LEVEL_ERROR)
 
-    def test_warns_on_many_local_epochs(self):
-        issues = validate_config(mutate("train.local_epochs", 5))
+    def test_warns_on_unbalanced_training_budget(self):
+        """判据是「联邦总本地 epoch 与基线对不对等」，不是「le 大不大」。
+
+        同一条 le=10，在每客户端 80 行数据下是必要的（le=2 欠拟合到 0.0222），
+        在每客户端上万样本下才是漂移风险。所以只有比值才有意义。
+        """
+        cfg = mutate("train.local_epochs", 5)
+        cfg["train"]["baseline_epochs"] = 300   # 500 / 300 = 1.67
+        issues = validate_config(cfg)
         assert "C-TRAIN" in codes(issues, LEVEL_WARN)
         assert not has_errors(issues)
+
+    def test_balanced_budget_is_not_warned(self):
+        """等训练量必须放行，否则「按规矩对齐」反而会被报警。"""
+        cfg = mutate("train.local_epochs", 3)
+        cfg["train"]["baseline_epochs"] = 300   # 300 / 300 = 1.00
+        issues = validate_config(cfg)
+        assert "C-TRAIN" not in codes(issues, LEVEL_WARN)
+
+    def test_missing_baseline_epochs_skips_budget_check(self):
+        """baseline_epochs 是可选的：缺了就跳过，不能凭空造一个分母。"""
+        cfg = mutate("train.local_epochs", 50)
+        assert "baseline_epochs" not in cfg["train"]
+        issues = validate_config(cfg)
+        assert "C-TRAIN" not in codes(issues, LEVEL_WARN)
 
 
 class TestSeeds:
