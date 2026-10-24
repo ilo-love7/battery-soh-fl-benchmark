@@ -18,14 +18,23 @@ import pytest
 pytest.importorskip("torch", reason="app 层需要 torch")
 flwr_app = pytest.importorskip("flwr.app", reason="app 层需要 flwr")
 
+import torch  # noqa: E402
 import numpy as np  # noqa: E402
-from flwr.app import ArrayRecord, ConfigRecord, Message, RecordDict  # noqa: E402
+from flwr.app import (  # noqa: E402
+    ArrayRecord,
+    ConfigRecord,
+    Message,
+    MetricRecord,
+    RecordDict,
+)
+from flwr.serverapp.strategy import FedAdam  # noqa: E402
 from flwr.supercore.task_identity import TaskIdentity  # noqa: E402
 
 from flsoh.app import client_app as ca  # noqa: E402
 from flsoh.app import server_app as sa  # noqa: E402
 from flsoh.data import synthetic_feature_table  # noqa: E402
 from flsoh.model import build_model  # noqa: E402
+from flsoh.train import ServerAdam, weighted_average  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -223,3 +232,124 @@ class TestTrainingBehaviour:
         wa = a.content["arrays"].to_torch_state_dict()
         wb = b.content["arrays"].to_torch_state_dict()
         assert any((wa[k] != wb[k]).any() for k in wa)
+
+
+# ---------------------------------------------------------------------------
+# 服务端聚合：本地实现与 flwr 内置策略必须逐轮相等
+# ---------------------------------------------------------------------------
+
+
+class TestFedAdamEquivalence:
+    """本地 ``ServerAdam`` 与 flwr 内置 ``FedAdam`` 必须逐轮相等。
+
+    这是仓库的既有约定（``weighted_average`` 对 FedAvg 也是这么钉的）：
+    两条路径共享 ``flsoh/train.py`` 的训练实现，服务端聚合一旦漂移，
+    两边都不会报错，只是跑出来的数不一样——而那种差异极难定位，
+    因为两边的日志都正常。M1 的 DOD ① 建立在「差异只可能在聚合」
+    这个前提上，这条测试就是那个前提的护栏。
+
+    ``current_arrays`` 直接设而绕过 ``configure_train``：后者要向 Grid
+    采样节点，而这里测的是聚合数学，不是采样。绕过时把理由写清楚，
+    免得以后有人以为漏了一步。
+    """
+
+    @staticmethod
+    def _query(init):
+        """构造一条 query。reply 必须由它派生（flwr 1.41 没有裸 reply）。"""
+        return Message(
+            content=RecordDict(
+                {
+                    "arrays": ArrayRecord.from_torch_state_dict(init),
+                    "config": ConfigRecord({"lr": 1e-3}),
+                }
+            ),
+            dst_node_id=0,
+            message_type="query",
+        )
+
+    @staticmethod
+    def _replies(query, states, weights):
+        out = []
+        for st, w in zip(states, weights):
+            out.append(
+                Message(
+                    content=RecordDict(
+                        {
+                            "arrays": ArrayRecord.from_torch_state_dict(st),
+                            "metrics": MetricRecord({"num-examples": int(w)}),
+                        }
+                    ),
+                    reply_to=query,
+                )
+            )
+        return out
+
+    def test_matches_flwr_round_by_round(self):
+        init = build_model(16, seed=0).state_dict()
+        weights = [7.0, 3.0, 5.0]
+        query = self._query(init)
+
+        # 三轮，每轮客户端从全局参数出发做确定性的"本地训练"（加一个
+        # 与轮次相关的扰动，保证伪梯度既非零也在变化）。
+        local_global = {k: v.clone() for k, v in init.items()}
+        flwr_global = {k: v.clone() for k, v in init.items()}
+        server = ServerAdam(eta=0.01, beta_1=0.9, beta_2=0.99, tau=1e-3)
+        strategy = FedAdam(eta=0.01, eta_l=1e-3, beta_1=0.9, beta_2=0.99, tau=1e-3)
+
+        for rnd in range(1, 4):
+            g = torch.Generator().manual_seed(100 + rnd)
+            states = [
+                {
+                    k: v + 0.01 * torch.randn(v.shape, generator=g)
+                    for k, v in local_global.items()
+                }
+                for _ in range(3)
+            ]
+
+            local_global = server.step(local_global, weighted_average(states, weights))
+
+            strategy.current_arrays = {k: v.numpy() for k, v in flwr_global.items()}
+            # flwr 的 server_round 从 0 开始；eta_norm 用的是 round+1
+            arrays, _ = strategy.aggregate_train(
+                rnd - 1, self._replies(query, states, weights)
+            )
+            flwr_global = arrays.to_torch_state_dict()
+
+            assert set(local_global) == set(flwr_global)
+            for k in local_global:
+                assert torch.allclose(
+                    local_global[k].to(torch.float32),
+                    flwr_global[k].to(torch.float32),
+                    rtol=1e-5,
+                    atol=1e-7,
+                ), f"第 {rnd} 轮 {k} 不一致"
+
+    def test_flwr_fedadam_moves_away_from_averaged(self):
+        """负面对照：FedAdam 的结果必须**不等于**加权平均。
+
+        这条与上一条配对才有意义——上一条证明"对得上 flwr"，
+        这一条证明"对上的不是巧合"（比如 η 被写死成 1、或整个
+        服务端更新被跳过，都会让输出退化成加权平均）。
+        """
+        init = build_model(16, seed=0).state_dict()
+        g = torch.Generator().manual_seed(7)
+        states = [
+            {k: v + 0.05 * torch.randn(v.shape, generator=g) for k, v in init.items()}
+            for _ in range(3)
+        ]
+        weights = [1.0, 1.0, 1.0]
+        avg = weighted_average(states, weights)
+
+        strategy = FedAdam(eta=0.01, eta_l=1e-3)
+        strategy.current_arrays = {k: v.numpy() for k, v in init.items()}
+        arrays, _ = strategy.aggregate_train(
+            0, self._replies(self._query(init), states, weights)
+        )
+        got = arrays.to_torch_state_dict()
+
+        # flwr 的 FedAdam 输出是 float64（eta_norm 是 numpy 标量，把结果
+        # 提上去了），本地实现保持 float32。比较前统一到 float32。
+        for k in got:
+            assert not torch.allclose(
+                got[k].to(torch.float32), avg[k].to(torch.float32), rtol=1e-4
+            ), f"{k} 与加权平均逐位相同：服务端 Adam 没有生效"

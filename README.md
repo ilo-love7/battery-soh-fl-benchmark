@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-275%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-210%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -20,8 +20,13 @@
 > same-budget IID control, p_t=0.0013), **H3 rejected** (μ=0.01 and μ=0.1 are
 > both worse than μ=0, with no usable interior point). Dirichlet α=0.5 stays
 > *undecided (treatment not applied)*: its label skew (12.2%) is below the IID
-> baseline (17.3%). M3 is now scanning label skew across shard granularity
-> k=1/2/5/10, each tier against a same-k IID control.
+> baseline (17.3%).
+> M3 added the skew sweep (k=1/2/5/10, each tier against a same-k IID control)
+> and **FedAdam**: server-side momentum recovers 86.1% of the accuracy lost to
+> `local_epochs=3` (p_t=0.0056, 8/8 seeds) and reaches centralized-level MAE at
+> 1/3.3 of the training budget — but adds nothing once local epochs suffice.
+> FedBN is deferred (the model deliberately has no BatchNorm, and no second
+> chemistry's ΔQ(V) features are available locally).
 > Every number in the table is regenerated from `results/*.json` by CI,
 > so nothing in it can be hand-edited.
 

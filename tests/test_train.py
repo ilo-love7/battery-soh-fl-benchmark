@@ -21,6 +21,7 @@ torch = pytest.importorskip("torch", reason="train 需要 torch")
 
 from flsoh.model import build_model  # noqa: E402
 from flsoh.train import (  # noqa: E402
+    ServerAdam,
     make_optimizer,
     train_epochs,
     weighted_average,
@@ -185,3 +186,173 @@ class TestFedProx:
             )
 
         assert dist_after(1.0) < dist_after(0.1)
+
+
+class TestServerAdam:
+    """服务端 Adam（FedAdam）的测试。
+
+    这个类要防的是两个**静默**失败，它们都不报错、曲线都照出：
+
+    1. **忘了偏置矫正**（``eta_norm`` 里的 √(1−β2^t)/(1−β1^t)）：
+       前几轮 m、v 都偏小，更新量被系统性压低，表现为「前 10 轮
+       几乎不动」——而轮数正是最贵的资源。
+    2. **伪梯度方向写反**（``w_global − w_avg``）：服务端每轮把参数
+       推离客户端训练的方向，训练照跑，只是整体发散或停滞。
+
+    所以下面每条测试都对着一个**手算得到的闭式解**，而不是对着
+    实现自己（那等于没测）。``eta=0`` 退化为 FedAvg 那条是总对照：
+       服务端更新必须是 FedAvg 与 FedAdam 的唯一差异。
+    """
+
+    def test_eta_zero_freezes_global(self):
+        """η=0 时 step 必须原样返回全局参数——服务端一步都不走。
+
+        注意这不是 FedAvg（FedAvg 是服务端 η=1 的普通梯度步），
+        别把两者混为一谈。这条钉住的是「eta 真的乘上了更新量」。
+        """
+        g = _state(1.0)
+        avg = _state(3.0)
+        out = ServerAdam(eta=0.0).step(g, avg)
+        assert torch.equal(out["w"], g["w"])
+        assert torch.equal(out["b"], g["b"])
+
+    def test_zero_delta_leaves_global_unchanged(self):
+        """客户端没带来任何变化（avg == global）时，全局不许动。
+
+        delta=0 ⇒ m=0、v=0 ⇒ 更新量 0/(0+τ)=0。τ>0 时精确成立；
+        τ=0 时会出 NaN——那条路径由 test_rejects_nan_update 钉住。
+        """
+        g = _state(2.0)
+        out = ServerAdam().step(g, _state(2.0))
+        assert torch.allclose(out["w"], g["w"])
+        assert torch.allclose(out["b"], g["b"])
+
+    def test_first_step_with_zero_betas_is_sign_step(self):
+        """β1=β2=0、τ=0 时首轮更新必须是 η·sign(delta)。
+
+        代入闭式解：m=delta、v=delta²、eta_norm=η，
+        w_new = w + η·delta/(|delta|+0) = w + η·sign(delta)。
+        w 的 delta=2.0 → 1.0+0.5=1.5；b 的 delta=4.0 → 2.0+0.5=2.5。
+        """
+        server = ServerAdam(eta=0.5, beta_1=0.0, beta_2=0.0, tau=0.0)
+        out = server.step(_state(1.0), _state(3.0))
+        assert torch.allclose(out["w"], torch.full((4,), 1.5))
+        assert torch.allclose(out["b"], torch.full((4,), 2.5))
+
+    def test_constant_delta_moves_eta_per_round(self):
+        """恒定伪梯度且 τ=0 时，每轮位移**恰为 η**——偏置矫正的闭式解。
+
+        代数上：m_t = delta·(1−β1^t)，v_t = delta²·(1−β2^t)，于是
+        eta_norm·m_t/√v_t = η·sign(delta)，β1^t 与 β2^t 正好约掉。
+
+        这条同时钉住两件事：偏置矫正必须**在**（缺了它位移会随 t 增长：
+        0.1、0.135、0.157……），分母也不许被悄悄改掉。期望值 1.1/1.2/1.3
+        是拿计算器按公式算的，不是跑实现得来的。
+
+        「恒定伪梯度」要求 averaged_state 跟着 global 一起走（delta 固定
+        为 +2）——只给恒定的 avg 会让 global 追上来的同时 delta 缩小，
+        那是另一条测试（动量的那条）才要的情形。
+        """
+        server = ServerAdam(eta=0.1, beta_1=0.9, beta_2=0.99, tau=0.0)
+        w = _state(1.0)
+        avg = _state(3.0)  # delta = +2
+        for want in (1.1, 1.2, 1.3):
+            w = server.step(w, avg)
+            # 保持 delta = +2：avg 要跟着**新的** global 走，不是旧的
+            avg = _state(float(w["w"][0]) + 2.0)
+            assert abs(float(w["w"][0]) - want) < 1e-5, (server.t, float(w["w"][0]))
+
+    def test_momentum_carries_the_previous_delta(self):
+        """伪梯度变小时，β1>0 的第二轮位移必须大于 β1=0。
+
+        这是 FedAdam 的**全部动机**：H3 实验发现客户端 Adam 动量每轮
+        归零（FedAvg 只聚合参数，不聚合优化器状态），FedAdam 把动量
+        放到服务端跨轮存活。若这条不过，说明动量没有跨轮累积。
+
+        为什么用「变小的 delta」而不是恒定 delta：恒定 delta 下偏置
+        矫正会让每轮位移恒为 η（见上一条），两种 β1 看不出差别；
+        只有梯度变化时，动量把上一轮的方向继续带走这一点才显形。
+        """
+        def second_step(beta_1: float) -> float:
+            server = ServerAdam(eta=0.1, beta_1=beta_1, beta_2=0.0, tau=0.0)
+            w = _state(1.0)
+            first = server.step(w, _state(3.0))    # delta = +2
+            second = server.step(first, _state(1.5))  # delta = +0.4
+            return float((second["w"] - first["w"]).abs().max())
+
+        # β1=0：每轮只认当前 delta，位移就是 η·sign(delta)
+        assert second_step(0.0) == pytest.approx(0.1, abs=1e-6)
+        # β1=0.9：上一轮的大 delta 仍占 0.9 权重，位移被抬高（手算 0.2895）
+        assert second_step(0.9) == pytest.approx(0.289474, abs=1e-5)
+
+    def test_bias_correction_uses_round_number(self):
+        """偏置矫正必须随轮数变化（t 从 1 开始），且等于 flwr 的闭式。
+
+        eta_norm = η·√(1−β2^t)/(1−β1^t)。β1=0.9、β2=0.99 时它是
+        **递减**的（0.1 → 0.0742 → 0.0636）：β1 衰减比分母增长更快。
+        少了它、或把 t 冻结在 1，三轮都会是 0.1——这条断言逐轮值，
+        不是只查单调性。
+        """
+        server = ServerAdam(eta=0.1, beta_1=0.9, beta_2=0.99)
+        w, avg = _state(1.0), _state(3.0)
+        expected = [0.1, 0.0742460, 0.0635942]
+        for want in expected:
+            w = server.step(w, avg)
+            got = server.eta * (1 - 0.99**server.t) ** 0.5 / (1 - 0.9**server.t)
+            assert abs(got - want) < 1e-6, (server.t, got)
+
+    def test_v_starts_at_zero_first_round(self):
+        """首轮 v_t 必须等于 (1−β2)·delta²，不能带着上一轮的残留。"""
+        server = ServerAdam(eta=0.0, beta_2=0.99)
+        server.step(_state(1.0), _state(3.0))
+        # delta=2 → v = 0.01·4 = 0.04
+        assert torch.allclose(server.v_t["w"], torch.full((4,), 0.04))
+
+    def test_rejects_key_mismatch(self):
+        """全局与聚合结果的键不一致必须抛错。
+
+        静默广播会造出张冠李戴的模型：客户端的键在全局里不存在时，
+        按 key 取值要么 KeyError、要么（更糟）悄悄对齐到错误的参数。
+        """
+        server = ServerAdam()
+        g = {"w": torch.zeros(4)}
+        avg = {"w": torch.zeros(4), "extra": torch.zeros(4)}
+        with pytest.raises(ValueError, match="键不一致"):
+            server.step(g, avg)
+
+    def test_rejects_shape_mismatch(self):
+        server = ServerAdam()
+        g = {"w": torch.zeros(4)}
+        avg = {"w": torch.zeros(5)}
+        with pytest.raises(ValueError, match="形状不一致"):
+            server.step(g, avg)
+
+    def test_rejects_bad_hyperparameters(self):
+        """超参越界必须抛错，不能静默取默认值。"""
+        with pytest.raises(ValueError, match="eta"):
+            ServerAdam(eta=-1.0)
+        with pytest.raises(ValueError, match="beta_1"):
+            ServerAdam(beta_1=1.0)
+        with pytest.raises(ValueError, match="beta_2"):
+            ServerAdam(beta_2=-0.1)
+        with pytest.raises(ValueError, match="tau"):
+            ServerAdam(tau=-1e-3)
+
+    def test_rejects_nan_update(self):
+        """τ=0 且伪梯度为 0 时必须抛错，不许把 NaN 写进结果 JSON。
+
+        0/(√0+0) = NaN。NaN 不会让训练崩，只会静默污染之后每一轮，
+        最后产出一份看起来正常的结果文件——那比崩溃贵得多。
+        """
+        server = ServerAdam(tau=0.0)
+        with pytest.raises(ValueError, match="NaN/Inf"):
+            server.step(_state(2.0), _state(2.0))
+
+    def test_does_not_mutate_inputs(self):
+        """step 不许改调用方的 state_dict——全局参数还要参与下一轮。"""
+        g, avg = _state(1.0), _state(3.0)
+        g_before = g["w"].clone()
+        avg_before = avg["w"].clone()
+        ServerAdam().step(g, avg)
+        assert torch.equal(g["w"], g_before)
+        assert torch.equal(avg["w"], avg_before)

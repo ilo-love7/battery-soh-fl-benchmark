@@ -76,6 +76,40 @@ def _fmt(vals: list[float]) -> str:
     return f"{mean:.5f} ± {std:.5f}"
 
 
+def _server_key(run: dict) -> tuple | None:
+    """服务端优化器配置；只有 FedAdam 有，其余策略返回 None。
+
+    返回整个四元组而不是只取 η：2026-10-24 真的发生过——η=0.01 的正式
+    实验与 η=0.01、τ=1e-5 的探针**只差 τ**，两组塌成一行后
+    ``_by_seed`` 用后一个文件静默覆盖了 seed 0（0.00101 → 0.00128），
+    配对差从 +0.00002 变成 +0.00006，而 seeds 列还写着 8。
+    一个维度没进键，表现不是「少一行」，是**某一行的数被换掉**。
+    """
+    if str(run.get("strategy", "?")) != "fedadam":
+        return None
+    return (
+        run.get("server_lr"),
+        run.get("server_beta_1"),
+        run.get("server_beta_2"),
+        run.get("server_tau"),
+    )
+
+
+def _fmt_server(server: tuple | None) -> str:
+    """配置列里的服务端超参片段。"""
+    if server is None:
+        return ""
+    eta, beta_1, beta_2, tau = server
+    parts = []
+    if eta is not None:
+        parts.append(f"η={eta:g}")
+    if tau is not None:
+        parts.append(f"τ={tau:g}")
+    if beta_1 is not None or beta_2 is not None:
+        parts.append(f"β=({beta_1:g},{beta_2:g})")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def _key(run: dict) -> tuple:
     """分组键。
 
@@ -87,6 +121,11 @@ def _key(run: dict) -> tuple:
     却是 0.0038 / 0.0038 / 0.0015 / 0.0014——差 2.7 倍。少了这一维，四档
     会塌成一行，均值描述的是任何一个都不存在的实验，而表看起来照样正常。
     同一维度还决定「每客户端拿几颗电池」，是 k 扫描要控制的混杂量本身。
+
+    **服务端配置也必须在键里**（M3 ② 的 FedAdam，2026-10-24）。η/τ 探针
+    与正式实验只差一个 τ，实测 MAE 差 0.00101 / 0.00128 / 0.00173。
+    见 :func:`_server_key` 的 docstring——那一维漏掉时被静默换掉的是
+    某一行的数，不是行数。
     """
     return (
         str(run.get("strategy", "?")),
@@ -96,17 +135,21 @@ def _key(run: dict) -> tuple:
         run.get("local_epochs") if run.get("local_epochs") is not None
         else run.get("epochs"),
         run.get("n_clients"),
+        _server_key(run),
     )
 
 
 def _label(key: tuple) -> str:
     """人读的配置名（不含编号）。"""
-    strategy, scheme, alpha, mu, _, _ = key
+    strategy, scheme, alpha, mu, _, _, server = key
     if strategy == "centralized":
         return "中心化"
     if strategy == "local":
         return "本地独立"
-    name = "FedAvg" if strategy == "fedavg" else f"FedProx (μ={mu:g})"
+    if strategy == "fedadam":
+        name = f"FedAdam{_fmt_server(server)}"
+    else:
+        name = "FedAvg" if strategy == "fedavg" else f"FedProx (μ={mu:g})"
     if scheme == "iid":
         return f"{name} / IID"
     if scheme == "dirichlet":
@@ -123,6 +166,7 @@ _BASE_CODE = {
     ("fedavg", "dirichlet"): "N1",
     ("fedavg", "sohrank"): "P1",   # P = pathological，压力测试档
     ("fedprox", "dirichlet"): "N2",
+    ("fedadam", "iid"): "A1",      # A = Adam，服务端优化器组（M3 ②）
 }
 
 
@@ -151,6 +195,7 @@ def _codes(keys: list[tuple]) -> dict[tuple, str]:
         varies_alpha = len({k[2] for k in group}) > 1
         varies_le = len({k[4] for k in group}) > 1
         varies_n = len({k[5] for k in group}) > 1
+        varies_server = len({k[6] for k in group}) > 1
         for key in group:
             parts = []
             if varies_n and key[5] is not None:
@@ -161,22 +206,33 @@ def _codes(keys: list[tuple]) -> dict[tuple, str]:
                 parts.append(f"α={key[2]:g}")
             if varies_le and key[4] is not None:
                 parts.append(f"le={key[4]}")
+            if varies_server:
+                # 组内只标真正不同的那一项：η 探针三档只差 η，τ 探针只差 τ
+                etas = {k[6][0] for k in group if k[6]}
+                taus = {k[6][3] for k in group if k[6]}
+                if len(etas) > 1:
+                    parts.append(f"η={key[6][0]:g}")
+                if len(taus) > 1:
+                    parts.append(f"τ={key[6][3]:g}")
             out[key] = f"{code}@{','.join(parts)}" if parts else code
     return out
 
 
 def _sort_key(key: tuple, code: str):
-    """组的排序键：先按基编号，再按 N、μ、α、le 数值排。
+    """组的排序键：先按基编号，再按 N、μ、α、le、服务端 η/τ 数值排。
 
     不能直接按 code 字符串排：`"I1@N=115" < "I1@N=12"`（字典序），表里
     115 会跑到 12 前面去。所以拆成 (基编号, 数值字段) 元组。
     """
+    server = key[6] or (None, None, None, None)
     return (
         code.split("@")[0],
         key[5] if key[5] is not None else 0,
         key[3],
         key[2] if key[2] is not None else -1.0,
         key[4] if key[4] is not None else -1,
+        server[0] if server[0] is not None else -1.0,
+        server[3] if server[3] is not None else -1.0,
     )
 
 
@@ -335,7 +391,7 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
         # 同 local_epochs、同 N（同 k）的 IID 组才是对照组。
         # N 也必须相同：k 扫描里「客户端更多」本身就会掉点（每客户端数据更少、
         # 梯度步更少），拿不同 N 的 IID 当分母会把 N 的效应算到偏斜头上。
-        ctrl = ("fedavg", "iid", None, 0.0, k[4], k[5])
+        ctrl = ("fedavg", "iid", None, 0.0, k[4], k[5], None)
         if ctrl not in groups:
             out.append(f"  {codes[k]}: 缺同预算（local_epochs={k[4]}、N={k[5]}）的 IID 对照组")
             continue
@@ -390,7 +446,7 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
     if not prox_keys:
         out.append("  没有 FedProx 结果")
     for k in sorted(prox_keys, key=lambda x: _sort_key(x, codes[x])):
-        avg_key = ("fedavg", k[1], k[2], 0.0, k[4], k[5])
+        avg_key = ("fedavg", k[1], k[2], 0.0, k[4], k[5], None)
         if avg_key not in groups:
             out.append(f"  {codes[k]}: 缺同划分的 FedAvg")
             continue
@@ -412,6 +468,42 @@ def judge_hypotheses(runs: list[dict], baseline_prefix: str = "c0__centralized",
             )
         out.append(f"  {codes[k]} vs 同划分 FedAvg: 改善 {improve:+.1f}%  → {verdict}")
 
+    # ---- M3 ②：服务端 Adam 能否替代客户端的训练量（对 H3 机理的追问） ----
+    # 这不是新假设，是对「每轮聚合后客户端动量归零」这条机理的直接检验：
+    # 如果动量归零是绑定约束，FedAdam 应当用更少的本地 epoch 追平 FedAvg。
+    # 对照组必须是**同 local_epochs、同 N 的 FedAvg**——换任何一个都会
+    # 把训练量的差异算到服务端优化器头上（§14 坑 15：不声明训练量的
+    # 相对差会反号）。
+    out.append("M3 ②（FedAdam vs 同预算 FedAvg：服务端动量能否替代训练量？）")
+    adam_keys = [k for k in groups if k[0] == "fedadam"]
+    if not adam_keys:
+        out.append("  没有 FedAdam 结果")
+    for k in sorted(adam_keys, key=lambda x: _sort_key(x, codes[x])):
+        ctrl = ("fedavg", k[1], None, 0.0, k[4], k[5], None)
+        if ctrl not in groups:
+            out.append(
+                f"  {codes[k]}: 缺同预算（local_epochs={k[4]}、N={k[5]}）的 FedAvg 对照组"
+            )
+            continue
+        res = _paired(groups[k], groups[ctrl])
+        if res is None:
+            out.append(f"  {codes[k]}: 共同 seed 不足 2 个")
+            continue
+        avg_mae = statistics.mean(r["final_mae"] for r in groups[ctrl])
+        improve = -(res["mean"] / avg_mae * 100)   # 正数 = FedAdam 更好
+        sig, why = is_significant(res)
+        if not sig:
+            verdict = f"未判定（{why}）"
+        elif improve >= 5:
+            verdict = f"FedAdam 更好（{improve:+.1f}%；{why}）"
+        elif improve <= -5:
+            verdict = f"FedAdam 更差（{improve:+.1f}%；{why}）"
+        else:
+            verdict = f"未判定（{improve:+.1f}% 落在 ±5% 内；{why}）"
+        out.append(
+            f"  {codes[k]} vs {codes[ctrl]} 同预算: 改善 {improve:+.1f}%  → {verdict}"
+        )
+
     return out
 
 
@@ -432,7 +524,7 @@ def build_table(runs: list[dict], baseline_prefix: str = "c0__centralized") -> l
     groups = _group(runs)
     codes = _codes(list(groups))
     for key, items in _sorted_groups(groups, codes):
-        strategy, scheme, alpha, mu, _, n_clients = key
+        strategy, scheme, alpha, mu, _, n_clients, _ = key
         maes = [r["final_mae"] for r in items]
         rmses = [r["final_rmse"] for r in items if r.get("final_rmse") is not None]
         rel = (statistics.mean(maes) - base_mae) / base_mae * 100
@@ -567,7 +659,7 @@ def main(argv: list[str] | None = None) -> int:
         for key, items in _sorted_groups(groups, codes):
             if key[0] != "fedprox":
                 continue
-            avg_key = ("fedavg", key[1], key[2], 0.0, key[4], key[5])
+            avg_key = ("fedavg", key[1], key[2], 0.0, key[4], key[5], None)
             if avg_key not in groups:
                 print(f"  {tag(key)} − FedAvg: 缺同划分的 FedAvg，跳过")
                 continue
@@ -577,6 +669,21 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             avg_mae = statistics.mean(r["final_mae"] for r in groups[avg_key])
             print(_fmt_paired(tag(key), f"{codes[avg_key]} 同划分", res, avg_mae))
+        # FedAdam 的对照也是 FedAvg，但必须是**同预算**（同 le、同 N）：
+        # 换 le 会把训练量的差异算到服务端优化器头上（§14 坑 15）。
+        for key, items in _sorted_groups(groups, codes):
+            if key[0] != "fedadam":
+                continue
+            avg_key = ("fedavg", key[1], None, 0.0, key[4], key[5], None)
+            if avg_key not in groups:
+                print(f"  {tag(key)} − FedAvg: 缺同预算的 FedAvg，跳过")
+                continue
+            res = _paired(items, groups[avg_key])
+            if res is None:
+                print(f"  {tag(key)} − FedAvg: 共同 seed 不足 2 个，跳过")
+                continue
+            avg_mae = statistics.mean(r["final_mae"] for r in groups[avg_key])
+            print(_fmt_paired(tag(key), f"{codes[avg_key]} 同预算", res, avg_mae))
 
     if args.judge:
         print("\n假设判定（plan §11.3：先配对 t 检验，不显著一律未判定；"

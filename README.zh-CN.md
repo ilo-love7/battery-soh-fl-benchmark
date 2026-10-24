@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-275%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-210%20passed-brightgreen)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -17,7 +17,10 @@
 > 差 6.4 倍——两种口径反号）、**H2 接受**（SOH 排序分片偏斜 47.1%，相对同预算 IID
 > 劣化 +24.2%，p_t=0.0013）、**H3 推翻**（μ=0.01 与 μ=0.1 都差于 μ=0，不存在可用
 > 内点）。Dirichlet α=0.5 记**未判定（处理未施加）**：它的标签偏斜 12.2% 低于 IID
-> 基线 17.3%。M3 正在扫分片粗细 k=1/2/5/10 的标签偏斜，每档配同 k 的 IID 对照。
+> 基线 17.3%。M3 已补上偏斜扫描（k=1/2/5/10，每档配同 k IID 对照）与 **FedAdam**：
+> 服务端动量补回了 `local_epochs=3` 损失的 86.1%（p_t=0.0056，8/8 同向），用三分之
+> 一的训练量达到中心化水平的 MAE；但本地 epoch 已经够用时没有额外收益。FedBN 暂缓
+> （模型刻意不含 BatchNorm，且本地没有第二个化学体系的 ΔQ(V) 特征）。
 > 表里每个数都由 CI 从 `results/*.json` 重新生成，手改不了。
 
 ---

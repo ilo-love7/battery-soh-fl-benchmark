@@ -150,3 +150,147 @@ def weighted_average(
             acc = acc + st[key].to(torch.float32) * (w / total)
         out[key] = acc
     return out
+
+
+class ServerAdam:
+    """服务端 Adam（FedAdam，Reddi et al. 2020，arXiv:2003.00295）。
+
+    ## 为什么需要它
+
+    H3 被推翻时暴露出的机理（plan.md §14 坑 2 的就地更正）：FedAvg /
+    FedProx 只聚合**参数**，不聚合优化器状态，所以客户端 Adam 的动量
+    每轮归零——100 轮就有 100 次「从零预热」。``local_epochs`` 因此
+    不是自由超参，它决定总训练量（le=10 才追平 C0，是 C0 的 3.3 倍训练量）。
+
+    FedAdam 把动量挪到服务端：服务端动量跨轮存活，客户端本地动量仍然
+    每轮重建，但「跨轮记忆」这一项不再丢。这是对该机理的**直接检验**——
+    如果动量归零是绑定约束，FedAdam 应该在更少的本地 epoch 下追平
+    FedAvg；如果不是，FedAdam 不会比 FedAvg 好。
+
+    ## 更新式
+
+    与 flwr 1.41.0 内置 ``FedAdam`` 逐字对应（读过安装版
+    ``flwr/serverapp/strategy/fedadam.py`` 与 ``fedopt.py`` 核对）：:
+
+        delta_t  = w_avg − w_global            # 伪梯度
+        m_t      = β1·m_{t−1} + (1−β1)·delta_t
+        v_t      = β2·v_{t−1} + (1−β2)·delta_t²
+        eta_norm = η·√(1−β2^t) / (1−β1^t)     # t 从 1 开始，偏置矫正
+        w_new    = w_global + eta_norm·m_t / (√v_t + τ)
+
+    等价性由 ``tests/test_app.py`` 里与 flwr 内置策略的逐轮对照钉住
+    （与 weighted_average 同样的约定：两条路径必须逐位对得上）。
+
+    ## 与 FedAvg 的关系
+
+    FedAdam 与 FedAvg 的差别**只在服务端优化器**：FedAvg 是服务端
+    η=1 的普通梯度步（``w + Δ``），FedAdam 是服务端 Adam。当伪梯度
+    大小 |Δ| 远大于 τ 时，FedAdam 每轮位移约 ``η·sign(Δ)``——步长被
+    归一化到 η，与 |Δ| 无关（恒定 Δ 时这是精确闭式解，见测试）。
+
+    这一点正是它可能补救「客户端动量归零」的原因：有效步长不再依赖
+    |Δ| 在一轮本地训练里累积多少，每轮都有约 η 的位移。
+
+    ``η=0`` 时全局参数**冻结**（``w_new = w_global``）——注意这不是
+    FedAvg，别把两者混为一谈。
+
+    ## 三个静默失败模式
+
+    1. **忘了偏置矫正**：前几轮 m、v 都偏小，更新量被系统性压低，
+       表现为「前 10 轮几乎不动」，不报错。
+    2. **delta 方向写反**（w_global − w_avg）：服务端每轮把参数推离
+       客户端训练的方向，训练照跑、曲线照出，只是整体发散或停滞。
+    3. **τ=0 且伪梯度为 0**：``0/(√0+0)`` 出 NaN，静默污染后面每一轮。
+       所以 step 末尾检查有限性，出现 NaN/Inf 直接抛错——一个 NaN 的
+       结果 JSON 比一次崩溃贵得多。
+    """
+
+    def __init__(
+        self,
+        eta: float = 1e-1,
+        beta_1: float = 0.9,
+        beta_2: float = 0.99,
+        tau: float = 1e-3,
+    ) -> None:
+        if eta < 0:
+            raise ValueError(f"服务端学习率 eta 不能为负：{eta}")
+        if not 0.0 <= beta_1 < 1.0:
+            raise ValueError(f"beta_1 必须在 [0,1)：{beta_1}")
+        if not 0.0 <= beta_2 < 1.0:
+            raise ValueError(f"beta_2 必须在 [0,1)：{beta_2}")
+        if tau < 0:
+            raise ValueError(f"tau 不能为负：{tau}")
+        self.eta = float(eta)
+        self.beta_1 = float(beta_1)
+        self.beta_2 = float(beta_2)
+        self.tau = float(tau)
+        self.m_t: dict[str, torch.Tensor] | None = None
+        self.v_t: dict[str, torch.Tensor] | None = None
+        self.t = 0
+
+    def step(
+        self,
+        global_state: dict[str, torch.Tensor],
+        averaged_state: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """按上面的更新式推进一步，返回新的全局 state_dict。
+
+        ``averaged_state`` 是客户端参数的加权平均（``weighted_average``
+        的输出）。两个 state_dict 的键与形状必须一致——不一致说明
+        客户端回了不同架构的参数，静默广播会造出张冠李戴的模型。
+        """
+        if set(global_state) != set(averaged_state):
+            raise ValueError(
+                f"全局参数与聚合结果的键不一致："
+                f"{sorted(set(global_state) ^ set(averaged_state))}"
+            )
+        for key in global_state:
+            if global_state[key].shape != averaged_state[key].shape:
+                raise ValueError(
+                    f"{key} 形状不一致：全局 {tuple(global_state[key].shape)}、"
+                    f"聚合 {tuple(averaged_state[key].shape)}"
+                )
+
+        self.t += 1
+        # 伪梯度：客户端更新方向。eta=0 时整个更新量为零，全局参数冻结。
+        delta = {
+            k: averaged_state[k].to(torch.float32) - global_state[k].to(torch.float32)
+            for k in global_state
+        }
+
+        if self.m_t is None:
+            self.m_t = {k: torch.zeros_like(v) for k, v in delta.items()}
+        if self.v_t is None:
+            self.v_t = {k: torch.zeros_like(v) for k, v in delta.items()}
+
+        self.m_t = {
+            k: self.beta_1 * m + (1.0 - self.beta_1) * delta[k]
+            for k, m in self.m_t.items()
+        }
+        self.v_t = {
+            k: self.beta_2 * v + (1.0 - self.beta_2) * delta[k] * delta[k]
+            for k, v in self.v_t.items()
+        }
+
+        # 偏置矫正（Kingma & Ba 2014 的 α_t）：前几轮 m、v 偏向 0，
+        # 不矫正会让早期更新量被系统性压低——表现是"前 10 轮不动"，
+        # 而轮数本来就是最贵的资源。
+        eta_norm = (
+            self.eta
+            * (1.0 - self.beta_2**self.t) ** 0.5
+            / (1.0 - self.beta_1**self.t)
+        )
+
+        new_state = {
+            k: global_state[k].to(torch.float32)
+            + eta_norm * self.m_t[k] / (self.v_t[k].sqrt() + self.tau)
+            for k in global_state
+        }
+        # τ=0 且伪梯度为 0 时上式是 0/0 = NaN。NaN 不会让训练崩，只会
+        # 静默污染之后每一轮，最后产出一份"能写进表里"的垃圾结果。
+        for k, v in new_state.items():
+            if not bool(torch.isfinite(v).all()):
+                raise ValueError(
+                    f"服务端更新出现 NaN/Inf（{k}）：常见原因是 tau=0 且伪梯度为 0"
+                )
+        return new_state

@@ -1,9 +1,10 @@
-# M3 备忘：标签偏斜扫到哪里掉点，以及一个天然零效应对照
+# M3 备忘：标签偏斜扫到哪里掉点，以及把动量挪到服务端
 
 **日期**：2026-10-24
 **数据**：MIT-Stanford，135 颗电池（115 训练 / 20 测试），2700 行 × 1003 列特征
 **设置**：100 轮、`local_epochs=10`、Adam 1e-3、`batch_size=64`、标签中心化到 1.0
-**规模**：sohrank k=1/2/5/10 各 8 seeds + 同 k IID 对照各 8 seeds，共 56 个 run
+**规模**：sohrank k=1/2/5/10 各 8 seeds + 同 k IID 对照各 8 seeds（56 个 run），
+FedAdam 19 个 run（8 × le=10 + 8 × le=3 + 3 个 η/τ 探针）
 
 ---
 
@@ -141,7 +142,101 @@ H2 闸门原来只 grep「缺 heterogeneity.json」。k 扫描新增四档 N 之
 
 ---
 
-## 5. 复现
+## 5. FedAdam：把动量挪到服务端（M3 ②）
+
+M3 DOD ② 原本是 FedBN 跨化学体系，被两个前置项挡住：模型**故意**不含
+BatchNorm（`model.py` 类注释写明「BN 会让 FedBN 成为必选项，MVP 先把问题
+收窄到数据异质」），而本地没有第二个化学体系的 ΔQ(V) 特征。所以改成做
+FedAdam——它没有前置阻塞，而且直接检验 M2 留下的最硬一条机理：
+
+> FedAvg/FedProx 只聚合参数、不聚合优化器状态，客户端 Adam 动量每轮归零，
+> 追平 C0 要 3.3 倍训练量（坑 12）。
+
+### 5.1 结果
+
+IID k=5（N=23）、100 轮、8 seeds，与 I1 完全同条件，只换服务端优化器：
+
+| 配置 | 本地 epoch | 总梯度步量 | 最终 MAE | CV | 相对同预算 FedAvg |
+|---|---|---|---|---|---|
+| FedAvg（I1@le=10） | 10 | 1000 | 0.00120 ± 0.00019 | 15.9% | — |
+| **FedAdam（A1@le=10）** | 10 | 1000 | 0.00123 ± 0.00051 | 41.3% | +2.0%（p_t=0.91 → 无差异） |
+| FedAvg（I1@le=3） | 3 | 300 | 0.01165 ± 0.00777 | 66.7% | — |
+| **FedAdam（A1@le=3）** | 3 | 300 | 0.00162 ± 0.00077 | 47.6% | **−86.1%**（8/8 同向，p_t=0.0056、p_sign=0.0078） |
+
+三条读数，方向一致：
+
+1. **本地训练量不够时，服务端动量能补上绝大部分**。I1 从 le=3 到 le=10
+   把 MAE 压低 8.7 倍；A1 只把 le 从 3 加到 10 几乎没有变化
+   （0.00162 → 0.00123，+32% 相对、p_t=0.24 不显著）。换句话说，
+   **服务端动量把「训练量」这个瓶颈从客户端挪走了**——这正是 H3 调查
+   定位到的机理（每轮聚合后客户端动量归零）被直接修补的证据。
+2. **但它不能全补**。A1@le=3 相对 I1@le=10 仍差 +34.5%（p_t=0.14，
+   样本量分辨不出这 30% 是真是噪）。所以「追平」未被判定，
+   「大幅缩小差距」被判定。
+3. **本地训练量已经够时，服务端动量没有额外收益**（+2.0%，
+   p_t=0.91）。这与坑 12 的结论自洽：le=10 时客户端动量归零的代价
+   已经被 10 个本地 epoch 摊薄，服务端那一步不再是瓶颈。
+
+附带一条对报告有用的：**A1@le=3 与 C0 不可区分**（+2.9%，p_t=0.88）——
+300 个总梯度步达到中心化 300 epoch 的水平，而 I1@le=10 要用 3.3 倍的
+训练量才做到 −23.5%。CV 也从 66.7% 降到 47.6%。
+
+### 5.2 η 与 τ 是量出来的，不是默认值捡的
+
+η 探针（seed 0，其余同正式条件）：
+
+| η（τ=1e-3） | 最终 MAE | 相对 FedAvg 同 seed（0.00131） |
+|---|---|---|
+| 0.1 | 0.00268 | +105% |
+| **0.01** | **0.00101** | **−23%** |
+| 0.001 | 0.00340 | +160% |
+
+τ 探针（η=0.01）：τ=1e-3 → 0.00101、τ=1e-5 → 0.00128、τ=1e-6 → 0.00173。
+
+两条读数：
+
+- **η 就是服务端每轮的步长**。闭式解：伪梯度恒定时每轮位移恰为 η
+  （偏置矫正把 β1^t、β2^t 约掉），与 |Δ| 无关。实测每轮伪梯度的
+  逐坐标 mean |Δ| ≈ 7×10⁻⁴、中位 6×10⁻⁴、max 1×10⁻²——η=0.01 落在
+  这个分布的上沿，η=0.001 落在中位以下，所以一个太快一个太慢。
+- **τ 在这里不是数值保护，是噪声地板**。稳态步长 = η/(1+τ/|Δ|)，τ=1e-3
+  与 mean |Δ| 同量级，把 |Δ|≲1e-3 的坐标阻尼掉、只放行真实位移；
+  τ 再小等于给全部 13.6 万个坐标都开归一化步长，噪声坐标一起动，
+  结果反而差（0.00173）。
+
+所以正式实验用 flwr 的默认 β1=0.9 / β2=0.99 / τ=1e-3，只把 η 定在 0.01。
+**默认值恰好匹配本数据的伪梯度尺度是巧合，不是定律**——换数据集必须
+重量 |Δ| 再定这两个数（坑 17）。
+
+### 5.3 工程改动
+
+- `flsoh/train.py::ServerAdam`：与 flwr 1.41 内置 `FedAdam` 逐字对应
+  （读过安装版 `flwr/serverapp/strategy/fedadam.py` 与 `fedopt.py` 核对），
+  末尾加有限性检查——τ=0 且伪梯度为 0 时 `0/(√0+0)` 出 NaN，而 NaN 不会
+  让训练崩，只会静默污染之后每一轮。
+- `run_federated.py`：`--strategy fedadam` + `--server-lr/--server-beta1/
+  --server-beta2/--server-tau`；η 进结果文件名与 JSON（扫 η 时两个只差
+  服务端学习率的 run 会撞名，撞名的表现是后一个静默覆盖前一个）。
+- `server_app.py`：run_config 的 `strategy="fedadam"` 走内置 `FedAdam`，
+  默认行为不变（pyproject 里没有这个键，CI 冒烟跑的仍是 FedAvg 路径）。
+- `summarize_results.py`：服务端四元组 (η, β1, β2, τ) 整体进分组键
+  （第七维），`A1` 编号，judge 增加 M3 ② 段（对照必须是同 le、同 N 的
+  FedAvg）。
+- 测试：`tests/test_train.py::TestServerAdam`（13 条，含闭式解与动量跨轮
+  累积）、`tests/test_app.py::TestFedAdamEquivalence`（与 flwr 逐轮相等 +
+  负面对照）、`tests/test_summarize.py::TestServerLrGrouping` /
+  `TestFedAdamVerdict`（10 条）。
+
+**一个当场被抓到的 bug，值得单独说**：分组键第一版只放了 `server_lr`。
+跑完探针后重新汇总，A1@le=10 对 I1@le=10 的配对差是 +0.00006；而我拿
+JSON 手算是 +0.00002。差额来自 τ=1e-5 的探针 run 与正式 run **只差 τ**，
+两组塌成一行后 `_by_seed` 用后一个文件静默覆盖了 seed 0（0.00101 →
+0.00128），而 seeds 列还写着 8。**漏一个维度的表现不是「少一行」，
+是某一行的数被换掉**——比少一行更难发现，因为行数、seeds 列、均值
+全都看着正常。修法是把服务端四元组整体放进键，并补了
+`test_tau_probe_does_not_merge_with_formal_runs` 钉住。
+
+## 6. 复现
 
 ```bash
 PY=/d/项目/venvs/flsoh-py312/Scripts/python.exe
@@ -189,3 +284,42 @@ $PY scripts/make_figure2.py
 
 k=5 那一档的 sohrank run 复用 M2 的 `fedavg__sohrank__seed*`（同一份
 `partition-mvp-k5-sohrank.json`），IID 对照复用 M2 的 `fedavg__iid__seed*`。
+
+### 6.1 FedAdam（M3 ②）
+
+```bash
+PY=/d/项目/venvs/flsoh-py312/Scripts/python.exe
+F=data/mit-stanford/features.parquet
+
+# η / τ 探针（seed 0；正式实验只保留 η=0.01、τ=1e-3）
+for eta in 0.1 0.01 0.001; do
+  $PY scripts/run_federated.py --config configs/mvp.toml --features $F \
+      --partition-json results/partition-mvp-k5-iid.json \
+      --strategy fedadam --server-lr $eta --seed 0 \
+      --tag "fedadam__iid__eta${eta}__seed0"
+done
+for tau in 0.00001 0.000001; do
+  $PY scripts/run_federated.py --config configs/mvp.toml --features $F \
+      --partition-json results/partition-mvp-k5-iid.json \
+      --strategy fedadam --server-lr 0.01 --server-tau $tau --seed 0 \
+      --tag "fedadam__iid__eta0.01__tau${tau}__seed0"
+done
+
+# 正式实验：8 seeds × (le=10 同预算对照 / le=3 训练量追问)
+for s in 0 1 2 3 4 5 6 7; do
+  $PY scripts/run_federated.py --config configs/mvp.toml --features $F \
+      --partition-json results/partition-mvp-k5-iid.json \
+      --strategy fedadam --server-lr 0.01 --seed $s \
+      --tag "fedadam__iid__eta0.01__seed${s}"
+done
+for s in 0 1 2 3 4 5 6 7; do
+  $PY scripts/run_federated.py --config configs/mvp.toml --features $F \
+      --partition-json results/partition-mvp-k5-iid.json \
+      --strategy fedadam --server-lr 0.01 --local-epochs 3 --seed $s \
+      --tag "fedadam__iid__eta0.01__le3__seed${s}"
+done
+```
+
+每轮伪梯度的逐坐标量级（用来定 η 与 τ，不是用来汇报的）：拿 FedAvg 的
+循环跑 5 轮，每轮算 `weighted_average − global` 的 |Δ| 分布。实测
+mean ≈ 7×10⁻⁴、中位 ≈ 6×10⁻⁴、max ≈ 1×10⁻²。

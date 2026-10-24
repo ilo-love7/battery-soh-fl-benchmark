@@ -2,8 +2,11 @@
 
 三件事：
 
-1. **按 `proximal_mu` 选策略**。mu=0 走 `FedAvg`，mu>0 走 `FedProx`。
-   这不是偷懒——MVP 的 N2 配置就是同一个 App 换一个参数（plan.md §9.4）。
+1. **按 run_config 选策略**。默认 ``proximal_mu>0`` 走 ``FedProx``、
+   否则 ``FedAvg``；显式 ``strategy="fedadam"`` 走服务端 Adam
+   （``server-lr`` / ``server-beta-1`` / ``server-beta-2`` / ``server-tau``
+   可配）。这不是偷懒——MVP 的 N2 配置就是同一个 App 换一个参数
+   （plan.md §9.4）。
 2. **全局测试集独立于所有客户端**（plan.md §6.2 规则 2）。`evaluate_fn`
    用的测试电池必须与 `_PARTITION` 里任何客户端的电池都不相交，
    启动时断言一次。
@@ -18,7 +21,7 @@ import os
 import torch
 from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord
 from flwr.serverapp import Grid, ServerApp
-from flwr.serverapp.strategy import FedAvg, FedProx
+from flwr.serverapp.strategy import FedAdam, FedAvg, FedProx
 from torch.utils.data import DataLoader
 
 from flsoh.app.runconfig import app_run_config
@@ -170,7 +173,28 @@ def main(grid: Grid, context: Context) -> None:
     if _INPUT_DIM is None:
         raise RuntimeError("server_app 未 configure()：input_dim 缺失")
 
-    strategy = FedProx(proximal_mu=mu) if mu > 0 else FedAvg()
+    # 策略选择与 scripts/run_federated.py 的白名单一致。三条路径共享
+    # flsoh/train.py 的训练实现，服务端这一侧则靠 tests/test_app.py 里
+    # 「本地 ServerAdam 与 flwr 内置 FedAdam 逐轮相等」那条测试钉住——
+    # 少了它，两条路径的 FedAdam 漂移时两边都不会报错。
+    #
+    # 默认（没有 strategy 键）保持历史行为：μ>0 走 FedProx，否则 FedAvg。
+    # pyproject 里没有 strategy 键，所以 CI 冒烟跑的仍是 FedAvg 路径。
+    strategy_name = str(rc.get("strategy", "")).lower()
+    if strategy_name == "fedadam":
+        strategy = FedAdam(
+            eta=float(rc.get("server-lr", 1e-1)),
+            eta_l=lr,
+            beta_1=float(rc.get("server-beta-1", 0.9)),
+            beta_2=float(rc.get("server-beta-2", 0.99)),
+            tau=float(rc.get("server-tau", 1e-3)),
+        )
+    elif strategy_name:
+        raise ValueError(
+            f"未知 strategy={strategy_name!r}（fedavg/fedprox/fedadam）"
+        )
+    else:
+        strategy = FedProx(proximal_mu=mu) if mu > 0 else FedAvg()
 
     strategy.start(
         grid=grid,

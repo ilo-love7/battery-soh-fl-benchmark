@@ -17,7 +17,9 @@ import summarize_results as sr
 
 
 def _run(strategy, seed, mae, *, scheme=None, alpha=None, mu=None,
-         n_clients=23, rmse=None, le=None, epochs=None, run_id=None):
+         n_clients=23, rmse=None, le=None, epochs=None, run_id=None,
+         server_lr=None, server_tau=None, server_beta_1=None,
+         server_beta_2=None):
     d = {
         "strategy": strategy,
         "scheme": scheme,
@@ -33,6 +35,13 @@ def _run(strategy, seed, mae, *, scheme=None, alpha=None, mu=None,
         d["local_epochs"] = le
     if epochs is not None:
         d["epochs"] = epochs
+    if server_lr is not None:
+        # 与 scripts/run_federated.py 写盘的字段一致：四个一起写，
+        # 否则「只差 τ」的两个 run 在测试里也塌成一组。
+        d["server_lr"] = server_lr
+        d["server_beta_1"] = 0.9 if server_beta_1 is None else server_beta_1
+        d["server_beta_2"] = 0.99 if server_beta_2 is None else server_beta_2
+        d["server_tau"] = 1e-3 if server_tau is None else server_tau
     return d
 
 
@@ -597,3 +606,132 @@ class TestKSweepGrouping:
         assert "57.2%" in h2 and "32.5%" in h2
         # 只有一组 sohrank、一组 IID，编号不带 N 后缀（后缀只在碰撞时出现）
         assert "P1: 偏斜 57.2%" in h2
+
+
+class TestServerLrGrouping:
+    """M3 ② 的 FedAdam：η 是主超参，必须进分组键。
+
+    不放进键里的后果与 N 当年一样：η 探针的三档（实测 seed 0 上
+    0.00268 / 0.00101 / 0.00340，差 3.4 倍）会被平均成一组，那张表的
+    「A1」行描述的是任何一个都没跑过的配置。
+    """
+
+    @staticmethod
+    def _eta_sweep_runs():
+        runs = []
+        for s, mae in enumerate([0.0022, 0.0024, 0.0020]):
+            runs.append(_run("centralized", s, mae, n_clients=None,
+                             epochs=300, run_id=f"c0__centralized__seed{s}"))
+        for eta, maes in ((0.1, [0.0027, 0.0029, 0.0025]),
+                          (0.01, [0.0010, 0.0012, 0.0009]),
+                          (0.001, [0.0034, 0.0036, 0.0032])):
+            for s, mae in enumerate(maes):
+                runs.append(_run("fedadam", s, mae, scheme="iid", le=10,
+                                 server_lr=eta,
+                                 run_id=f"fedadam__iid__eta{eta}__seed{s}"))
+        return runs
+
+    def test_server_lr_splits_groups(self):
+        groups = sr._group(self._eta_sweep_runs())
+        adam = [k for k in groups if k[0] == "fedadam"]
+        assert len(adam) == 3
+        assert {k[6][0] for k in adam} == {0.1, 0.01, 0.001}
+
+    def test_codes_get_eta_suffix(self):
+        codes = sr._codes(list(sr._group(self._eta_sweep_runs())))
+        adam = {c for k, c in codes.items() if k[0] == "fedadam"}
+        assert adam == {"A1@η=0.1", "A1@η=0.01", "A1@η=0.001"}
+
+    def test_each_row_keeps_its_own_mean(self):
+        """塌成一组会把三档平均成一个数；分开后每行是自己的均值。"""
+        rows = sr.build_table(self._eta_sweep_runs())
+        assert len([r for r in rows if r.startswith("| A1")]) == 3
+        for r in rows:
+            if r.startswith("| A1"):
+                assert "±" in r, "三 seeds 的行必须带标准差"
+
+    def test_label_carries_eta(self):
+        """编号只标 le 时配置列要能自解释，否则读者分不清哪行是哪个 η。"""
+        key = sr._key(_run("fedadam", 0, 0.001, scheme="iid", le=10,
+                           server_lr=0.01))
+        assert sr._label(key) == "FedAdam (η=0.01, τ=0.001, β=(0.9,0.99)) / IID"
+
+    def test_base_code_is_a1(self):
+        assert sr._BASE_CODE[("fedadam", "iid")] == "A1"
+
+    def test_missing_server_lr_does_not_split_fedavg(self):
+        """FedAvg 没有 server_lr，键的第七维全是 None，不许把基线拆开。"""
+        runs = [_run("fedavg", s, mae, scheme="iid", le=10) for s, mae in
+                enumerate([0.0012, 0.0013, 0.0011])]
+        groups = sr._group(runs)
+        assert len(groups) == 1
+
+    def test_tau_probe_does_not_merge_with_formal_runs(self):
+        """只差 τ 的两个 run 不许塌成一组（2026-10-24 真实发生过）。
+
+        η=0.01 的正式实验与 η=0.01、τ=1e-5 的探针只差 τ。τ 不在键里时
+        两组合并，``_by_seed`` 用后一个文件静默覆盖 seed 0，配对差从
+        +0.00002 变成 +0.00006——而 seeds 列还写着 8。这一条钉住
+        「换掉的是数，不是行数」那种失败。
+        """
+        runs = [_run("centralized", s, 0.0020, n_clients=None, epochs=300,
+                     run_id=f"c0__centralized__seed{s}") for s in range(3)]
+        runs += [_run("fedavg", s, m, scheme="iid", le=10)
+                 for s, m in enumerate([0.0013, 0.0015, 0.0011])]
+        # 正式：η=0.01、τ=1e-3；探针：η=0.01、τ=1e-5（只差 τ）
+        runs += [_run("fedadam", s, m, scheme="iid", le=10, server_lr=0.01)
+                 for s, m in enumerate([0.0010, 0.0010, 0.0010])]
+        runs += [_run("fedadam", 0, 0.0013, scheme="iid", le=10,
+                      server_lr=0.01, server_tau=1e-5)]
+        groups = sr._group(runs)
+        adam = [k for k in groups if k[0] == "fedadam"]
+        assert len(adam) == 2, "只差 τ 的两组被合并了"
+        assert {k[6][3] for k in adam} == {1e-3, 1e-5}
+        # 合并的另一种表现：seeds 列写成 4 而实际只有 3 个 seed
+        rows = sr.build_table(runs)
+        a1 = [r for r in rows if r.startswith("| A1")]
+        assert len(a1) == 2
+        seeds_col = {r.split("|")[6].strip() for r in a1}
+        assert seeds_col == {"3", "1"}, seeds_col
+
+
+class TestFedAdamVerdict:
+    """judge 的 M3 ② 段：对照必须是同预算 FedAvg，不能是 C0 或别的 le。"""
+
+    @staticmethod
+    def _runs(adam_maes, avg_maes, *, adam_le=10, avg_le=10):
+        runs = [_run("centralized", s, 0.0020, n_clients=None, epochs=300,
+                     run_id=f"c0__centralized__seed{s}") for s in range(3)]
+        runs += [_run("fedadam", s, m, scheme="iid", le=adam_le,
+                      server_lr=0.01, run_id=f"fedadam__iid__seed{s}")
+                 for s, m in enumerate(adam_maes)]
+        runs += [_run("fedavg", s, m, scheme="iid", le=avg_le,
+                      run_id=f"fedavg__iid__seed{s}")
+                 for s, m in enumerate(avg_maes)]
+        return runs
+
+    def test_same_budget_control_gets_a_verdict(self):
+        out = "\n".join(sr.judge_hypotheses(
+            self._runs([0.0010, 0.0011, 0.0009], [0.0012, 0.0013, 0.0011])))
+        assert "M3 ②" in out
+        assert "vs I1 同预算" in out
+        assert "改善" in out
+
+    def test_different_le_is_not_a_control(self):
+        """拿 le=3 的 FedAvg 当分母，会把训练量差异算到服务端优化器头上。"""
+        out = "\n".join(sr.judge_hypotheses(
+            self._runs([0.0010, 0.0011, 0.0009], [0.0120, 0.0130, 0.0110],
+                       avg_le=3)))
+        assert "缺同预算（local_epochs=10、N=23）的 FedAvg 对照组" in out
+
+    def test_no_control_no_verdict(self):
+        """没有 FedAvg 对照时必须明说，不许默默拿 C0 当分母。"""
+        runs = [_run("centralized", s, 0.0020, n_clients=None, epochs=300,
+                     run_id=f"c0__centralized__seed{s}") for s in range(3)]
+        runs += [_run("fedadam", s, m, scheme="iid", le=10, server_lr=0.01)
+                 for s, m in enumerate([0.0010, 0.0011, 0.0009])]
+        out = "\n".join(sr.judge_hypotheses(runs))
+        assert "缺同预算（local_epochs=10、N=23）的 FedAvg 对照组" in out
+        assert "改善" not in out
+
+
