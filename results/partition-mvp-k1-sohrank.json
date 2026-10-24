@@ -1,0 +1,376 @@
+{
+  "config": "configs/mvp.toml",
+  "k": 1,
+  "scheme": "sohrank",
+  "alpha": null,
+  "split_seed": 0,
+  "test_cells": [
+    "b1c44",
+    "b3c37",
+    "b3c24",
+    "b3c30",
+    "b3c31",
+    "b1c29",
+    "b1c3",
+    "b3c23",
+    "b2c3",
+    "b2c11",
+    "b3c22",
+    "b1c25",
+    "b3c12",
+    "b1c14",
+    "b2c24",
+    "b1c43",
+    "b2c10",
+    "b1c6",
+    "b2c17",
+    "b1c23"
+  ],
+  "partition": {
+    "client-0": [
+      "b2c1"
+    ],
+    "client-1": [
+      "b2c0"
+    ],
+    "client-2": [
+      "b3c6"
+    ],
+    "client-3": [
+      "b3c28"
+    ],
+    "client-4": [
+      "b2c19"
+    ],
+    "client-5": [
+      "b3c21"
+    ],
+    "client-6": [
+      "b2c6"
+    ],
+    "client-7": [
+      "b1c20"
+    ],
+    "client-8": [
+      "b2c12"
+    ],
+    "client-9": [
+      "b2c13"
+    ],
+    "client-10": [
+      "b2c4"
+    ],
+    "client-11": [
+      "b1c21"
+    ],
+    "client-12": [
+      "b2c18"
+    ],
+    "client-13": [
+      "b3c17"
+    ],
+    "client-14": [
+      "b3c19"
+    ],
+    "client-15": [
+      "b3c18"
+    ],
+    "client-16": [
+      "b2c23"
+    ],
+    "client-17": [
+      "b3c35"
+    ],
+    "client-18": [
+      "b3c2"
+    ],
+    "client-19": [
+      "b3c34"
+    ],
+    "client-20": [
+      "b3c5"
+    ],
+    "client-21": [
+      "b3c11"
+    ],
+    "client-22": [
+      "b3c32"
+    ],
+    "client-23": [
+      "b3c3"
+    ],
+    "client-24": [
+      "b3c36"
+    ],
+    "client-25": [
+      "b1c18"
+    ],
+    "client-26": [
+      "b3c38"
+    ],
+    "client-27": [
+      "b3c33"
+    ],
+    "client-28": [
+      "b3c45"
+    ],
+    "client-29": [
+      "b3c4"
+    ],
+    "client-30": [
+      "b3c15"
+    ],
+    "client-31": [
+      "b1c31"
+    ],
+    "client-32": [
+      "b3c20"
+    ],
+    "client-33": [
+      "b3c16"
+    ],
+    "client-34": [
+      "b3c42"
+    ],
+    "client-35": [
+      "b3c1"
+    ],
+    "client-36": [
+      "b3c7"
+    ],
+    "client-37": [
+      "b3c10"
+    ],
+    "client-38": [
+      "b3c43"
+    ],
+    "client-39": [
+      "b1c32"
+    ],
+    "client-40": [
+      "b1c38"
+    ],
+    "client-41": [
+      "b1c26"
+    ],
+    "client-42": [
+      "b1c30"
+    ],
+    "client-43": [
+      "b1c28"
+    ],
+    "client-44": [
+      "b3c0"
+    ],
+    "client-45": [
+      "b1c33"
+    ],
+    "client-46": [
+      "b2c21"
+    ],
+    "client-47": [
+      "b1c27"
+    ],
+    "client-48": [
+      "b3c26"
+    ],
+    "client-49": [
+      "b1c7"
+    ],
+    "client-50": [
+      "b1c37"
+    ],
+    "client-51": [
+      "b1c45"
+    ],
+    "client-52": [
+      "b3c13"
+    ],
+    "client-53": [
+      "b1c19"
+    ],
+    "client-54": [
+      "b2c25"
+    ],
+    "client-55": [
+      "b3c39"
+    ],
+    "client-56": [
+      "b3c8"
+    ],
+    "client-57": [
+      "b3c27"
+    ],
+    "client-58": [
+      "b1c36"
+    ],
+    "client-59": [
+      "b3c9"
+    ],
+    "client-60": [
+      "b1c34"
+    ],
+    "client-61": [
+      "b1c24"
+    ],
+    "client-62": [
+      "b1c40"
+    ],
+    "client-63": [
+      "b3c44"
+    ],
+    "client-64": [
+      "b1c22"
+    ],
+    "client-65": [
+      "b3c40"
+    ],
+    "client-66": [
+      "b3c25"
+    ],
+    "client-67": [
+      "b1c35"
+    ],
+    "client-68": [
+      "b1c39"
+    ],
+    "client-69": [
+      "b1c41"
+    ],
+    "client-70": [
+      "b2c26"
+    ],
+    "client-71": [
+      "b3c41"
+    ],
+    "client-72": [
+      "b2c5"
+    ],
+    "client-73": [
+      "b2c14"
+    ],
+    "client-74": [
+      "b1c42"
+    ],
+    "client-75": [
+      "b2c45"
+    ],
+    "client-76": [
+      "b3c29"
+    ],
+    "client-77": [
+      "b1c5"
+    ],
+    "client-78": [
+      "b3c14"
+    ],
+    "client-79": [
+      "b2c22"
+    ],
+    "client-80": [
+      "b1c13"
+    ],
+    "client-81": [
+      "b2c40"
+    ],
+    "client-82": [
+      "b1c4"
+    ],
+    "client-83": [
+      "b2c2"
+    ],
+    "client-84": [
+      "b1c12"
+    ],
+    "client-85": [
+      "b2c35"
+    ],
+    "client-86": [
+      "b1c9"
+    ],
+    "client-87": [
+      "b1c8"
+    ],
+    "client-88": [
+      "b2c20"
+    ],
+    "client-89": [
+      "b2c27"
+    ],
+    "client-90": [
+      "b2c30"
+    ],
+    "client-91": [
+      "b1c17"
+    ],
+    "client-92": [
+      "b2c38"
+    ],
+    "client-93": [
+      "b2c42"
+    ],
+    "client-94": [
+      "b2c28"
+    ],
+    "client-95": [
+      "b1c16"
+    ],
+    "client-96": [
+      "b1c2"
+    ],
+    "client-97": [
+      "b1c0"
+    ],
+    "client-98": [
+      "b2c36"
+    ],
+    "client-99": [
+      "b2c44"
+    ],
+    "client-100": [
+      "b2c33"
+    ],
+    "client-101": [
+      "b2c32"
+    ],
+    "client-102": [
+      "b2c29"
+    ],
+    "client-103": [
+      "b1c1"
+    ],
+    "client-104": [
+      "b2c37"
+    ],
+    "client-105": [
+      "b2c31"
+    ],
+    "client-106": [
+      "b2c43"
+    ],
+    "client-107": [
+      "b2c34"
+    ],
+    "client-108": [
+      "b1c10"
+    ],
+    "client-109": [
+      "b1c11"
+    ],
+    "client-110": [
+      "b2c46"
+    ],
+    "client-111": [
+      "b2c41"
+    ],
+    "client-112": [
+      "b1c15"
+    ],
+    "client-113": [
+      "b2c47"
+    ],
+    "client-114": [
+      "b2c39"
+    ]
+  }
+}
