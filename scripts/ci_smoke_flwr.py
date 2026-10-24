@@ -32,13 +32,14 @@ from flsoh.partition import partition_iid, split_test_cells  # noqa: E402
 
 ROUNDS = 2
 N_CLIENTS = 4
+INPUT_DIM = 16
 
 
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="flsoh-smoke-"))
 
     table = synthetic_feature_table(
-        n_cells=20, cycles_per_cell=10, input_dim=16, seed=0
+        n_cells=20, cycles_per_cell=10, input_dim=INPUT_DIM, seed=0
     )
     feat_path = tmp / "features.parquet"
     table.frame.to_parquet(feat_path, index=False)
@@ -76,27 +77,35 @@ def main() -> int:
     print(f"合成数据：{len(table.cells)} 颗电池 / {len(table.frame)} 行")
     print(f"划分：{len(partition)} 个客户端，测试电池 {len(test_cells)} 颗")
 
-    # run_simulation 从 app 目录的 pyproject.toml 读 run_config，没有参数能覆盖
-    # num-server-rounds。冒烟不该跑 100 轮，所以临时改成 ROUNDS，跑完在 finally
-    # 里改回——绝不留一个"配置说 100 轮、实际跑 2 轮"的状态。
-    pyproject = ROOT / "pyproject.toml"
-    original = pyproject.read_text(encoding="utf-8")
-    patched = original.replace(
-        "num-server-rounds = 100", f"num-server-rounds = {ROUNDS}"
+    # `run_simulation` 的签名里没有 run_config（1.41.0 实测），`flwr run` 才
+    # 会从 pyproject 填。所以走 `FLSOH_RUN_CONFIG` 覆盖文件（见
+    # flsoh/app/runconfig.py）——**不去改 pyproject**：测试不该改写被追踪的
+    # 文件，一旦 finally 没执行，仓库里就留下一个假配置（这件事真发生过）。
+    #
+    # input-dim 必须跟着合成数据走：真实特征表是 1000 维，合成的是 16 维。
+    override = tmp / "smoke-runconfig.toml"
+    override.write_text(
+        "\n".join(
+            [
+                f"num-server-rounds = {ROUNDS}",
+                "local-epochs = 2",
+                f"input-dim = {INPUT_DIM}",
+                'optimizer = "adam"',
+                "learning-rate = 0.001",
+                "proximal-mu = 0.0",
+                "batch-size = 8",
+                "seed = 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
     )
-    if patched == original:
-        print("FAIL 没找到 num-server-rounds = 100，配置格式变了？")
-        return 2
+    os.environ["FLSOH_RUN_CONFIG"] = str(override)
 
     print(f"启动 ray 仿真，{ROUNDS} 轮", flush=True)
-    pyproject.write_text(patched, encoding="utf-8")
-    try:
-        run_simulation(
-            server_app, client_app, num_supernodes=len(partition), backend_name="ray"
-        )
-    finally:
-        pyproject.write_text(original, encoding="utf-8")
-        print("pyproject.toml 已恢复")
+    run_simulation(
+        server_app, client_app, num_supernodes=len(partition), backend_name="ray"
+    )
 
     print("SMOKE OK：flwr 仿真运行时跑通")
     return 0

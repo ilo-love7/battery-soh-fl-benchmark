@@ -21,6 +21,7 @@ from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import FedAvg, FedProx
 from torch.utils.data import DataLoader
 
+from flsoh.app.runconfig import app_run_config
 from flsoh.data import FeatureTable, label_offset, make_global_test_loader
 from flsoh.model import MLP, build_model
 
@@ -162,9 +163,10 @@ def main(grid: Grid, context: Context) -> None:
     if _TABLE is None:
         raise RuntimeError("server_app 未 configure()")
 
-    num_rounds = int(context.run_config["num-server-rounds"])
-    lr = float(context.run_config["learning-rate"])
-    mu = float(context.run_config.get("proximal-mu", 0.0))
+    rc = app_run_config(context)
+    num_rounds = int(rc["num-server-rounds"])
+    lr = float(rc["learning-rate"])
+    mu = float(rc.get("proximal-mu", 0.0))
     if _INPUT_DIM is None:
         raise RuntimeError("server_app 未 configure()：input_dim 缺失")
 
@@ -173,7 +175,7 @@ def main(grid: Grid, context: Context) -> None:
     strategy.start(
         grid=grid,
         initial_arrays=ArrayRecord.from_torch_state_dict(
-            build_model(_INPUT_DIM, seed=int(context.run_config.get("seed", 0))).state_dict()
+            build_model(_INPUT_DIM, seed=int(rc.get("seed", 0))).state_dict()
         ),
         train_config=ConfigRecord({"lr": lr}),
         num_rounds=num_rounds,

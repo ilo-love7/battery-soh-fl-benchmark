@@ -297,15 +297,11 @@ jobs:
       - name: flwr 官方仿真冒烟（M1 DOD ①）
         run: python scripts/ci_smoke_flwr.py
 
-      # 冒烟脚本为了不跑 100 轮，会临时把 pyproject 的 num-server-rounds
-      # 改成 2，跑完在 finally 里改回。进程被 SIGKILL 时 finally 不执行，
-      # 仓库就会留一个「配置说 2 轮」的假状态（这件事真发生过：pyproject
-      # 曾停在 2 轮 × 2 ep，而 configs/mvp.toml 是 100 轮 × 10 ep）。
-      # 所以跑完必须证明它被改回来了。
-      - name: pyproject 必须已恢复（否则下一次提交会带上错的轮数）
+      # 冒烟用 FLSOH_RUN_CONFIG 覆盖文件传超参，不碰 pyproject。
+      # 这一步是兜底：万一以后有人又改成「临时改配置再改回来」，这里会红。
+      - name: 冒烟不许留下被改写的仓库状态
         run: |
-          if ! git diff --exit-code -- pyproject.toml; then
-            echo "::error::ci_smoke_flwr.py 没有恢复 pyproject.toml，轮数/epoch 已被改写"
+          if ! git diff --exit-code; then
+            echo "::error::冒烟跑完后工作区有改动，测试不该改写被追踪的文件"
             exit 1
           fi
-          python scripts/check_protocol.py --config configs/mvp.toml

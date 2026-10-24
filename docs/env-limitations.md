@@ -142,3 +142,48 @@ M1 的完成定义①是「`flwr run` 跑通官方 MNIST」。本机做不到，
 `flwr.simulation.run_simulation(...)` 走 Python API，不经过 fab 校验，
 所以不受这两条限制（它仍需要 ray，所以在 CI 跑）。
 
+
+### 第三个坑：`run_simulation` 根本拿不到 run_config（2026-10-24 实测）
+
+这条与 ray 无关，是 flwr 1.41.0 的 API 事实：
+
+```python
+inspect.signature(flwr.simulation.run_simulation)
+# (server_app, client_app, num_supernodes, backend_name='ray',
+#  backend_config=None, enable_tf_gpu_growth=False, verbose_logging=False)
+```
+
+**没有 `run_config` 参数。** `context.run_config` 只在 `flwr run`（fab）路径下
+由 `pyproject.toml` 的 `[tool.flwr.app.config]` 填充；直接调 `run_simulation`
+时它是空的，于是 `context.run_config["num-server-rounds"]` 直接 KeyError。
+
+第一次真跑 CI 就是这么红的：
+
+```
+File "src/flsoh/app/server_app.py", line 165, in main
+    num_rounds = int(context.run_config["num-server-rounds"])
+KeyError: 'num-server-rounds'
+```
+
+**修法**：`flsoh/app/runconfig.py` 的 `app_run_config(context)`，优先级
+`context.run_config` → `FLSOH_RUN_CONFIG` 指向的 TOML → `pyproject.toml`。
+第 1 与第 3 读的是同一张表，所以不会出现「官方跑 100 轮、本地跑 2 轮」。
+
+**为什么环境变量排第二而不是第一**：`flwr run` 传进来的是显式、与本次运行
+绑定的值；环境变量会留在 shell 里跨命令生效，一个忘了清掉的
+`FLSOH_RUN_CONFIG` 能悄悄改掉一次正式实验的轮数，而日志里看不出来。
+
+**冒烟脚本因此不再改 `pyproject.toml`。** 之前的做法是「临时把
+`num-server-rounds = 100` 改成 2、`finally` 里改回」，但：
+
+- `finally` 不覆盖 SIGKILL，进程被杀就留下假配置——**这件事真的发生过**：
+  `pyproject.toml` 停在 `num-server-rounds = 2 / local-epochs = 2`，而
+  `configs/mvp.toml` 已经是 100 / 10。官方运行时读前者、本地循环读后者，
+  两边都不报错，只是跑的不是同一个实验。
+- 冒烟用 16 维合成数据，`input-dim` 也必须跟着改（真实表是 1000 维），
+  要改的键不止一个。
+
+现在冒烟写一个临时 TOML 并通过 `FLSOH_RUN_CONFIG` 传进去，**被追踪的文件
+一个字节都不动**。CI 里还加了一步 `git diff --exit-code` 兜底，万一以后有人
+改回去会红。`pyproject.toml` 与 `configs/mvp.toml` 的漂移则由
+`check_protocol.py` 的 `C-APP` 在每次 push 上检查。

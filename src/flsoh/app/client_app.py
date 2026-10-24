@@ -21,6 +21,7 @@ from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
 from torch.utils.data import DataLoader
 
+from flsoh.app.runconfig import app_run_config
 from flsoh.data import (
     ClientData,
     FeatureTable,
@@ -131,16 +132,17 @@ def _client_data(cid: str, run_config: dict, node_config: dict) -> ClientData:
 @app.train()
 def train(msg: Message, context: Context) -> Message:
     _ensure_loaded()
-    model = MLP(int(context.run_config["input-dim"]))
+    rc = app_run_config(context)
+    model = MLP(int(rc["input-dim"]))
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
 
     cid = _resolve_client(context.node_config["partition-id"])
-    data = _client_data(cid, context.run_config, context.node_config)
+    data = _client_data(cid, rc, context.node_config)
 
-    local_epochs = int(context.run_config.get("local-epochs", 1))
+    local_epochs = int(rc.get("local-epochs", 1))
     lr = float(msg.content["config"]["lr"])
-    optimizer = str(context.run_config.get("optimizer", "adam"))
-    mu = float(context.run_config.get("proximal-mu", 0.0))
+    optimizer = str(rc.get("optimizer", "adam"))
+    mu = float(rc.get("proximal-mu", 0.0))
 
     # FedProx 的近端项需要"本轮开始时的全局参数"。它就是 msg 里带过来的那份，
     # 所以在训练前先克隆下来——训练开始后 model 会被就地更新，再取就晚了。
@@ -172,11 +174,12 @@ def train(msg: Message, context: Context) -> Message:
 @app.evaluate()
 def evaluate(msg: Message, context: Context) -> Message:
     _ensure_loaded()
-    model = MLP(int(context.run_config["input-dim"]))
+    rc = app_run_config(context)
+    model = MLP(int(rc["input-dim"]))
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
 
     cid = _resolve_client(context.node_config["partition-id"])
-    data = _client_data(cid, context.run_config, context.node_config)
+    data = _client_data(cid, rc, context.node_config)
 
     if data.val_loader is None:
         # 没有本地验证集就返回空指标，而不是编一个 0
