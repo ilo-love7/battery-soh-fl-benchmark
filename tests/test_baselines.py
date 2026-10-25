@@ -382,6 +382,32 @@ class TestLabelSpread:
         with pytest.raises(ValueError, match="groups"):
             label_spread(np.array([1.0, 2.0]), np.array(["a"]))
 
+    def test_within_std_pooled_differs_from_median(self):
+        """两个组内 std 口径**不等**，且差得很大。
+
+        真实 MATR 表上池化 0.00316 / 中位 0.00066（4.8 倍），形态就是这里：
+        一个离散度大的分组把池化值拉高，而它在「中位」里只占一票。
+        这就是为什么 ``error_decomposition`` 的组内 RMSE（池化）**不能**拿
+        ``within_std_median`` 当分母——2026-10-25 正是这么误判过一次。
+        """
+        # a: [0, 0.002]（std 0.001），b: [0, 10]（std 5）
+        y = np.array([0.0, 0.002, 0.0, 10.0])
+        g = np.array(["a", "a", "b", "b"])
+        got = label_spread(y, g)
+        assert got["within_std_median"] == pytest.approx((0.001 + 5.0) / 2)
+        # 池化 = sqrt((2·0.001² + 2·5²) / 4)
+        assert got["within_std_pooled"] == pytest.approx(np.sqrt(50.000002 / 4))
+        assert got["within_std_pooled"] > got["within_std_median"]
+
+    def test_within_std_pooled_is_rms_of_residuals(self):
+        """池化口径 = 所有行去组均值后的 RMS，不是「每颗 std 的平均」。"""
+        y = np.array([0.0, 2.0, 10.0, 12.0])
+        g = np.array(["a", "a", "b", "b"])
+        got = label_spread(y, g)
+        # 每组残差都是 [−1, 1] → 平方和 4，除以 4 行
+        assert got["within_std_pooled"] == pytest.approx(1.0)
+        assert got["within_std_median"] == pytest.approx(1.0)
+
 
 class TestErrorDecomposition:
     """误差的组间/组内拆分。
@@ -433,6 +459,44 @@ class TestErrorDecomposition:
         assert got["between_rmse"] == pytest.approx(4.5)
         # 组内：残差 = y − 组均值，两组都是 [−1,0,1] → 平方和 2+2，除以 6 行
         assert got["within_rmse"] == pytest.approx(np.sqrt(4.0 / 6.0))
+
+    def test_per_group_mean_prediction_has_ratio_exactly_one(self):
+        """负控：每颗各猜自己的均值 → 组内 RMSE 恰好等于池化组内 std，比值 1。
+
+        这一条把「比常数好」与「跟住变化」的边界钉死：比值 1 就是「一点没跟住」，
+        不是「跟得不好」。若 ``within_std`` 误用了中位口径，这里会算出 ≠ 1。
+        """
+        blocks = [[0.0, 100.0]] + [[0.0, 1.0, 2.0]] * 10
+        y = np.concatenate(blocks)
+        g = np.concatenate([[f"g{i}"] * len(b) for i, b in enumerate(blocks)])
+        pred = np.concatenate([np.full(len(b), float(np.mean(b))) for b in blocks])
+        dec = error_decomposition(pred, y, g)
+        spread = label_spread(y, g)
+        assert dec["within_std"] == pytest.approx(spread["within_std_pooled"])
+        assert dec["within_ratio"] == pytest.approx(1.0)
+        # 而中位口径会把它算成 15 倍——同一个预测，两种分母
+        assert dec["within_rmse"] / spread["within_std_median"] > 10.0
+
+    def test_within_ratio_uses_pooled_denominator_not_median(self):
+        """负控：换分母会翻转结论（跟住了 / 差 5 倍）。
+
+        构造形态与真实 MATR 表一致：一个 2 行的大离散分组 + 10 个 3 行的小离散
+        分组。池化 std 被大分组拉高到 12.5，逐颗中位只有 0.82。
+        组内 RMSE 落在两者之间时，两个分母给出相反的判定。
+        """
+        blocks = [[0.0, 100.0]] + [[0.0, 1.0, 2.0]] * 10
+        y = np.concatenate(blocks)
+        g = np.concatenate([[f"g{i}"] * len(b) for i, b in enumerate(blocks)])
+        pred = y.copy()
+        for i in range(1, 11):
+            m = g == f"g{i}"
+            pred[m] += np.array([5.16, -5.16, 0.0])
+        dec = error_decomposition(pred, y, g)
+        spread = label_spread(y, g)
+        assert spread["within_std_pooled"] > 10.0
+        assert spread["within_std_median"] < 1.0
+        assert dec["within_ratio"] < 1.0  # 池化口径：跟住了
+        assert dec["within_rmse"] / spread["within_std_median"] > 1.0  # 中位口径：没跟住
 
     def test_rejects_length_mismatch(self):
         y, g = self._data()

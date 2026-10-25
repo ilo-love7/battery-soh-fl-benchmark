@@ -211,13 +211,27 @@ def label_spread(labels: np.ndarray, groups: np.ndarray) -> dict:
     - 跟住**这颗电池随循环**的变化（组内：同一颗内部随循环的移动）
 
     真实 MATR 表（135 颗 × 循环 5..100 步长 5）上两者差一个数量级：组间 std
-    0.00486，组内 std 中位只有 0.00066。**九成标签方差在组间**，所以「好 3 倍」
-    基本只说明第一件事。不拆开就写「模型能跟踪老化」，是把没测过的事说成测过了。
+    0.00486，组内 std 中位只有 0.00066。``var_fraction_between`` 实测 **70.4%**
+    ——**七成标签方差在组间**，所以「好 3 倍」基本只说明第一件事。不拆开就写
+    「模型能跟踪老化」，是把没测过的事说成测过了。
 
     ``var_fraction_between`` 用 ANOVA 的 ``SS_between / SS_total``（不等长分组
     也成立）。注意它**恰好等于** ``between_std² / 全局方差``——因为
     ``between_std`` 定义为 ``sqrt(SS_between / n)``。容易混的是「组均值的
     **无加权** std」：那个量在不等长分组下会偏（小组被放大），所以这里不用它。
+
+    **组内 std 有两个口径，不能混用**（2026-10-26 实测，差 4.8 倍）：
+
+    - ``within_std_median``：每颗电池各算一个 std，再取中位。回答「**典型**的
+      一颗电池，标签在它内部动多少」。
+    - ``within_std_pooled``：所有电池去均值后合并算一个 std（``sqrt(mean(r²))``，
+      ``r`` 为去组均值后的残差）。回答「**整批行**平均动多少」。
+
+    两个数在真实 MATR 表上是 0.00066 vs 0.00316（**4.8 倍**）：少数早期就掉得
+    厉害的电池把池化口径拉高了，而中位口径里它们只占一票。所以
+    :func:`error_decomposition` 的 ``within_rmse``（池化）**只能**与
+    ``within_std_pooled`` 比；拿它跟 ``within_std_median`` 比会凭空得出
+    「模型没跟住组内变化」——2026-10-25 就这么误判过一次，见 plan §13.5.4。
     """
     y = np.asarray(labels, dtype=float).ravel()
     g = np.asarray(groups)
@@ -232,6 +246,7 @@ def label_spread(labels: np.ndarray, groups: np.ndarray) -> dict:
     grand = y.mean()
     ss_between = 0.0
     ss_total = float(((y - grand) ** 2).sum())
+    ss_within = 0.0
     within_stds = []
     for key in uniq:
         mask = g == key
@@ -240,6 +255,7 @@ def label_spread(labels: np.ndarray, groups: np.ndarray) -> dict:
         if len(block) > 1:
             # ddof=0：这是描述这批数据的离散度，不是估计总体参数
             within_stds.append(float(block.std()))
+            ss_within += float(((block - block.mean()) ** 2).sum())
     if not within_stds:
         raise ValueError("每个分组都只有一行，组内离散度无定义")
 
@@ -248,6 +264,7 @@ def label_spread(labels: np.ndarray, groups: np.ndarray) -> dict:
         "n_rows": int(len(y)),
         "between_std": float(np.sqrt(ss_between / len(y))),
         "within_std_median": float(np.median(within_stds)),
+        "within_std_pooled": float(np.sqrt(ss_within / len(y))),
         "var_fraction_between": float(ss_between / ss_total) if ss_total > 0 else 0.0,
     }
 
@@ -258,9 +275,20 @@ def error_decomposition(pred: np.ndarray, labels: np.ndarray, groups: np.ndarray
     ``between_rmse``：每颗电池的**均值**估得准不准（同一颗内部的偏差先平均掉）
     ``within_rmse``：同一颗内部**随循环的移动**估得准不准（每颗的偏差先减掉均值）
 
-    ``within_rmse`` 的下界是标签本身的组内 std（:func:`label_spread` 的
-    ``within_std_median``）：一份组内 std 只有 0.00076 的切片，``within_rmse``
-    再好也到不了 0，而「比 0.00076 大」说明模型根本没跟住循环间的变化。
+    **``within_rmse`` 是池化的，它的下界是 ``within_std_pooled``，不是
+    ``within_std_median``。** 这两个口径在真实 MATR 表上差 **4.8 倍**
+    （0.00316 vs 0.00066，见 :func:`label_spread`），所以本函数把同口径的
+    基准一起算出来，放在 ``within_std`` / ``within_ratio`` 里——调用方不需要
+    再去挑一个「看起来差不多」的标签统计量来当分母。
+
+    为什么这不是吹毛求疵：2026-10-25 我用 ``within_rmse``（0.00093）去比
+    ``within_std_median``（0.00076），得出「新口径丢掉了组内跟踪能力」，
+    还据此在 plan §13.5.4 开了一条阻塞项。换成同口径后那个比值是
+    **0.00093 / 0.00316 = 0.29**，模型跟得相当好。**两个都「正常」的数相除
+    也能得出反的结论**，而这一次错误活过了一整轮复核。
+
+    ``within_ratio < 1`` 表示比「每颗各自猜一个常数」更会跟循环变化；
+    ``= 1`` 说明一点没跟住；``> 1`` 说明预测在组内比常数还差（在放大噪声）。
     """
     p = np.asarray(pred, dtype=float).ravel()
     y = np.asarray(labels, dtype=float).ravel()
@@ -276,18 +304,26 @@ def error_decomposition(pred: np.ndarray, labels: np.ndarray, groups: np.ndarray
         raise ValueError(f"至少需要两个分组，收到 {len(uniq)} 个")
 
     between_sq, within_sq, n_within = [], [], 0
+    ss_within_labels = 0.0
     for key in uniq:
         mask = g == key
         between_sq.append((y[mask].mean() - p[mask].mean()) ** 2)
         residual = (y[mask] - p[mask]) - (y[mask] - p[mask]).mean()
         within_sq.append(float((residual**2).sum()))
+        # 同口径的标签基准：标签自己去掉组均值后的平方和
+        ss_within_labels += float(((y[mask] - y[mask].mean()) ** 2).sum())
         n_within += int(mask.sum())
 
+    within_rmse = float(np.sqrt(sum(within_sq) / n_within))
+    within_std = float(np.sqrt(ss_within_labels / n_within))
     return {
         "mae": _mae(p, y),
         "between_rmse": float(np.sqrt(np.mean(between_sq))),
         # 用全部行数做分母（每颗内部的残差均值本来就为 0，不影响结果）
-        "within_rmse": float(np.sqrt(sum(within_sq) / n_within)),
+        "within_rmse": within_rmse,
+        # 这两个是「同口径」的配套量，别换成 label_spread 的 within_std_median
+        "within_std": within_std,
+        "within_ratio": within_rmse / within_std if within_std > 0 else float("nan"),
     }
 
 

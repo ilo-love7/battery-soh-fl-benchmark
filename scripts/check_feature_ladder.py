@@ -139,10 +139,16 @@ def main(argv=None) -> int:
     print(
         f"\n[label] 标签离散度：组间 std {spread['between_std']:.5f}"
         f"（占方差 {spread['var_fraction_between']:.0%}），"
-        f"组内 std 中位 {spread['within_std_median']:.5f}"
+        f"组内 std 池化 {spread['within_std_pooled']:.5f} / "
+        f"逐颗中位 {spread['within_std_median']:.5f}"
         f"（{spread['n_groups']} 颗）"
     )
-    print(f"{'模型':24s} {'组间 RMSE':>10s} {'组内 RMSE':>10s}")
+    # 分母只能是**池化**的组内 std：下面的组内 RMSE 也是池化的。
+    # 拿它去比「逐颗中位」在真实 MATR 表上差 4.8 倍，会把跟得住的模型
+    # 判成「没跟住」——2026-10-25 就这么错过一次（plan §13.5.4）。
+    print(
+        f"{'模型':24s} {'组间 RMSE':>10s} {'组内 RMSE':>10s} {'组内/基准':>10s}"
+    )
     amp_col = amplitude(X)
     for tag, pred in (
         ("常数基线", np.full(int(test_mask.sum()), y[train_mask].mean())),
@@ -153,10 +159,14 @@ def main(argv=None) -> int:
         ("全部特征", ridge_predict(X[train_mask], y[train_mask], X[test_mask])),
     ):
         dec = error_decomposition(pred, y[test_mask], cells[test_mask])
-        print(f"{tag:24s} {dec['between_rmse']:10.5f} {dec['within_rmse']:10.5f}")
+        print(
+            f"{tag:24s} {dec['between_rmse']:10.5f} {dec['within_rmse']:10.5f}"
+            f"{dec['within_ratio']:10.3f}"
+        )
     print(
         "[label] 组间 = 「这颗电池衰减得快不快」；组内 = 「它现在衰减到哪」。"
-        "组内 RMSE 大于组内 std 说明模型没跟住循环间的变化"
+        "「组内/基准」= 组内 RMSE ÷ 池化组内 std："
+        "<1 比每颗各猜一个常数更会跟循环，≈1 完全没跟住，>1 在放大噪声"
     )
 
     # 「1000 维」是假象还是真的用了 1000 维？主成分阶梯答这个。

@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-841-blue)](./tests)
+[![Tests](https://img.shields.io/badge/tests-845-blue)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -70,7 +70,7 @@
 | **`src/flsoh/simulate.py`** | 带**真值**的模拟 App 会话。物理模型刻意简单（OCV 幂律、内阻压降、√ 衰减）——它的用途是检验管道，不是证明方法 |
 | **`src/flsoh/ingest.py`** | 校验 → 去重 → 组装。去重按**内容指纹**而不是 session ID：重装 App 后 ID 会复用 |
 | **`scripts/check_features.py`** | 本该拦住 2026-10-25 那个特征 bug 的闸门：逐行算总变差 / 幅度。正确数据 5.9，错配数据 122.4。另有第三道：特征到底有没有携带**老化**（ΔQ(V) 与循环号的 Spearman ρ）——常数曲线在 TV 上是 0 分，完美光滑 |
-| **`scripts/check_feature_ladder.py`** | 回答「信号到底在哪」：常数 / 只用幅度 / 全部特征 / 只用形状 四格，误差的组间-组内拆分，以及主成分阶梯。真实 MATR 表上**任何单一标量幅度都比水平线差**（1.09–1.32 倍），1000 维全量到 0.31 倍，而**前 10 个主成分比全部 1000 维还好**（0.27 倍）——所以有效自由度约 10，第 1 主成分（占 91% 方差）是干扰方向 |
+| **`scripts/check_feature_ladder.py`** | 回答「信号到底在哪」：常数 / 只用幅度 / 全部特征 / 只用形状 四格，误差的组间-组内拆分，以及主成分阶梯。真实 MATR 表上**任何单一标量幅度都比水平线差**（1.05–1.27 倍），1000 维全量到 0.33 倍，而**前 10 个主成分略好于全部 1000 维**（0.32 倍）——所以有效自由度约 10，第 1 主成分（占 91% 方差）是干扰方向 |
 | **`scripts/compare_feature_versions.py`** | 把两个结果目录逐 run 配对，报中位比值、精确符号检验、以及每个配置家族的 seed 变异系数——让「劣化 17%」跟它所在的噪声放在一起读。线程数不同的两个 run 直接拒绝对比：那会混进一个与 seed 同量级的随机源 |
 | **`scripts/simulate_sessions.py`** | 产出 Schema v1 JSONL 与真值。**自己的输出也过一遍 schema 校验**——模拟数据不享受豁免 |
 | **`scripts/run_e2e.py`** | 端到端：会话 → 入库 → 特征 → 光滑性闸门 → 划分 → 联邦训练 → 结果 JSON。五道闸门各有非零退出码，并把一条平凡基线阶梯（常数 / 只用幅度 / 全部特征 / 只用形状）与 MAE 一起报出来——只报 MAE 是不可判读的，模拟数据上 1 维线性模型比 1000 维网络好 6.5 倍 |

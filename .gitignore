@@ -19,6 +19,8 @@ dist/
 htmlcov/
 
 # 实验产物：结果 JSON 要进版本库（它是数据源），但缓存与日志不进
+# discharge-v2 是重跑的**暂存目录**，promote 之后内容进 results/，本身不入库
+results/discharge-v2/
 results/**/*.log
 results/**/__pycache__/
 *.tmp
