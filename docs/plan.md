@@ -1606,7 +1606,17 @@ python scripts/rerun_all.py --execute --jobs 12 --threads 1 \
    特征口径无关，脚本按「有没有 `final_mae`」区分，原地不动。
 3. `summarize_results.py --write-plan docs/plan.md` 重生成 §10.2 的表，
    `--judge --hetero results/heterogeneity.json` 重出 H1–H4 判定。
-4. 重生成图 1–3，`--compare results/ablation-old-features` 出新旧逐 run 对比。
+4. 重生成图 1–3。**`--compare` 不属于画图脚本**（`make_figure1/2/3` 只有
+   `--results` / `--out`，figure2 多一个 `--hetero`）——逐 run 的新旧对比是
+   `rerun_all.py --compare results/ablation-old-features` 在**重跑时**就产出
+   的，不在这之后补：
+
+   ```bash
+   python scripts/make_figure1.py --results results
+   python scripts/make_figure2.py --results results --hetero results/heterogeneity.json
+   python scripts/make_figure3.py --results results
+   ```
+
 5. 把新数字写进 §13.5.6 的判定对照表，新增一列「新表（1 线程）」。
 
 第 2 步必须做而不是让 CI 改指 `results/discharge-v2`：CI 的
