@@ -1919,13 +1919,15 @@ promote → 重生成 §10.2 与图 1–3 → 逐条复核 H1–H4。
 | `torch_version` | `2.10.0+cpu` × 172 |
 | `python_version` | `3.13.14` × 172 |
 
-**重跑过程本身暴露了一个运维坑**：第一轮 145 个任务里 **16 个 FAIL**，日志里
-只有进度行、没有异常栈（进程被静默杀掉）。缺的是 8 个 `fedavg__sohrank__seed*`
-和 8 个 FedProx-dirichlet。用 `--only 'sohrank__seed|dirichlet0.5' --skip-existing
---jobs 4` 补跑，16 个全过、0 失败。**教训**：`rerun_all.py` 的 FAIL 分支只打
-末 15 行输出，进程被 kill 时那 15 行全是进度行，看不出是「数据问题」还是
-「被系统杀掉」。要么给每个 job 存日志（`--log-dir`），要么在 FAIL 时把返回码
-一起打出来。
+**重跑过程本身暴露了一个运维坑，已修**：第一轮 145 个任务里 **16 个 FAIL**，
+日志里只有进度行、没有异常栈（进程被静默杀掉）。缺的是 8 个
+`fedavg__sohrank__seed*` 和 8 个 FedProx-dirichlet。用
+`--only 'sohrank__seed|dirichlet0.5' --skip-existing --jobs 4` 补跑，16 个全过、
+0 失败。**修法**：`rerun_all.py` 的 FAIL 行现在带 `returncode=`，并由
+`_rc_hint()` 把「被信号杀掉」与「进程异常终止（0xC…，多半内存不足）」翻成
+人话——这两种都**不是数据问题**，重跑即可。`tests/test_rerun_all.py::
+TestReturncodeHint` 五条钉住（0 与普通非零码不给猜测性提示、负数说信号、
+大于 255 说系统杀、十六进制大写定宽）。
 
 **最要紧的结果：seed 波动大幅上升，判据失去分辨力。**
 

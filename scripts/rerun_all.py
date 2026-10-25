@@ -508,6 +508,28 @@ def pinned_env(threads: int) -> dict[str, str]:
     return env
 
 
+def _rc_hint(code: int) -> str:
+    """把「进程被系统杀掉」与「脚本自己报错退出」分开。
+
+    2026-10-26 真撞到过：145 个任务里 16 个 FAIL，日志末尾全是 `round NN/100`
+    这样的进度行、**没有任何异常栈**。原因是子进程被系统杀掉，而 FAIL 行当时
+    只打末 15 行输出——读起来像「数据有问题」，实际重跑一遍就过。所以返回码
+    必须进 FAIL 行，而且异常终止码要翻译成人话。
+    """
+    if code == 0:
+        return ""
+    if code < 0:
+        return f"（被信号 {-code} 杀掉：不是数据问题，重跑该任务即可）"
+    if code > 255:
+        # Windows 上 0xC0000005 / 0xC0000409 这类码都是进程级异常，
+        # 最常见的是内存不足。Unix 的 128+N 也落在这里。
+        return (
+            f"（进程异常终止 0x{code:08X}：多半是内存不足或被系统杀掉，"
+            "降低 --jobs 重跑该任务即可）"
+        )
+    return ""
+
+
 def _run_job(job: dict, *, config: str, features: str, out: str,
              baseline_partition: str, log_dir: Path | None,
              python: str, threads: int) -> dict:
@@ -758,8 +780,12 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 failures.append(res)
                 tail = "\n".join(res["output"].strip().splitlines()[-15:])
-                print(f"[{done}/{len(jobs)}] FAIL {label}  {res['seconds']}s\n{tail}",
-                      flush=True)
+                print(
+                    f"[{done}/{len(jobs)}] FAIL {label}  {res['seconds']}s"
+                    f"  returncode={res['returncode']}{_rc_hint(res['returncode'])}"
+                    f"\n{tail}",
+                    flush=True,
+                )
     print(f"\n重跑结束，墙钟 {round(time.time() - t0, 1)}s，失败 {len(failures)} 个")
 
     missing = verify_outputs(runs, out_dir)

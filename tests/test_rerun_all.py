@@ -635,3 +635,34 @@ class TestMixedDirectoryResume:
         runs = {"a": {"torch_num_threads": 24}, "b": {}}
         problems = ra.check_thread_count(runs, 1, allow_mixed=True)
         assert problems and "24" in problems[0]
+
+
+class TestReturncodeHint:
+    """FAIL 行必须带上返回码，并把「被系统杀掉」翻译成人话。
+
+    2026-10-26 真撞到过：145 个任务里 16 个 FAIL，日志末尾全是 `round NN/100`
+    这样的进度行、**没有任何异常栈**。FAIL 行当时只打末 15 行输出，读起来像
+    「数据有问题」，实际是子进程被系统杀掉，重跑一遍就过。返回码不进日志，
+    这个区分就无从做出。
+    """
+
+    def test_zero_has_no_hint(self):
+        assert ra._rc_hint(0) == ""
+
+    def test_negative_code_says_signal(self):
+        hint = ra._rc_hint(-9)
+        assert "信号" in hint and "不是数据问题" in hint
+
+    def test_large_code_says_system_kill(self):
+        # Windows 的 0xC0000005（访问违例）与 0xC0000409（栈溢出）都是进程级
+        hint = ra._rc_hint(0xC0000005)
+        assert "0xC0000005" in hint and "内存" in hint
+
+    def test_plain_nonzero_has_no_hint(self):
+        """普通非零退出码是脚本自己报的错，不要加猜测性提示。"""
+        assert ra._rc_hint(1) == ""
+        assert ra._rc_hint(2) == ""
+
+    def test_hint_is_ascii_hex_uppercase(self):
+        """十六进制要大写且定宽，否则日志里对不齐、也不好 grep。"""
+        assert "0xC0000409" in ra._rc_hint(0xC0000409)
