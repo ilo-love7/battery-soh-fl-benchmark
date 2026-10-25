@@ -340,3 +340,120 @@ def ladder_note(ladder: dict, neural_mae: float | None = None) -> str:
         f"×{ratio:.2f}：**1 维线性模型就够了**，多余维度在贡献噪声。"
         "这不是「方法有效」的证据，是模拟数据的任务太单薄"
     )
+
+
+#: 主成分阶梯要看的维数。到 50 为止：再往上每一步只降 0.01，而「有效自由度是
+#: 几」这个问题在前 10 维就答完了。
+DEFAULT_PC_KS = (1, 2, 3, 5, 10, 20, 50)
+
+
+def pc_ladder(
+    features: np.ndarray,
+    labels: np.ndarray,
+    train_mask: np.ndarray,
+    test_mask: np.ndarray,
+    *,
+    ks: tuple[int, ...] = DEFAULT_PC_KS,
+    alpha: float = DEFAULT_ALPHA,
+) -> dict:
+    """主成分阶梯：**「1000 维」到底有几个有效自由度**。
+
+    阶梯表报的是「全部特征比常数基线好 3 倍」，但没说清这 3 倍是从几个方向
+    来的。1000 列里可能只有 3 列在起作用，其余 997 列在贡献噪声——两者的工程
+    含义完全不同（前者说明该降维，后者说明该换特征）。
+
+    实测（真实 MATR 表，135 颗，留出 23 颗）：
+
+    - **第 1 主成分占 91% 的方差，判别力 1.22 倍**（比水平线还差）。它与
+      ``max|ΔQ|`` 的相关是 0.66——就是「这是哪颗电池」那个方向。
+    - **第 2–3 主成分（合计 7.5% 的方差）把 MAE 从 1.15 倍拉到 0.43 倍。**
+      信号藏在高方差方向的正交补里。
+    - 再加到 50 维只从 0.43 降到 0.34，收益递减。
+
+    所以「1000 维」是个假象：有效自由度是 3，而且真正有用的那 3 维只占总方差
+    的 7.5%。这也解释了为什么 seed 之间的波动会大——模型要在 91% 的干扰项下面
+    找出 7.5% 的信号。
+
+    **主成分只在训练集上拟合**，测试集用同一组载荷投影。否则 PCA 本身就看过
+    测试集，而这一步的「判别力」会好得没有道理。
+
+    ``first_useful_k`` 是第一个比常数基线好的维数；``saturated_k`` 是第一个
+    达到最优判别力 90% 增益的维数（即再往后加维度不值得）。两个都给，因为
+    「从几维开始有用」与「加到几维就够」不是同一个数。
+    """
+    X = np.asarray(features, dtype=float)
+    y = np.asarray(labels, dtype=float).ravel()
+    train_mask = np.asarray(train_mask, dtype=bool)
+    test_mask = np.asarray(test_mask, dtype=bool)
+    if X.ndim != 2:
+        raise ValueError(f"features 必须是二维，收到 shape={X.shape}")
+    if len(X) != len(y):
+        raise ValueError(f"features 有 {len(X)} 行而 labels 有 {len(y)} 个")
+    if len(train_mask) != len(X) or len(test_mask) != len(X):
+        raise ValueError("掩码长度必须与特征行数一致")
+    if not train_mask.any() or not test_mask.any():
+        raise ValueError("训练集或测试集为空，主成分阶梯没有意义")
+    if (train_mask & test_mask).any():
+        raise ValueError("训练掩码与测试掩码有重叠：同一行不能既训练又测试")
+
+    X_train, X_test = X[train_mask], X[test_mask]
+    y_train, y_test = y[train_mask], y[test_mask]
+    constant = _mae(np.full(len(y_test), y_train.mean()), y_test)
+
+    mean = X_train.mean(axis=0)
+    centred = X_train - mean
+    # 只需要前 max(ks) 个方向；full_matrices=False 已经是最省的写法
+    _u, s, vt = np.linalg.svd(centred, full_matrices=False)
+    total = float((s**2).sum())
+    explained = (s**2 / total) if total > 0 else np.zeros_like(s)
+    n_available = int(len(s))
+
+    rows = []
+    for k in ks:
+        k_eff = min(int(k), n_available)
+        if k_eff < 1:
+            continue
+        loadings = vt[:k_eff].T
+        train_scores = centred @ loadings
+        test_scores = (X_test - mean) @ loadings
+        mae = _mae(ridge_predict(train_scores, y_train, test_scores, alpha=alpha), y_test)
+        rows.append({
+            "k": int(k),
+            "k_used": k_eff,
+            "explained_variance": float(explained[:k_eff].sum()),
+            "mae": mae,
+            "ratio": mae / constant if constant else float("inf"),
+        })
+    if not rows:
+        raise ValueError("ks 里没有一个可用的维数")
+
+    useful = [r for r in rows if r["ratio"] < 1.0]
+    best = min(r["ratio"] for r in rows)
+    saturated = next(
+        (r for r in rows if r["ratio"] <= best + 0.10 * (1.0 - best)), rows[-1]
+    )
+    return {
+        "constant": constant,
+        "n_components_available": n_available,
+        "explained_first": float(explained[0]) if n_available else 0.0,
+        "rows": rows,
+        "first_useful_k": useful[0]["k"] if useful else None,
+        "saturated_k": saturated["k"],
+        "best_ratio": best,
+    }
+
+
+def pc_verdict(ladder: dict) -> str:
+    """把主成分阶梯读成一句话：几个方向在起作用，它们占多少方差。"""
+    first = ladder["rows"][0]
+    sat = next(r for r in ladder["rows"] if r["k"] == ladder["saturated_k"])
+    if ladder["first_useful_k"] is None:
+        return (
+            f"主成分方向上一个都不如常数基线（最好 {ladder['best_ratio']:.2f} 倍）："
+            "特征里没有可线性提取的信号"
+        )
+    return (
+        f"有效自由度约 {ladder['saturated_k']}（占方差 {sat['explained_variance']:.1%}）；"
+        f"第 1 主成分占 {first['explained_variance']:.1%} 的方差却只有 "
+        f"{first['ratio']:.2f} 倍判别力"
+    )

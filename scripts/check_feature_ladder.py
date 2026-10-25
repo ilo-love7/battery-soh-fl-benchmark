@@ -61,6 +61,8 @@ from flsoh.baselines import (  # noqa: E402
     feature_ladder,
     label_spread,
     ladder_verdict,
+    pc_ladder,
+    pc_verdict,
     ridge_predict,
     scalar_summaries,
 )
@@ -156,6 +158,14 @@ def main(argv=None) -> int:
         "[label] 组间 = 「这颗电池衰减得快不快」；组内 = 「它现在衰减到哪」。"
         "组内 RMSE 大于组内 std 说明模型没跟住循环间的变化"
     )
+
+    # 「1000 维」是假象还是真的用了 1000 维？主成分阶梯答这个。
+    P = pc_ladder(X, y, train_mask, test_mask)
+    print(f"\n{'主成分':22s} {'占方差':>8s} {'测试 MAE':>10s} {'相对常数':>9s}")
+    for row in P["rows"]:
+        print(f"前 {row['k']:2d} 个{row['explained_variance']:>13.1%}"
+              f"{row['mae']:>12.5f}{row['ratio']:>11.3f}")
+    print(f"[pca] {pc_verdict(P)}")
 
     print(f"\n[ladder] 结论：{ladder_verdict(L)}")
     return 0

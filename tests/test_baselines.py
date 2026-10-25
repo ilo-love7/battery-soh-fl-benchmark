@@ -19,6 +19,8 @@ from flsoh.baselines import (  # noqa: E402
     label_spread,
     ladder_note,
     ladder_verdict,
+    pc_ladder,
+    pc_verdict,
     ridge_predict,
     scalar_summaries,
 )
@@ -441,3 +443,134 @@ class TestErrorDecomposition:
         y, _ = self._data()
         with pytest.raises(ValueError, match="两个分组"):
             error_decomposition(y, y, np.array(["a"] * len(y)))
+
+
+class TestPcLadder:
+    """主成分阶梯：回答「1000 维里有几个有效自由度」。
+
+    要钉住的是**泄漏**与**饱和判据**两件事：主成分只能在训练集上拟合（否则
+    PCA 自己看过测试集，判别力好得没有道理）；``saturated_k`` 不能在没有可用
+    信号时瞎给一个数。
+    """
+
+    def _data(self, n_per=6, n_groups=8, n_features=40, seed=0):
+        """造一份「第 1 主成分是干扰项、标签在更低方差方向」的表。
+
+        这正是真实 MATR 表的形状：PC1 占 91% 的方差（电池身份），标签住在
+        PC2–PC3（合计 7.5%）。如果让信号占住第 1 主成分，这个测试就测不出
+        「前 1 维不够」——那样 k=1 本来就是最优。
+        """
+        rng = np.random.default_rng(seed)
+        cells, rows, labels = [], [], []
+        for g in range(n_groups):
+            nuisance = rng.normal(0, 3.0)   # 大方差、与标签无关
+            signal = rng.normal(0, 1.0)     # 小方差、就是标签
+            for _ in range(n_per):
+                row = rng.normal(0, 0.05, n_features)
+                row[0] += nuisance
+                row[1] += signal
+                rows.append(row)
+                cells.append(f"c{g:02d}")
+                labels.append(signal)
+        X = np.array(rows)
+        cells = np.array(cells)
+        train = np.isin(cells, [f"c{g:02d}" for g in range(n_groups - 2)])
+        return X, np.array(labels), train, ~train
+
+    def test_first_component_alone_is_not_enough(self):
+        """标签在 PC2 上时，只用第 1 主成分（干扰项方向）拿不到最优。"""
+        X, y, tr, te = self._data()
+        P = pc_ladder(X, y, tr, te, ks=(1, 2, 10))
+        first = next(r for r in P["rows"] if r["k"] == 1)
+        two = next(r for r in P["rows"] if r["k"] == 2)
+        assert first["ratio"] > two["ratio"]
+        # 第 1 维是干扰项，单独用不该好过水平线
+        assert first["ratio"] > 1.0
+
+    def test_svd_is_fitted_on_train_only(self):
+        """改动测试集的行，解释方差必须**完全不变**。
+
+        解释方差只由训练集的 SVD 决定。如果它跟着测试集变，说明 SVD 吃进了
+        测试行——那一步的「判别力」就是泄漏出来的。
+        """
+        X, y, tr, te = self._data()
+        P1 = pc_ladder(X, y, tr, te, ks=(1, 2))
+        X2 = X.copy()
+        X2[te] = np.random.default_rng(99).normal(0, 10.0, size=X2[te].shape)
+        P2 = pc_ladder(X2, y, tr, te, ks=(1, 2))
+        assert [r["explained_variance"] for r in P1["rows"]] == pytest.approx(
+            [r["explained_variance"] for r in P2["rows"]]
+        )
+
+    def test_negative_control_train_rows_do_change_explained_variance(self):
+        """负控：改训练集的行，解释方差必须变。
+
+        没有这一条，上一条用一个「永远不变」的实现也能通过。
+        """
+        X, y, tr, te = self._data()
+        P1 = pc_ladder(X, y, tr, te, ks=(1,))
+        X2 = X.copy()
+        X2[tr, 0] *= 10.0
+        P2 = pc_ladder(X2, y, tr, te, ks=(1,))
+        assert P1["rows"][0]["explained_variance"] != pytest.approx(
+            P2["rows"][0]["explained_variance"]
+        )
+
+    def test_explained_variance_is_monotone_and_bounded(self):
+        X, y, tr, te = self._data()
+        P = pc_ladder(X, y, tr, te, ks=(1, 2, 5, 10))
+        vals = [r["explained_variance"] for r in P["rows"]]
+        assert vals == sorted(vals)
+        assert vals[-1] <= 1.0 + 1e-9
+        assert 0.0 < vals[0] < 1.0
+
+    def test_saturated_k_is_one_of_the_requested_ks(self):
+        X, y, tr, te = self._data()
+        P = pc_ladder(X, y, tr, te, ks=(1, 3, 10))
+        assert P["saturated_k"] in {r["k"] for r in P["rows"]}
+
+    def test_clamps_k_beyond_available_components(self):
+        """训练行数少于特征数时，k 不能超出可用维数。"""
+        X, y, tr, te = self._data(n_per=1, n_groups=4, n_features=40)
+        P = pc_ladder(X, y, tr, te, ks=(1, 50))
+        assert P["rows"][-1]["k_used"] <= P["n_components_available"]
+
+    def test_rejects_overlapping_masks(self):
+        X, y, _, _ = self._data()
+        mask = np.ones(len(X), dtype=bool)
+        with pytest.raises(ValueError, match="重叠"):
+            pc_ladder(X, y, mask, mask)
+
+    def test_rejects_empty_test_set(self):
+        X, y, tr, _ = self._data()
+        with pytest.raises(ValueError, match="为空"):
+            pc_ladder(X, y, tr, np.zeros(len(X), dtype=bool))
+
+
+class TestPcVerdict:
+    def test_reports_dimension_and_variance(self):
+        fake = {
+            "rows": [
+                {"k": 1, "explained_variance": 0.916, "ratio": 1.22},
+                {"k": 10, "explained_variance": 0.999, "ratio": 0.27},
+            ],
+            "first_useful_k": 3,
+            "saturated_k": 10,
+            "best_ratio": 0.27,
+        }
+        v = pc_verdict(fake)
+        assert "10" in v
+        assert "91.6%" in v
+        assert "1.22" in v
+
+    def test_says_no_signal_when_nothing_beats_constant(self):
+        fake = {
+            "rows": [
+                {"k": 1, "explained_variance": 0.9, "ratio": 1.2},
+                {"k": 10, "explained_variance": 0.99, "ratio": 1.1},
+            ],
+            "first_useful_k": None,
+            "saturated_k": 10,
+            "best_ratio": 1.1,
+        }
+        assert "没有可线性提取的信号" in pc_verdict(fake)
