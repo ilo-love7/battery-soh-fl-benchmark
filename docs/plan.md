@@ -1487,6 +1487,11 @@ python scripts/rerun_all.py --execute --jobs 12 --threads 1 \
 `results/discharge-v2/` 里出现的东西只可能来自这一次重跑。`--skip-existing`
 配合它才是安全的续跑——产物逐个过 `artifact_is_current`，口径对不上就重新排队。
 
+`--jobs` 不写死：先单独跑一个任务量出峰值 RSS，再取
+`min(20, 0.7 × 可用内存 / RSS)`。本机 24 核 / 16 GB（实际可用 5.9 GB），
+按单个 torch 进程约 350 MB 估，12 个并发是安全上限；直接开到 20 会换页，
+而换页期间所有任务一起变慢，看不出是哪一步出的问题。
+
 **重跑完成后的落地顺序**（顺序有依赖，不能跳）：
 
 1. 核对 `results/discharge-v2/` 的 157 个任务全齐，且每个 JSON 的
