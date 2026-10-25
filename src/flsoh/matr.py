@@ -37,6 +37,13 @@ from urllib.parse import urlparse
 import h5py
 import numpy as np
 
+from flsoh.features import (
+    CHARGE_SIGN,
+    DISCHARGE_SIGN,
+    DataContractError,
+    segment_capacity_curve,
+)
+
 # summary 结构体的字段。顺序照 MATLAB 里的定义，不按字母排——打印时更容易
 # 和原文对照。
 SUMMARY_FIELDS = (
@@ -739,7 +746,13 @@ class MatrBatch:
         return out
 
     def curve(self, index: int, cycle: int, field: str = "V") -> np.ndarray:
-        """第 ``cycle`` 个循环的某个通道（0 起，与 summary 的下标对齐）。"""
+        """第 ``cycle`` 个循环的某个通道（0 起，与 summary 的下标对齐）。
+
+        **这是原始通道，一个循环里同时含充电段与放电段。** 要拿去做 ΔQ(V)
+        特征必须先用 :meth:`discharge_curve` / :meth:`charge_curve` 分段——
+        直接把这里的结果喂给 ``delta_q_curve`` 会把两段混在一起，见
+        ``flsoh.features.segment_capacity_curve`` 的实测表。
+        """
         if field not in CURVE_FIELDS:
             raise MatrError(f"未知曲线字段 {field}；只有 {CURVE_FIELDS}")
         refs = self._cycle_refs(index, field)
@@ -747,16 +760,38 @@ class MatrBatch:
             raise MatrError(f"循环下标 {cycle} 越界（电池 {index} 共 {len(refs)} 个）")
         return np.asarray(self._h5[refs[cycle]][()], dtype=float).ravel()
 
-    def charge_curve(self, index: int, cycle: int) -> tuple[np.ndarray, np.ndarray]:
-        """(V, Qc)。两者长度必须一致，否则后面插值会错位。"""
+    def _segment_curve(
+        self, index: int, cycle: int, capacity_field: str, sign: float
+    ) -> tuple[np.ndarray, np.ndarray]:
         voltage = self.curve(index, cycle, "V")
-        capacity = self.curve(index, cycle, "Qc")
-        if voltage.shape != capacity.shape:
+        capacity = self.curve(index, cycle, capacity_field)
+        current = self.curve(index, cycle, "I")
+        if not (voltage.shape == capacity.shape == current.shape):
             raise MatrError(
-                f"电池 {index} 循环 {cycle} 的 V/Qc 长度不一致："
-                f"{voltage.shape} vs {capacity.shape}"
+                f"电池 {index} 循环 {cycle} 的 V/{capacity_field}/I 长度不一致："
+                f"{voltage.shape} / {capacity.shape} / {current.shape}"
             )
-        return voltage, capacity
+        try:
+            return segment_capacity_curve(voltage, capacity, current, sign=sign)
+        except DataContractError as exc:
+            raise MatrError(f"电池 {index} 循环 {cycle} 分段失败：{exc}") from exc
+
+    def discharge_curve(self, index: int, cycle: int) -> tuple[np.ndarray, np.ndarray]:
+        """放电段的 (V, Qd)。``build_features.py`` 用的就是这个。
+
+        选放电段而不是充电段，理由写在 ``delta_q_curve`` 的 docstring 里：
+        恒压充电段 dQ/dV → ∞，均匀电压网格在那里会插出 ~1 Ah 的跳变。
+        """
+        return self._segment_curve(index, cycle, "Qd", DISCHARGE_SIGN)
+
+    def charge_curve(self, index: int, cycle: int) -> tuple[np.ndarray, np.ndarray]:
+        """充电段的 (V, Qc)。两者长度必须一致，否则后面插值会错位。
+
+        注意：返回的是**充电段**，不是整条循环。这个方法曾经返回整条循环
+        （名字里的 charge 名不副实），于是放电段被 ``delta_q_curve`` 的
+        ``argsort`` 混进低电压区——见 ``segment_capacity_curve`` 的实测表。
+        """
+        return self._segment_curve(index, cycle, "Qc", CHARGE_SIGN)
 
     def n_cycles(self, index: int) -> int:
         return int(len(self._cycle_refs(index, "V")))
@@ -764,7 +799,7 @@ class MatrBatch:
     # ------------------------------------------------------------------
     # 预取
     # ------------------------------------------------------------------
-    def prefetch_cell(self, index: int, cycles, fields=("V", "Qc")) -> int:
+    def prefetch_cell(self, index: int, cycles, fields=("V", "Qd", "I")) -> int:
         """把该电池本次要用的曲线解引用一遍，让数据和对象头进缓存。
 
         **为什么不用包络预取**（一次抓一大段字节区间）：实测过，而且慢一倍。

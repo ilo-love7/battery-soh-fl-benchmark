@@ -25,6 +25,7 @@ np = pytest.importorskip("numpy", reason="matr 需要 numpy")
 pd = pytest.importorskip("pandas", reason="特征表需要 pandas")
 pytest.importorskip("pyarrow", reason="parquet 需要 pyarrow")
 
+import build_features as bf  # noqa: E402
 from build_features import (  # noqa: E402
     cell_frame,
     concat_parts,
@@ -38,7 +39,13 @@ from build_features import (  # noqa: E402
 )
 from build_manifest import resolve_source  # noqa: E402
 # 同样从 flsoh.features 导入：flsoh.data 在模块层 import torch。
-from flsoh.features import CELL_COL, CYCLE_COL, SOH_COL, make_v_grid  # noqa: E402
+from flsoh.features import (  # noqa: E402
+    CELL_COL,
+    CYCLE_COL,
+    FEATURE_SPEC_VERSION,
+    SOH_COL,
+    make_v_grid,
+)
 from flsoh.matr import MatrBatch  # noqa: E402
 
 from test_matr import write_fake_matr  # noqa: E402
@@ -82,6 +89,32 @@ class TestStateFingerprint:
         """JSON 读回来是 list；若哪天内部改成 tuple，不该因为类型差异拒绝续跑。"""
         saved = {"cycles": [5, 10], "points": 1000}
         assert state_mismatch(saved, {"cycles": (5, 10), "points": 1000}) is None
+
+    def test_fingerprint_carries_the_algorithm_version(self):
+        state = state_fingerprint(
+            cycles=[5, 10], ref_cycle=1, v_lo=2.0, v_hi=3.5, points=1000
+        )
+        assert state["feature_version"] == FEATURE_SPEC_VERSION
+
+    def test_parts_without_version_are_refused(self):
+        """负控：2026-10-25 之前的 state.json 没有这个键。
+
+        那批分片是用「整条循环插值」算的，而参数一个都没变。少了这道比对，
+        重跑同一条命令会把它们当成有效数据全部跳过——表里一行新数据都没有，
+        脚本还会打印「全部有分片」并退出 0。
+        """
+        kwargs = dict(cycles=[5, 10], ref_cycle=1, v_lo=2.0, v_hi=3.5, points=1000)
+        saved = state_fingerprint(**kwargs)
+        del saved["feature_version"]
+        reason = state_mismatch(saved, state_fingerprint(**kwargs))
+        assert reason and "feature_version" in reason and "--restart" in reason
+
+    def test_changed_algorithm_version_is_refused(self, monkeypatch):
+        kwargs = dict(cycles=[5, 10], ref_cycle=1, v_lo=2.0, v_hi=3.5, points=1000)
+        saved = state_fingerprint(**kwargs)
+        monkeypatch.setattr(bf, "FEATURE_SPEC_VERSION", "discharge-v99")
+        reason = state_mismatch(saved, state_fingerprint(**kwargs))
+        assert reason and "feature_version" in reason
 
 
 # ---------------------------------------------------------------------------

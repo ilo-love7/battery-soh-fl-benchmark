@@ -51,7 +51,7 @@ from build_features import (  # noqa: E402
     main,
     parts_dir_for,
 )
-from flsoh.features import make_v_grid  # noqa: E402
+from flsoh.features import FEATURE_SPEC_VERSION, make_v_grid  # noqa: E402
 from flsoh.matr import MatrError, MatrTransportError  # noqa: E402
 
 from test_matr import write_fake_matr  # noqa: E402
@@ -116,7 +116,7 @@ class TestTransportErrorIsNotADrop:
             def summary(self, index, *, fields=()):
                 return {"QDischarge": np.ones(200), "cycle": np.arange(200)}
 
-            def charge_curve(self, index, cycle):
+            def discharge_curve(self, index, cycle):
                 raise MatrTransportError("区间抓取失败：ConnectionResetError")
 
         with pytest.raises(MatrTransportError):
@@ -136,7 +136,7 @@ class TestTransportErrorIsNotADrop:
             def summary(self, index, *, fields=()):
                 return {"QDischarge": np.ones(200), "cycle": np.arange(200)}
 
-            def charge_curve(self, index, cycle):
+            def discharge_curve(self, index, cycle):
                 if cycle > 30:
                     raise MatrTransportError("区间抓取失败：timed out")
                 return np.linspace(3.0, 3.5, 32), np.linspace(0.0, 1.0, 32)
@@ -158,7 +158,7 @@ class TestTransportErrorIsNotADrop:
             def summary(self, index, *, fields=()):
                 return {"QDischarge": np.ones(3), "cycle": np.arange(3)}
 
-            def charge_curve(self, index, cycle):
+            def discharge_curve(self, index, cycle):
                 raise MatrError("曲线覆盖不住电压窗口 [2.0, 3.5] V")
 
         result = extract_cell(
@@ -237,6 +237,9 @@ class TestStaleEmptyMarkersAreHealed:
         (parts / "state.json").write_text(
             json.dumps(
                 {
+                    # 指纹里的算法版本必须写全：缺了它新代码会判「算法变了」
+                    # 并拒绝续跑，而这条测试要验的是**续跑**。
+                    "feature_version": FEATURE_SPEC_VERSION,
                     "cycles": [1, 3, 5, 7],
                     "ref_cycle": 1,
                     "v_lo": 3.0,
@@ -268,6 +271,9 @@ class TestStaleEmptyMarkersAreHealed:
         (parts / "state.json").write_text(
             json.dumps(
                 {
+                    # 指纹里的算法版本必须写全：缺了它新代码会判「算法变了」
+                    # 并拒绝续跑，而这条测试要验的是**续跑**。
+                    "feature_version": FEATURE_SPEC_VERSION,
                     "cycles": [1, 3, 5, 7],
                     "ref_cycle": 1,
                     "v_lo": 3.0,

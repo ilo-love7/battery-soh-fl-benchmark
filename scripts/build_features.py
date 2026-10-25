@@ -3,8 +3,21 @@
 
 特征口径
 --------
-每行 = (电池, 循环 k)，特征 = ``Qc_k(V) − Qc_ref(V)`` 在 1000 点电压网格上的
+每行 = (电池, 循环 k)，特征 = ``Qd_k(V) − Qd_ref(V)`` 在 1000 点电压网格上的
 差分，标签 = ``SOH_k = QD_k / QD_ref``。
+
+**为什么是放电段（``Qd``）而不是充电段（``Qc``）**：恒压充电段里电压几乎不变
+而容量猛涨，dQ/dV 趋于无穷，均匀电压网格在那里会把 0.1 Ah 的容量变化压进
+一两个网格点。实测同一颗电池同一对循环，插值出的最大相邻跳变：充电段
+**1.118 Ah**，放电段 **0.013 Ah**。这不是调参能解决的，是充电曲线在恒定电压
+下的固有奇性。Severson et al. 2019 用的也是放电曲线。
+
+顺带一段踩过的坑（2026-10-25）：曾经把**整条循环**（充电 + 放电拼在一起）
+喂给 ``delta_q_curve``，它的 ``argsort`` 于是把放电段排进充电段的电压区间，
+而放电段的 ``Qc`` 是常数——低电压区冒出一片「容量 = 满容量」的平台。那样算出
+的「ΔQ」总变差 269.6，正确分段后 0.21，两者相关系数 −0.02。指标照样算得
+出来，曲线形状也「看着像那么回事」，所以只有总变差这个量能拦住它。见
+``scripts/check_features.py``。
 
 三个为什么
 ----------
@@ -82,12 +95,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from flsoh.features import (  # noqa: E402
     CELL_COL,
     CYCLE_COL,
+    FEATURE_SPEC_VERSION,
     SOH_COL,
     DataContractError,
     delta_q_features,
     make_v_grid,
     validate_feature_table,
 )
+from check_features import check_feature_table  # noqa: E402
 from flsoh.matr import MatrBatch, MatrError, MatrTransportError  # noqa: E402
 
 DEFAULT_CYCLES = "5:100:5"
@@ -141,8 +156,13 @@ def state_fingerprint(
     """这次抽取的规格指纹。
 
     任何一个字段不同，新旧分片拼在一起都是错的——而且错得不报异常。
+
+    ``feature_version`` 是**怎么算**的指纹（见 ``flsoh.features``）：只改参数
+    不改算法时它不变，只改算法不改参数时**只有它变**。少了它，修完算法重跑
+    同一条命令会把旧分片全部当成有效数据跳过，退出码还是 0。
     """
     return {
+        "feature_version": FEATURE_SPEC_VERSION,
         "cycles": list(cycles),
         "ref_cycle": int(ref_cycle),
         "v_lo": float(v_lo),
@@ -324,7 +344,7 @@ def extract_cell(
         return result
 
     try:
-        v_ref, c_ref = batch.charge_curve(index, ref_cycle)
+        v_ref, c_ref = batch.discharge_curve(index, ref_cycle)
     except MatrTransportError:
         raise
     except MatrError as exc:
@@ -338,7 +358,7 @@ def extract_cell(
             )
             continue
         try:
-            voltage, capacity = batch.charge_curve(index, cycle)
+            voltage, capacity = batch.discharge_curve(index, cycle)
             feature = delta_q_features(
                 [(v_ref, c_ref), (voltage, capacity)], grid, reference_index=0
             )[0]
@@ -364,8 +384,9 @@ def _extract_one(
     index = int(meta["index"])
     # 先按字节区间把这一颗要用的曲线并发抓回，再逐条解析。
     # 不预取的话每条曲线两次往返，20 条就是 40 次。
+    # 三个通道都要：V 与 Qd 是曲线本身，I 用来切放电段（2026-10-25 的坑）。
     try:
-        batch.prefetch_cell(index, [ref_cycle, *cycles])
+        batch.prefetch_cell(index, [ref_cycle, *cycles], fields=("V", "Qd", "I"))
     except MatrTransportError:
         raise  # 预取阶段的网络失败同样不是数据问题，不能吞
     except MatrError:
@@ -595,6 +616,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--keep-parts", action="store_true", help="跑完保留分片目录（默认删除）"
     )
+    parser.add_argument(
+        "--no-check", action="store_true",
+        help="跳过后写的光滑性自检（不建议：那正是 2026-10-25 那个 bug 漏网的原因）",
+    )
     args = parser.parse_args(argv)
 
     from build_manifest import resolve_source
@@ -780,7 +805,8 @@ def main(argv: list[str] | None = None) -> int:
         "generated_by": "scripts/build_features.py",
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source_manifest": str(args.manifest),
-        "feature": "ΔQ(V) = Qc_k(V) − Qc_ref(V)，只用充电片段",
+        "feature": "ΔQ(V) = Qd_k(V) − Qd_ref(V)，只用放电片段（I<0）",
+        "feature_version": FEATURE_SPEC_VERSION,
         "label": "SOH_k = QD_k / QD_ref",
         "voltage_grid": {"v_lo": args.v_lo, "v_hi": args.v_hi, "n_points": args.points},
         "cycles": {
@@ -813,6 +839,40 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {count:>5} 条  {reason}")
     print(f"写入 {args.out}")
     print(f"规格 {spec_path}")
+
+    # 写完立刻自检：ΔQ(V) 必须是光滑的。这一步不是可选的便利设施——
+    # 2026-10-25 之前没有任何检查看过特征的光滑性，于是「把整条循环喂给
+    # delta_q_curve」这个错跑了整整四个里程碑，指标全部正常，只有总变差
+    # 能指出数据是错的（实测 TV/幅度 86 vs 正确的 5.9）。
+    if not args.no_check:
+        report = check_feature_table(args.out, top=5)
+        ratio = report["tv_ratio_median"]
+        print(f"光滑性自检：TV/幅度 中位数 {ratio:.2f}，"
+              f"最大 {report['tv_ratio_max']:.2f}，"
+              f"超限 {report['n_over_limit']}/{report['n_rows']} 行，"
+              f"参考循环行 {report['n_reference_rows']}（ΔQ ≡ 0，不计入比值）")
+        if report["too_many_zero_rows"]:
+            print(
+                f"整表退化成全零：{report['n_reference_rows']} 行零而只有 "
+                f"{report['n_cells']} 颗电池。TV/幅度 对全零行算不出比值，"
+                "这种表会静默通过检查，所以单独拦。",
+                file=sys.stderr,
+            )
+            return 1
+        if report["n_over_limit"]:
+            print(
+                "特征表不够光滑——这不是精度问题，是插值链上把不相干的点"
+                "配到了一起。先查分段（MATR 每个循环含充电+放电两段），"
+                "再查电压网格是否落在数据值域内。",
+                file=sys.stderr,
+            )
+            for row in report["worst"]:
+                print(f"    {row['cell_id']} 循环 {row['cycle']}: "
+                      f"TV/幅度 = {row['tv_ratio']:.1f}", file=sys.stderr)
+            return 1
+    else:
+        print("光滑性自检已按 --no-check 跳过（不建议）")
+
     if args.keep_parts:
         print(f"分片保留在 {parts}")
     else:

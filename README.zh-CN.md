@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-452%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-653-blue)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -27,6 +27,15 @@
 > 还差 34.7%**。ε 不是自由变量：q=0.5、600 步之下 nm=1 对应 ε=152.31，所以 DOD 字面
 > 写的「noise=1.0 处 ε ≤ 8」在本协议下结构上不可达。
 > 表里每个数都由 CI 从 `results/*.json` 重新生成，手改不了。
+>
+> **M5（当前）查出一个让这些数字失效的数据缺陷。** 特征提取把**整条循环**
+> （充电 + 放电）喂给了按电压排序的插值器，于是放电段（它的 `Qc` 通道是常数）
+> 被打散进充电段的电压区间。真实数据实测：总变差 269.60，正确管道 0.21，与
+> 真值 ΔQ(V) 的**相关系数 −0.019**。上面那张表就是在这张坏表上算出来的，正在
+> 重建（`scripts/check_features.py` 现在把每次构建卡在 TV/幅度 ≤ 20，且把
+> 提取算法版本写进了续跑指纹，旧分片无法被静默复用）。方法学结论——训练量口径、
+> seed 噪声量级、ε 的推导、稳定性 ≠ 正确性——不受影响；每个 MAE 待复核。
+> 详见 `docs/report.md` §0。
 
 ---
 
@@ -56,6 +65,14 @@
 | **`src/flsoh/data.py`** | 特征表读写、按客户端的 DataLoader，以及把「不许全局标准化」从注释变成断言的 `LocalStandardizer` |
 | **`src/flsoh/app/`** | Flower 1.41 客户端/服务端 App（`ClientApp` + `@app.train()` + `flwr.serverapp.strategy`） |
 | **`src/flsoh/dp.py`** | Opacus DP-SGD 包装。会计器**每客户端一个、绝不乘 N**（联合机制是乘积，`ε_joint = max_i ε_i`），而且必须跨轮存活，否则 ε 少算 100 倍 |
+| **`src/flsoh/schema.py`** | Schema v1——手机 App 与联邦仿真之间唯一的契约。纯标准库。`session_fingerprint` 覆盖整条会话而不是只覆盖 ID：App 重装后 ID 会重复，内容却不同 |
+| **`src/flsoh/segments.py`** | App 侧路径：原始采样记录 → 放电段 → (V, Q) 对，然后直接进 `delta_q_curve`——就是 `build_features.py` 调用的同一个函数（plan §8.2） |
+| **`src/flsoh/simulate.py`** | 带**真值**的模拟 App 会话。物理模型刻意简单（OCV 幂律、内阻压降、√ 衰减）——它的用途是检验管道，不是证明方法 |
+| **`src/flsoh/ingest.py`** | 校验 → 去重 → 组装。去重按**内容指纹**而不是 session ID：重装 App 后 ID 会复用 |
+| **`scripts/check_features.py`** | 本该拦住 2026-10-25 那个特征 bug 的闸门：逐行算总变差 / 幅度。正确数据 5.9，错配数据 122.4 |
+| **`scripts/simulate_sessions.py`** | 产出 Schema v1 JSONL 与真值。**自己的输出也过一遍 schema 校验**——模拟数据不享受豁免 |
+| **`scripts/run_e2e.py`** | 端到端：会话 → 入库 → 特征 → 光滑性闸门 → 划分 → 联邦训练 → 结果 JSON。五道闸门各有非零退出码，并把常数基线一起报出来——只报 MAE 是不可判读的 |
+| **`scripts/check_schema.py`** | 按 Schema v1 校验 JSONL 会话转储。坏会话退 1、输入解析不了退 2，绝不静默跳过 |
 | **`scripts/check_dp_budget.py`** | 在扫 `noise_multiplier` **之前**把 ε 算出来。ε 不是自由变量：q 与步数由协议钉死，本协议下 nm=1 对应 ε=152.31 |
 | **`scripts/check_continuations.py`** | 用四条独立证据证明批次 2 的 5 颗是批次 1 的延续段。配错一对就会静默删掉正常电池 |
 | **`scripts/build_manifest.py`** | **从数据**生成 `cells.txt` / `manifest.json`，让 `P-UNKNOWN` 不可能对着虚构 ID 说 PASS |
@@ -64,7 +81,7 @@
 | **`scripts/check_protocol.py`** | 在烧掉 GPU 小时之前先校验实验矩阵 |
 | **`scripts/run_local_baseline.py`** | C0（中心化上限）与 C1（本地独立下限）基线——不需要联邦运行时 |
 | **`configs/mvp.toml`、`configs/full.toml`、`configs/dp.toml`** | 机器可读的实验矩阵：MIT-Stanford 135 颗电池、留出 20 颗、k ∈ {2, 5}、α 扫描、DP 扫描 |
-| **`tests/`** | 452 条测试。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
+| **`tests/`** | 25 个文件、653 个测试函数。每个检查器都验证过它在坏输入上**确实会失败**——永远只打印 PASS 的检查器比没有检查器更糟 |
 
 ## 快速开始
 
@@ -241,6 +258,7 @@ Windows 上请用 **Python 3.11 或 3.12**：`flwr[simulation]==1.41.0` 硬钉
 ## 文档
 
 - **执行方案（v2.1）** — [`docs/plan.md`](./docs/plan.md)，主文档
+- **报告** — [`docs/report.md`](./docs/report.md)：威胁模型、实验协议、主结果，以及模拟与部署的差距（已量化：2 mV 电压噪声吃掉 ΔQ 幅度的 46.6%，而 10 s 采样本身只损失 5.6%）
 - **§3.4 API 实测校准** — 对照安装的 `flwr` 1.41.0 逐项核对的结果，含发现的两处差异
 - **v1 归档** — [`docs/archive/plan-v1.md`](./docs/archive/plan-v1.md)，保留用于对比
 - **里程碑备忘** — `docs/memo-m2.md`（H1–H3）、`docs/memo-m3.md`（偏斜扫描 + FedAdam）、`docs/memo-m4.md`（本地 DP）
@@ -257,10 +275,15 @@ Windows 上请用 **Python 3.11 或 3.12**：`flwr[simulation]==1.41.0` 硬钉
 2. **没有运行结果就没有数字。** §10.2 的结果表由脚本从 `results/*.json` 重算、CI 逐字核对；没有 run 就没有行，手改一个数字就红。
 
 ```bash
-python3 -m pytest tests -v        # 纯标准库，CI 里跑的就是这些
-pip install -e ".[train,dev]"     # 装 torch/flwr 后才能跑另外 112 条
-python3 -m pytest tests -v        # 全部 452 条
+python3 -m pytest tests -v        # 纯标准库，CI 里跑的就是这些（默认 job 不装 numpy/flwr）
+pip install -e ".[train,dev]"     # 装 torch/flwr 后才能跑其余部分
+python3 -m pytest tests -v        # 全部
 ```
+
+徽章数的是**仓库里定义的测试函数个数**，不是某一次运行的结果——`pytest`
+报出来的数量取决于恰好装了哪些可选依赖（裸 Python 约收集 300 条，全依赖
+约 490 条）。`tests/test_readme_badge.py` 会重新静态清点一遍，徽章数字
+漂了就让 CI 红。
 
 ## 许可证
 

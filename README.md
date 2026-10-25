@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-452%20passed-brightgreen)](./tests)
+[![Tests](https://img.shields.io/badge/tests-653-blue)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -36,6 +36,19 @@
 > noise=1.0" is structurally unreachable under this protocol.
 > Every number in the table is regenerated from `results/*.json` by CI,
 > so nothing in it can be hand-edited.
+>
+> **M5 (current) found a data defect that invalidates those numbers.** The
+> feature extractor was feeding the **whole cycle** (charge + discharge) into
+> the voltage-sorted interpolator, so the discharge segment — whose `Qc` channel
+> is constant — was scattered into the charge segment's voltage range. Measured
+> on real data: total variation 269.60 vs 0.21 for the correct pipeline, and a
+> correlation of **−0.019** with the true ΔQ(V). The table above was computed on
+> that broken table. It is being rebuilt (`scripts/check_features.py` now gates
+> every build at TV/amplitude ≤ 20, and the extraction version is part of the
+> resume fingerprint so old shards cannot be silently reused). Methodology
+> conclusions — training-budget accounting, seed-noise magnitude, the ε
+> derivation, "stability ≠ correctness" — are unaffected; every MAE is pending
+> re-verification. See `docs/report.md` §0.
 
 ---
 
@@ -64,15 +77,23 @@ So this repo treats the *checkers* as the deliverable, not the training loop.
 | **`src/flsoh/data.py`** | Feature-table I/O, per-client loaders, and the `LocalStandardizer` that makes "no global normalization" an assertion rather than a comment |
 | **`src/flsoh/app/`** | Flower 1.41 client/server apps (`ClientApp` + `@app.train()` + `flwr.serverapp.strategy`) |
 | **`src/flsoh/dp.py`** | Opacus DP-SGD wrapper. One accountant **per client**, never multiplied by N (the joint mechanism is a product, so `ε_joint = max_i ε_i`) — and the accountant must outlive the rounds, or ε is undercounted 100× |
+| **`src/flsoh/schema.py`** | Schema v1, the only contract between the phone app and the simulation. Pure standard library. `session_fingerprint` hashes the whole session, not its ID — a reinstalled app reuses IDs |
+| **`src/flsoh/segments.py`** | The app-side path: raw records → discharge segments → (V, Q) pairs, then straight into `delta_q_curve` — the same function `build_features.py` calls, per plan §8.2 |
+| **`src/flsoh/simulate.py`** | Synthetic app sessions with **ground truth**. Deliberately simple physics (OCV power law, IR sag, √-fade) — its job is to exercise the pipeline, not to prove the method |
+| **`src/flsoh/ingest.py`** | Validate → deduplicate → assemble. Deduplication is by **content fingerprint**, not session ID: a reinstalled app reuses IDs |
+| **`scripts/check_features.py`** | The gate that would have caught the 2026-10-25 feature bug: per-row total variation / amplitude. Correct data scores 5.9, mis-paired points score 122.4 |
+| **`scripts/simulate_sessions.py`** | Emits Schema v1 JSONL + a truth file. Validates its own output against the schema — synthetic data does not get a pass |
+| **`scripts/run_e2e.py`** | End-to-end: sessions → ingest → features → smoothness gate → split → federated training → results JSON. Five gates, each with a non-zero exit code. Reports a constant baseline alongside MAE, because MAE alone is unreadable |
+| **`scripts/check_schema.py`** | Validates a JSONL session dump against Schema v1. Exit 1 for a bad session, 2 for unparseable input — never a silent skip |
 | **`scripts/check_dp_budget.py`** | Computes ε **before** you sweep `noise_multiplier`. ε is not a free variable: `q` and the step count are fixed by the protocol, and nm=1 lands at ε=152.31 here |
 | **`scripts/check_continuations.py`** | Proves that 5 batch-2 cells are continuations of 5 batch-1 cells, using four independent lines of evidence. Wrong pairing would delete healthy cells invisibly |
 | **`scripts/build_manifest.py`** | Generates `cells.txt` / `manifest.json` **from the data**, so `P-UNKNOWN` cannot pass against an invented ID list |
-| **`scripts/build_features.py`** | Builds the per-cycle ΔQ(V) feature table, **resumably** — one parquet part per cell, so an interrupted run resumes instead of restarting. Records every dropped curve in `features.spec.json` |
+| **`scripts/build_features.py`** | Builds the per-cycle ΔQ(V) feature table, **one parquet part per cell** — an interrupted run resumes instead of restarting. Records every dropped curve in `features.spec.json` |
 | **`scripts/check_partition.py`** | Audits a partition file for cross-client leakage, test-set contamination, empty clients |
 | **`scripts/check_protocol.py`** | Audits a TOML matrix before you burn GPU-hours on it |
 | **`scripts/run_local_baseline.py`** | C0 (centralized ceiling) and C1 (local-only floor) baselines — no federated runtime needed |
 | **`configs/mvp.toml`, `configs/full.toml`, `configs/dp.toml`** | The machine-readable experiment matrix: 135 MIT-Stanford cells, 20 held out, k ∈ {2, 5}, α scan, DP scan |
-| **`tests/`** | 452 tests. Every checker is proven to *fail* on a broken input — a checker that only ever prints PASS is worse than none |
+| **`tests/`** | 653 test functions across 25 files. Every checker is proven to *fail* on a broken input — a checker that only ever prints PASS is worse than none |
 
 ## Quick start
 
@@ -262,6 +283,7 @@ On Windows, use **Python 3.11 or 3.12**: `flwr[simulation]==1.41.0` pins
 ## Documentation
 
 - **Execution plan (v2.1)** — [`docs/plan.md`](./docs/plan.md), the primary document
+- **Report** — [`docs/report.md`](./docs/report.md): threat model, protocol, results, and the simulated-vs-deployed gap (quantified: 2 mV of voltage noise costs 46.6% of the ΔQ amplitude, vs 5.6% for 10 s sampling alone)
 - **§3.4 API calibration** — what was verified against the installed `flwr` 1.41.0, including the two discrepancies found
 - **v1 archive** — [`docs/archive/plan-v1.md`](./docs/archive/plan-v1.md), kept for diffing
 - **Milestone memos** — `docs/memo-m2.md` (H1–H3), `docs/memo-m3.md` (skew sweep + FedAdam), `docs/memo-m4.md` (local DP)
@@ -276,10 +298,16 @@ Contributions are welcome, with two rules that are not negotiable:
 2. **No numbers without runs.** §10.2 stays `—` until `results/*.json` exists.
 
 ```bash
-python3 -m pytest tests -v        # stdlib-only, runs in CI
-pip install -e ".[train,dev]"     # for the torch/flwr tests
-python3 -m pytest tests -v        # all 452
+python3 -m pytest tests -v        # stdlib-only: the default CI job (no numpy/flwr installed)
+pip install -e ".[train,dev]"     # for the torch/flwr/numpy tests
+python3 -m pytest tests -v        # everything
 ```
+
+The badge counts **test functions in the repo**, not a run — the number
+`pytest` reports depends on which optional dependencies happen to be
+installed (a bare Python collects ~300, a full install ~490). A test
+(`tests/test_readme_badge.py`) recomputes the static count and fails if the
+badge drifts.
 
 ## License
 

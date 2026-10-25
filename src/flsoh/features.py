@@ -140,13 +140,105 @@ class FeatureTable:
 # ΔQ(V) 特征
 # ---------------------------------------------------------------------------
 
+#: MATR 每个循环的数组里同时含充电段与放电段，按电流符号分段。负 = 放电。
+DISCHARGE_SIGN = -1.0
+#: 正 = 充电。两个符号都导出，让调用方写 ``sign=CHARGE_SIGN`` 而不是 ``+1.0``。
+CHARGE_SIGN = +1.0
+#: |I| 低于这个值视为停顿，不属于任何一段。
+SEGMENT_REST_THRESHOLD_A = 0.05
+
+#: 特征**语义**的版本号。改动「怎么从原始曲线算出这一行」就必须改它。
+#:
+#: 为什么需要它：``build_features.py`` 的分片续跑靠规格指纹（循环区间、
+#: 参考循环、电压网格）判断「已跑的分片能不能用」。但指纹只描述**要算什么**，
+#: 不描述**怎么算**。2026-10-25 修掉「整条循环喂进插值」那个 bug 时，指纹
+#: 完全没变——于是重跑同一条命令会把旧的错分片当成有效数据全部跳过，
+#: 新表里一行新数据都没有，而脚本打印「全部有分片」、退出码 0。
+#:
+#: 这正是指纹机制本来要防的那类错误（新旧行的同一列不是同一个物理量），
+#: 只是方向换了一下：不是参数变了语义没变，而是参数没变语义变了。
+#:
+#: 取值规则：改 ``segment_capacity_curve`` / ``delta_q_curve`` 的任何语义
+#: （分段依据、去重策略、插值方式）都必须加一个版本，不要复用旧值。
+FEATURE_SPEC_VERSION = "discharge-v2"
+
+
+def segment_capacity_curve(
+    voltage: np.ndarray,
+    capacity: np.ndarray,
+    current: np.ndarray,
+    *,
+    sign: float = DISCHARGE_SIGN,
+    rest_threshold_a: float = SEGMENT_REST_THRESHOLD_A,
+) -> tuple[np.ndarray, np.ndarray]:
+    """从一整条循环里取出某一段的 (V, Q)，并整理成可插值的形式。
+
+    **为什么必须有这一步**：MATR 的每个循环数组是「充电段 + 放电段」拼起来
+    的——充电段电流为正、容量通道 ``Qc`` 从 0 累积到满容量；放电段电流为负、
+    ``Qc`` 恒定不再累积（放电容量在 ``Qd`` 里）。
+
+    ``delta_q_curve`` 内部按电压排序后插值。如果把**整条循环**喂进去，放电段
+    会被排进充电段的电压区间：低电压区于是冒出一片「容量 = 满容量」的平台，
+    而那里本该是充电曲线的陡坡。实测（b1c0 循环 1，1087 点，见
+    ``tests/fixtures/matr_c0_cyc1_*.npy``）：
+
+    ==================== ======= ====== ========
+    喂给 ``delta_q_curve``  TV     std    与正确值相关
+    ==================== ======= ====== ========
+    整条循环（曾经的代码） 269.60  0.3918   −0.019
+    仅放电段（本函数）       0.21  0.0026    —
+    ==================== ======= ====== ========
+
+    TV 差 1280 倍，而两者**相关系数只有 −0.02**——也就是说曾经的「ΔQ 特征」
+    和真正的 ΔQ 特征基本是两套不相干的数据，而它的形状、长度、数值范围全都
+    正常，指标照样算得出来。
+
+    返回的 ``voltage`` 已按升序排好且**去重**（同一电压保留最后一个容量）：
+    ``np.interp`` 对重复 x 的取值取决于排序稳定性，不值得把特征正确性押在
+    上面。
+    """
+    voltage = np.asarray(voltage, dtype=float)
+    capacity = np.asarray(capacity, dtype=float)
+    current = np.asarray(current, dtype=float)
+    if not (voltage.shape == capacity.shape == current.shape):
+        raise DataContractError(
+            f"voltage / capacity / current 长度不一致："
+            f"{voltage.shape} / {capacity.shape} / {current.shape}"
+        )
+    mask = current * sign > rest_threshold_a
+    if int(mask.sum()) < 2:
+        raise DataContractError(
+            f"按电流符号 sign={sign} 只切出 {int(mask.sum())} 个点，不够构造曲线"
+        )
+    v = voltage[mask]
+    q = capacity[mask]
+    order = np.argsort(v, kind="stable")
+    v, q = v[order], q[order]
+    # 去重：同一电压保留最后一个容量（np.interp 对重复 x 的实际行为）
+    keep = np.concatenate([np.diff(v) != 0, [True]])
+    return v[keep], q[keep]
+
+
+def curve_total_variation(curve: np.ndarray) -> float:
+    """一条 Q(V) 曲线的总变差。
+
+    这是**特征表的健康检查量**，不是建模用的量：真实 ΔQ(V) 是两条光滑 Q(V)
+    之差，总变差与曲线幅度同量级（实测放电段 ΔQ 为 0.21，幅度 0.031）。
+    数值大出两个量级，说明插值链上某处把不相干的点配到了一起——这类错误
+    不抛异常，只体现在「数字有点怪」上，所以必须有一个能算出来的判据。
+    """
+    curve = np.asarray(curve, dtype=float)
+    if curve.size < 2:
+        raise DataContractError("总变差至少需要 2 个点")
+    return float(np.abs(np.diff(curve)).sum())
+
 
 def delta_q_curve(
     voltage: np.ndarray,
     capacity: np.ndarray,
     v_grid: np.ndarray,
 ) -> np.ndarray:
-    """把一次放电的 (V, Q) 插值到固定电压网格上，得到 Q(V)。
+    """把一次**放电**的 (V, Q) 插值到固定电压网格上，得到 Q(V)。
 
     Severson et al. 2019 的特征构造方式：放电容量对电压作图，在统一网格上
     重采样，使得不同电池、不同循环长度可以逐点相减。
@@ -154,6 +246,11 @@ def delta_q_curve(
     ``voltage`` 必须单调（升或降都可以，内部会排序）。``v_grid`` 必须落在
     ``voltage`` 的值域内，否则线性外延会产生没有物理意义的值——这里直接抛错，
     不外延。
+
+    **为什么是放电而不是充电**：恒压充电段里 V 几乎不变而容量猛涨，dQ/dV
+    趋于无穷，均匀电压网格在那里会把 0.1 Ah 的容量变化压进一两个网格点，
+    插值结果出现 ~1 Ah 的跳变（实测 b1c0 充电段最大相邻跳变 1.118 Ah，
+    放电段 0.013 Ah）。喂进来之前先用 :func:`segment_capacity_curve` 分段。
     """
     voltage = np.asarray(voltage, dtype=float)
     capacity = np.asarray(capacity, dtype=float)

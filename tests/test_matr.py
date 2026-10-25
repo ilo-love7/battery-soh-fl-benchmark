@@ -81,14 +81,36 @@ def write_fake_matr(
             summary_refs.append(summary.ref)
 
             cycles = h5.create_group(f"/fake/c{i}/cycles")
-            v_refs, q_refs = [], []
+            # 每个循环写成一整条「充电 + 放电」，与真实 MATR 同构：
+            # 充电段 I>0、Qc 从 0 累积到 base；放电段 I<0、Qc 恒定、
+            # Qd 从 0 累积到 base。**必须同构**——2026-10-25 那个 bug 的
+            # 前提就是「循环数组里有两段」，只有一段的假数据测不出分段逻辑。
+            half = n_points // 2
+            v_refs, q_refs, d_refs, i_refs = [], [], [], []
             for k in range(n_cycles):
-                voltage = np.linspace(3.0, 3.6, n_points)
-                capacity = np.linspace(0.0, float(base[k]), n_points)
+                v_chg = np.linspace(2.0, 3.6, half)
+                v_dis = np.linspace(3.6, 2.0, n_points - half)
+                qc = np.concatenate([
+                    np.linspace(0.0, float(base[k]), half),
+                    np.full(n_points - half, float(base[k])),
+                ])
+                qd = np.concatenate([
+                    np.zeros(half),
+                    np.linspace(0.0, float(base[k]), n_points - half),
+                ])
+                cur = np.concatenate([
+                    np.full(half, 1.0),
+                    np.full(n_points - half, -4.0),
+                ])
+                voltage = np.concatenate([v_chg, v_dis])
                 v_refs.append(h5.create_dataset(f"/fake/c{i}/v{k}", data=voltage).ref)
-                q_refs.append(h5.create_dataset(f"/fake/c{i}/q{k}", data=capacity).ref)
+                q_refs.append(h5.create_dataset(f"/fake/c{i}/q{k}", data=qc).ref)
+                d_refs.append(h5.create_dataset(f"/fake/c{i}/d{k}", data=qd).ref)
+                i_refs.append(h5.create_dataset(f"/fake/c{i}/i{k}", data=cur).ref)
             cycles.create_dataset("V", data=_ref_column(v_refs))
             cycles.create_dataset("Qc", data=_ref_column(q_refs))
+            cycles.create_dataset("Qd", data=_ref_column(d_refs))
+            cycles.create_dataset("I", data=_ref_column(i_refs))
             cycles_refs.append(cycles.ref)
 
             life_refs.append(
@@ -158,12 +180,79 @@ class TestMatrBatch:
             assert summary["QDischarge"][-1] < summary["QDischarge"][0]
 
     def test_curve_roundtrip(self, fake_mat):
+        """``curve()`` 返回**整条循环**（原始通道），这是分段的输入。"""
         with MatrBatch(fake_mat) as batch:
-            voltage, capacity = batch.charge_curve(2, 3)
+            voltage, capacity, current = (
+                batch.curve(2, 3, "V"), batch.curve(2, 3, "Qc"), batch.curve(2, 3, "I")
+            )
             assert voltage.shape == (32,)
             assert capacity.shape == (32,)
-            assert voltage[0] == pytest.approx(3.0)
-            assert voltage[-1] == pytest.approx(3.6)
+            assert current.shape == (32,)
+            # 整条循环：电压先升（充电）后降（放电）
+            assert voltage[0] == pytest.approx(2.0)
+            assert voltage[15] == pytest.approx(3.6)
+            assert voltage[-1] == pytest.approx(2.0)
+            assert (current[:16] > 0).all() and (current[16:] < 0).all()
+
+    def test_discharge_curve_takes_only_the_discharge_segment(self, fake_mat):
+        """``discharge_curve`` 必须只取 ``I<0`` 的那半段。
+
+        这是 2026-10-25 那个 bug 的守门测试：曾经 ``charge_curve`` 返回整条
+        循环，``delta_q_curve`` 的 ``argsort`` 于是把放电段排进低电压区，
+        而放电段的 ``Qc`` 是常数——插出来的「ΔQ」总变差 269.6，正确值 0.21，
+        两者相关系数 −0.02。
+
+        注意返回的 V 是**升序**的（``segment_capacity_curve`` 排过）：断言不写
+        「单调下降」，那按的是原始时间顺序，不是这个函数的契约。
+        """
+        with MatrBatch(fake_mat) as batch:
+            v, q = batch.discharge_curve(2, 3)
+            assert v.shape == (16,)                  # 只有 I<0 的半段
+            assert (np.diff(v) > 0).all()            # 已按升序排好
+            # 升序后：低压端是放电末尾（Qd 已充满），高压端是放电起点（Qd=0）
+            assert q[0] > 0 and q[-1] == pytest.approx(0.0)
+
+    def test_charge_curve_takes_only_the_charge_segment(self, fake_mat):
+        with MatrBatch(fake_mat) as batch:
+            v, q = batch.charge_curve(2, 3)
+            assert v.shape == (16,)                  # 只有 I>0 的半段
+            assert (np.diff(v) > 0).all()
+            # 升序后：低压端是充电起点（Qc=0），高压端是充电末尾（Qc 已充满）
+            assert q[0] == pytest.approx(0.0) and q[-1] > 0
+
+    def test_segment_curves_do_not_overlap(self, fake_mat):
+        """两段加起来必须恰好等于整条循环的点数——不重不漏。"""
+        with MatrBatch(fake_mat) as batch:
+            total = len(batch.curve(2, 3, "V"))
+            vc, _ = batch.charge_curve(2, 3)
+            vd, _ = batch.discharge_curve(2, 3)
+            assert len(vc) + len(vd) == total
+
+    def test_whole_cycle_is_not_a_valid_curve_input(self, fake_mat):
+        """把整条循环喂给 ``delta_q_curve`` 必须被总变差判据抓住。
+
+        这条是那个 bug 的**回归测试**：不 mock 任何东西，就用假 MATR 的同构
+        数据，走一遍真实调用链。分段后 TV/幅度约 2（合成数据是线性的，所以
+        比真实数据还小），不分段则大两个量级以上。
+        """
+        from flsoh.features import curve_total_variation, delta_q_curve, make_v_grid
+
+        grid = make_v_grid(2.05, 3.55, 200)
+        with MatrBatch(fake_mat) as batch:
+            seg_ref = batch.discharge_curve(0, 1)
+            seg_cur = batch.discharge_curve(0, 5)
+            whole_ref = (batch.curve(0, 1, "V"), batch.curve(0, 1, "Qd"))
+            whole_cur = (batch.curve(0, 5, "V"), batch.curve(0, 5, "Qd"))
+
+        def _tv_ratio(ref, cur):
+            d = delta_q_curve(*cur, grid) - delta_q_curve(*ref, grid)
+            span = float(d.max() - d.min())
+            return curve_total_variation(d) / span if span > 0 else float("inf")
+
+        good = _tv_ratio(seg_ref, seg_cur)
+        bad = _tv_ratio(whole_ref, whole_cur)
+        assert good < 20.0, f"分段后的 TV/幅度 = {good:.1f}，本应远小于 20"
+        assert bad > 5 * good, f"不分段 TV/幅度 {bad:.1f} 没有显著大于 {good:.1f}"
 
     def test_batch_no_inferred_from_date(self, fake_mat):
         with MatrBatch(fake_mat) as batch:
