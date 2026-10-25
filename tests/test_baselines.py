@@ -14,7 +14,9 @@ np = pytest.importorskip("numpy", reason="baselines 需要 numpy")
 
 from flsoh.baselines import (  # noqa: E402
     amplitude,
+    error_decomposition,
     feature_ladder,
+    label_spread,
     ladder_note,
     ladder_verdict,
     ridge_predict,
@@ -295,18 +297,147 @@ class TestLadderVerdict:
         assert "信息在形状里" in v
 
     def test_real_data_case_neither_view_alone(self):
-        """真实 MATR：幅度 1.174、形状 2.099，都不如常数；全量 0.361。
+        """真实 MATR（5 种子中位）：幅度 1.28、形状 1.52，都不如常数；全量 0.31。
 
         这一格最容易被读错——两个单视图都失败，但特征其实很有用。
         """
-        v = ladder_verdict(self._ladder(constant=0.00179, amplitude=0.00210,
-                                        all_features=0.00065, shape_only=0.00376))
+        v = ladder_verdict(self._ladder(constant=0.00205, amplitude=0.00271,
+                                        all_features=0.00064, shape_only=0.00312))
         assert "任何一个一维摘要都不够" in v
         assert "组合" in v
-        assert "3.23" in v
+        assert "4.23" in v
         assert "唯一载体" not in v
 
     def test_no_signal_at_all(self):
         v = ladder_verdict(self._ladder(constant=1.0, amplitude=1.1,
                                         all_features=1.2, shape_only=1.3))
         assert "没有可用信号" in v
+
+
+class TestLabelSpread:
+    """标签的组间/组内拆分。
+
+    这个函数的用途是**阻止一种误读**：「全部特征比常数基线好 3 倍」在组内
+    标签几乎不动时，只能说明模型估出了「这颗电池的水平」，不能说明它跟住了
+    「它现在衰减到哪」。所以测试要钉住三件事：组间/组内分别算什么、方差占比
+    在不等长分组下也用 ANOVA 口径、单行分组不会把组内离散度算成 0。
+    """
+
+    def test_between_and_within_are_separated(self):
+        # 两组：A 恒为 1.0，B 恒为 3.0 → 全部方差在组间，组内为 0
+        y = np.array([1.0, 1.0, 1.0, 3.0, 3.0, 3.0])
+        g = np.array(["a", "a", "a", "b", "b", "b"])
+        got = label_spread(y, g)
+        assert got["n_groups"] == 2
+        assert got["between_std"] == pytest.approx(1.0)
+        assert got["within_std_median"] == pytest.approx(0.0)
+        assert got["var_fraction_between"] == pytest.approx(1.0)
+
+    def test_within_only(self):
+        # 两组的均值相同 → 组间为 0，方差全在组内
+        y = np.array([0.0, 2.0, 0.0, 2.0])
+        g = np.array(["a", "a", "b", "b"])
+        got = label_spread(y, g)
+        assert got["between_std"] == pytest.approx(0.0)
+        assert got["within_std_median"] == pytest.approx(1.0)
+        assert got["var_fraction_between"] == pytest.approx(0.0)
+
+    def test_between_std_is_size_weighted_not_plain_mean_std(self):
+        """``between_std`` 用 ``sqrt(SS_between/n)``，不是「组均值的无加权 std」。
+
+        不等长分组下两者不等：``--test-cells`` 会造出不等长，用无加权版本会
+        把只有一行的电池放大成一个完整分组。
+        """
+        y = np.array([0.0, 0.0, 0.0, 10.0])
+        g = np.array(["a", "a", "a", "b"])
+        got = label_spread(y, g)
+        # 组均值的无加权 std = std([0, 10]) = 5
+        assert np.std([y[g == "a"].mean(), y[g == "b"].mean()]) == pytest.approx(5.0)
+        assert got["between_std"] == pytest.approx(np.sqrt(18.75))
+        assert got["between_std"] < 5.0
+        # 但方差占比仍然等于 between_std² / 全局方差（同一个 SS 口径）
+        assert got["var_fraction_between"] == pytest.approx(
+            got["between_std"] ** 2 / y.var()
+        )
+
+    def test_singleton_group_does_not_fake_zero_within(self):
+        """一颗只有一行的电池不能把组内 std 拉成 0——它没有组内可言。"""
+        y = np.array([1.0, 1.1, 1.2, 5.0])
+        g = np.array(["a", "a", "a", "b"])
+        got = label_spread(y, g)
+        assert got["within_std_median"] > 0.0
+        assert got["within_std_median"] == pytest.approx(np.std([1.0, 1.1, 1.2]))
+
+    def test_rejects_single_group(self):
+        with pytest.raises(ValueError, match="两个分组"):
+            label_spread(np.array([1.0, 2.0]), np.array(["a", "a"]))
+
+    def test_rejects_all_singletons(self):
+        with pytest.raises(ValueError, match="组内离散度无定义"):
+            label_spread(np.array([1.0, 2.0]), np.array(["a", "b"]))
+
+    def test_length_mismatch(self):
+        with pytest.raises(ValueError, match="groups"):
+            label_spread(np.array([1.0, 2.0]), np.array(["a"]))
+
+
+class TestErrorDecomposition:
+    """误差的组间/组内拆分。
+
+    关键性质：把每颗电池的预测整体加上一个常数，``between_rmse`` 变、
+    ``within_rmse`` 不变。这正是「估出水平」与「跟住变化」两件事的分界线。
+    """
+
+    def _data(self):
+        y = np.array([1.0, 2.0, 3.0, 10.0, 11.0, 12.0])
+        g = np.array(["a", "a", "a", "b", "b", "b"])
+        return y, g
+
+    def test_perfect_prediction(self):
+        y, g = self._data()
+        got = error_decomposition(y.copy(), y, g)
+        assert got["mae"] == pytest.approx(0.0)
+        assert got["between_rmse"] == pytest.approx(0.0)
+        assert got["within_rmse"] == pytest.approx(0.0)
+
+    def test_per_group_offset_only_hits_between(self):
+        """整颗偏一个常数：组间变差，组内完全不受影响。
+
+        ``between_rmse`` 是**跨分组**的 RMS（每组一个偏差，再取均方根），
+        不是行级 RMS——所以这里只有一组偏 4 时是 ``sqrt(16/2)``，不是 4。
+        """
+        y, g = self._data()
+        pred = y.copy()
+        pred[g == "b"] += 4.0
+        got = error_decomposition(pred, y, g)
+        assert got["within_rmse"] == pytest.approx(0.0)
+        assert got["between_rmse"] == pytest.approx(np.sqrt(8.0))
+        assert got["mae"] == pytest.approx(2.0)
+
+    def test_within_only_error_hits_within(self):
+        """每颗内部的残差均值为 0：组间看不出任何偏差，组内全是偏差。"""
+        y, g = self._data()
+        pred = y.copy()
+        pred[0] += 1.0
+        pred[1] -= 1.0
+        got = error_decomposition(pred, y, g)
+        assert got["between_rmse"] == pytest.approx(0.0)
+        assert got["within_rmse"] == pytest.approx(np.sqrt(2.0 / 6.0))
+
+    def test_constant_prediction_matches_hand_computation(self):
+        y, g = self._data()
+        got = error_decomposition(np.full(len(y), 6.5), y, g)
+        # 组均值 2 与 11 各偏 4.5
+        assert got["between_rmse"] == pytest.approx(4.5)
+        # 组内：残差 = y − 组均值，两组都是 [−1,0,1] → 平方和 2+2，除以 6 行
+        assert got["within_rmse"] == pytest.approx(np.sqrt(4.0 / 6.0))
+
+    def test_rejects_length_mismatch(self):
+        y, g = self._data()
+        with pytest.raises(ValueError, match="长度必须一致"):
+            error_decomposition(y[:5], y, g)
+
+    def test_rejects_single_group(self):
+        y, _ = self._data()
+        with pytest.raises(ValueError, match="两个分组"):
+            error_decomposition(y, y, np.array(["a"] * len(y)))

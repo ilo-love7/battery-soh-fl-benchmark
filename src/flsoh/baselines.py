@@ -11,12 +11,13 @@
 但常数基线是**最弱**的平凡基线，过了它不代表模型有用。真正的问题是：
 **1000 维神经网络，比「只拿一个标量（ΔQ 的幅度）」好多少？**
 
-模拟数据上的实测（24 颗 × 20 循环，留出 6 颗整颗测试）::
+模拟数据上的实测（24 颗 × 20 循环，留出 6 颗整颗测试，
+``results/e2e/e2e__sim__seed0.json``）::
 
-    常数基线                     MAE 0.02703
-    只用幅度（1 维岭回归）       MAE 0.00430   ← 最强平凡基线
-    全部 1000 维（岭回归）       MAE 0.00568
-    只用形状（归一化后 1000 维） MAE 0.05411   ← 比水平线还差
+    常数基线                     MAE 0.02638
+    只用幅度（1 维岭回归）       MAE 0.00350   ← 最强平凡基线
+    全部 1000 维（岭回归）       MAE 0.00605
+    只用形状（归一化后 1000 维） MAE 0.07209   ← 比水平线还差
     神经网络（run_e2e 默认设置） MAE 0.02289
 
 读法：**信号几乎全在幅度里**。1000 维模型打不过 1 维线性模型，而且归一化后
@@ -28,6 +29,11 @@
 的作用是**把 e2e 的指标放进可解释的位置**：它证明的是管道接对了，不是方法
 有效；而当 ``final_mae`` 明显大于 ``amplitude`` 那一格时，该查的是模型与训练
 设置，不是继续调数据。
+
+**真实 MATR 表上的结论是反的**，而且反得比「缺形状机制」更彻底：那里
+``amplitude`` 比常数基线还差（5 个划分种子下 1.09–1.32 倍），1000 维全量好
+2.4–3.4 倍。机制是幅度的跨电池离散度（33.8%）远大于标签的（0.5%）——幅度
+主要编码「这是哪颗电池」。所以别把这里的「1 维就够」当成数据的性质。
 
 ## 为什么是岭回归而不是别的
 
@@ -195,13 +201,104 @@ def feature_ladder(
     }
 
 
+def label_spread(labels: np.ndarray, groups: np.ndarray) -> dict:
+    """标签的**组间 / 组内**离散度。``groups`` 一般是 ``cell_id``。
+
+    为什么阶梯表必须配这一格：``all_features`` 比常数基线好 3 倍，这句话
+    本身不区分两种完全不同的能力——
+
+    - 估出**这颗电池**衰减得快不快（组间：同一颗的标签水平与全局均值之差）
+    - 跟住**这颗电池随循环**的变化（组内：同一颗内部随循环的移动）
+
+    真实 MATR 表（135 颗 × 循环 5..100 步长 5）上两者差一个数量级：组间 std
+    0.00486，组内 std 中位只有 0.00066。**九成标签方差在组间**，所以「好 3 倍」
+    基本只说明第一件事。不拆开就写「模型能跟踪老化」，是把没测过的事说成测过了。
+
+    ``var_fraction_between`` 用 ANOVA 的 ``SS_between / SS_total``（不等长分组
+    也成立）。注意它**恰好等于** ``between_std² / 全局方差``——因为
+    ``between_std`` 定义为 ``sqrt(SS_between / n)``。容易混的是「组均值的
+    **无加权** std」：那个量在不等长分组下会偏（小组被放大），所以这里不用它。
+    """
+    y = np.asarray(labels, dtype=float).ravel()
+    g = np.asarray(groups)
+    if len(y) != len(g):
+        raise ValueError(f"labels 有 {len(y)} 个而 groups 有 {len(g)} 个")
+    if len(y) == 0:
+        raise ValueError("labels 为空")
+    uniq = sorted(set(g.tolist()))
+    if len(uniq) < 2:
+        raise ValueError(f"至少需要两个分组才能谈组间/组内，收到 {len(uniq)} 个")
+
+    grand = y.mean()
+    ss_between = 0.0
+    ss_total = float(((y - grand) ** 2).sum())
+    within_stds = []
+    for key in uniq:
+        mask = g == key
+        block = y[mask]
+        ss_between += float(len(block) * (block.mean() - grand) ** 2)
+        if len(block) > 1:
+            # ddof=0：这是描述这批数据的离散度，不是估计总体参数
+            within_stds.append(float(block.std()))
+    if not within_stds:
+        raise ValueError("每个分组都只有一行，组内离散度无定义")
+
+    return {
+        "n_groups": len(uniq),
+        "n_rows": int(len(y)),
+        "between_std": float(np.sqrt(ss_between / len(y))),
+        "within_std_median": float(np.median(within_stds)),
+        "var_fraction_between": float(ss_between / ss_total) if ss_total > 0 else 0.0,
+    }
+
+
+def error_decomposition(pred: np.ndarray, labels: np.ndarray, groups: np.ndarray) -> dict:
+    """把预测误差拆成组间与组内两部分。
+
+    ``between_rmse``：每颗电池的**均值**估得准不准（同一颗内部的偏差先平均掉）
+    ``within_rmse``：同一颗内部**随循环的移动**估得准不准（每颗的偏差先减掉均值）
+
+    ``within_rmse`` 的下界是标签本身的组内 std（:func:`label_spread` 的
+    ``within_std_median``）：一份组内 std 只有 0.00076 的切片，``within_rmse``
+    再好也到不了 0，而「比 0.00076 大」说明模型根本没跟住循环间的变化。
+    """
+    p = np.asarray(pred, dtype=float).ravel()
+    y = np.asarray(labels, dtype=float).ravel()
+    g = np.asarray(groups)
+    if not (len(p) == len(y) == len(g)):
+        raise ValueError(
+            f"长度必须一致，收到 pred={len(p)} labels={len(y)} groups={len(g)}"
+        )
+    if len(y) == 0:
+        raise ValueError("输入为空")
+    uniq = sorted(set(g.tolist()))
+    if len(uniq) < 2:
+        raise ValueError(f"至少需要两个分组，收到 {len(uniq)} 个")
+
+    between_sq, within_sq, n_within = [], [], 0
+    for key in uniq:
+        mask = g == key
+        between_sq.append((y[mask].mean() - p[mask].mean()) ** 2)
+        residual = (y[mask] - p[mask]) - (y[mask] - p[mask]).mean()
+        within_sq.append(float((residual**2).sum()))
+        n_within += int(mask.sum())
+
+    return {
+        "mae": _mae(p, y),
+        "between_rmse": float(np.sqrt(np.mean(between_sq))),
+        # 用全部行数做分母（每颗内部的残差均值本来就为 0，不影响结果）
+        "within_rmse": float(np.sqrt(sum(within_sq) / n_within)),
+    }
+
+
 def ladder_verdict(ladder: dict) -> str:
     """把阶梯表读成一句话。**四种情形必须分开**，不能合并成「有没有信号」。
 
     上一版把 ``shape_only > constant`` 直接写成「形状里没有标签信息（幅度是
     唯一载体）」——在真实数据上这是**错的**：那里 ``amplitude`` 也比常数基线
-    差（1.17 倍），所以幅度不是载体；信息在幅度与形状的**组合**里（全量
-    0.36 倍）。两件事混成一句，就把一个反直觉的发现读成了「符合预期」。
+    差（五个划分种子下 1.09–1.32 倍），所以幅度不是载体；信息在幅度与形状的
+    **组合**里（全量 0.30–0.42 倍）。两件事混成一句，就把一个反直觉的发现读成
+    了「符合预期」。
     """
     amp_ok = ladder["amplitude"] < ladder["constant"]
     shape_ok = ladder["shape_only"] < ladder["constant"]
