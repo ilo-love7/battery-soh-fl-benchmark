@@ -219,6 +219,60 @@ class TestPaired:
         assert sr._paired(a, b) is None
 
 
+class TestSeedCvAdvice:
+    """CV 超标时的提示不能与 plan §11.3.1 的结论打架。
+
+    上一版的提示是「超标项需要加 seed 数」，而同一段输出紧接着就打印配对
+    比较。plan §11.3.1 已经算过加 seed 不划算（CV 16% 想分辨 5% 要 ~50 个，
+    4 配置 × 50 seed = 10–20 小时），最终选的是配对比较。按旧提示读，读者
+    会把一份已完成的判定当成待办。
+    """
+
+    def test_no_advice_when_all_within_threshold(self):
+        assert sr.seed_cv_advice([]) is None
+
+    def test_advice_points_to_paired_comparison(self):
+        text = sr.seed_cv_advice([("A C0 中心化", 14.3)])
+        assert "配对比较" in text
+        # 旧文案的断言式措辞必须消失：它把可选路径写成了强制动作
+        assert "需要加 seed 数" not in text
+
+    def test_advice_names_the_worst_offender(self):
+        text = sr.seed_cv_advice([("A C0", 14.3), ("D I1", 66.1), ("B C1", 28.0)])
+        assert "66.1%" in text and "D I1" in text
+        assert "3 个配置" in text
+
+    def test_report_flags_only_groups_over_ten_percent(self):
+        runs = [
+            # 稳定：0.0020 ± 0.00002 → CV ~1%
+            _run("centralized", s, 0.0020 + 0.00002 * (s % 3),
+                 n_clients=None, epochs=300, run_id=f"c0__centralized__seed{s}")
+            for s in range(3)
+        ] + [
+            # 抖动：0.0010 / 0.0016 / 0.0022 → CV ~37%
+            _run("fedavg", s, 0.0010 + 0.0006 * s, scheme="iid", le=3,
+                 run_id=f"fedavg__iid__seed{s}")
+            for s in range(3)
+        ]
+        groups = sr._group(runs)
+        codes = sr._codes(list(groups))
+        lines, bad = sr.seed_cv_report(groups, codes, lambda k: f"{codes[k]}")
+        assert len(lines) == 2
+        # 只有抖动那一组超标，且 CV 确实是 37% 那个量级（不是随手判的）
+        assert len(bad) == 1
+        assert bad[0][1] == pytest.approx(37.0, abs=2.0)
+        assert "只有 1 个 seed" not in "\n".join(lines)
+
+    def test_single_seed_group_is_not_judged(self):
+        runs = [_run("fedavg", 0, 0.0010, scheme="iid", le=3,
+                     run_id="fedavg__iid__seed0")]
+        groups = sr._group(runs)
+        codes = sr._codes(list(groups))
+        lines, bad = sr.seed_cv_report(groups, codes, lambda k: f"{codes[k]}")
+        assert bad == []
+        assert "只有 1 个 seed" in lines[0]
+
+
 def test_script_uses_only_stdlib():
     """CI 的 no-fabricated-results job 只装纯 Python。
 

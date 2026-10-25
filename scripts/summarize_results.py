@@ -310,6 +310,49 @@ def _by_seed(items: list[dict]) -> dict[int, float]:
     return {int(r.get("seed", -1)): r["final_mae"] for r in items}
 
 
+def seed_cv_report(
+    groups: dict, codes: dict, tag
+) -> tuple[list[str], list[tuple[str, float]]]:
+    """每个配置的 seed 相对标准差（CV）。返回（要打印的行，超标项）。"""
+    lines: list[str] = []
+    bad: list[tuple[str, float]] = []
+    for key, items in _sorted_groups(groups, codes):
+        maes = [r["final_mae"] for r in items]
+        if len(maes) < 2:
+            lines.append(f"  {tag(key)}: 只有 {len(maes)} 个 seed，无法评估波动")
+            continue
+        mean = statistics.mean(maes)
+        cv = statistics.stdev(maes) / mean * 100 if mean else float("inf")
+        lines.append(f"  {tag(key)}: {cv:.1f}%  {'OK' if cv < 10 else '**超标**'}")
+        if cv >= 10:
+            bad.append((tag(key), cv))
+    return lines, bad
+
+
+def seed_cv_advice(bad: list[tuple[str, float]]) -> str | None:
+    """CV 超标时该怎么读——**不是**「回去加 seed」。
+
+    这条提示上一版写的是「超标项需要加 seed 数」。那句话单独看没错（plan
+    §11.3 的判据表就是这么写的），但它与 plan §11.3.1 的结论矛盾：那里已经
+    算过，按 CV=16%、想分辨 5% 要 ~50 个 seed，4 配置 × 50 seed = 10–20
+    小时，代价与收益不成比例，所以最终选的是**路径 3（配对比较）**。
+
+    于是同一段输出会自相矛盾：上一句说「你必须加 seed」，下一段就打印配对
+    比较的 p 值。读者按前一句理解，会把一份已经完成的判定当成待办事项。
+    """
+    if not bad:
+        return None
+    worst_tag, worst_cv = max(bad, key=lambda kv: kv[1])
+    return (
+        f"\n{len(bad)} 个配置的 seed 波动超过 10%（最差 {worst_tag} {worst_cv:.1f}%）。"
+        "这不是「再抽几个 seed」能修的：CV 16% 想分辨 5% 要 ~50 个 seed，"
+        "4 配置 × 50 seed = 10–20 小时，代价与收益不成比例（plan.md §11.3.1）。\n"
+        "  它的含义是**不能拿绝对 MAE 跨配置比**——噪声比要检测的效应还大。"
+        "判据改用下面的配对比较（§11.3.2）：同 seed 相减，seed 的共同波动被"
+        "消掉，只留配置差异。只有配对差本身仍小于 seed 噪声时才真需要加 seed。"
+    )
+
+
 def _paired(items_a: list[dict], items_b: list[dict]) -> dict | None:
     """按 seed 配对比两个配置。
 
@@ -796,23 +839,14 @@ def main(argv: list[str] | None = None) -> int:
           f"（{len(base)} 个 seed）\n")
     print(table)
 
-    # seed 波动：plan.md §11.3 要求相对标准差 <10%，超了要加 seed 数
+    # seed 波动：plan.md §11.3 要求相对标准差 <10%
     print("\nseed 波动检查（相对标准差，阈值 10%）：")
-    bad = []
-    for key, items in _sorted_groups(groups, codes):
-        maes = [r["final_mae"] for r in items]
-        if len(maes) < 2:
-            print(f"  {tag(key)}: 只有 {len(maes)} 个 seed，无法评估波动")
-            continue
-        mean = statistics.mean(maes)
-        cv = statistics.stdev(maes) / mean * 100 if mean else float("inf")
-        flag = "OK" if cv < 10 else "**超标**"
-        if cv >= 10:
-            bad.append((tag(key), cv))
-        print(f"  {tag(key)}: {cv:.1f}%  {flag}")
-
-    if bad:
-        print("\n超标项需要加 seed 数，不许挑最好的一次报（plan.md §11.3）。")
+    cv_lines, bad = seed_cv_report(groups, codes, tag)
+    for line in cv_lines:
+        print(line)
+    advice = seed_cv_advice(bad)
+    if advice:
+        print(advice)
 
     if args.paired:
         print("\n配对比较（同 seed 相减，消掉 seed 共同波动）：")
