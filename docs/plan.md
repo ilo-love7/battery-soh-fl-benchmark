@@ -1487,6 +1487,23 @@ python scripts/rerun_all.py --execute --jobs 12 --threads 1 \
 `results/discharge-v2/` 里出现的东西只可能来自这一次重跑。`--skip-existing`
 配合它才是安全的续跑——产物逐个过 `artifact_is_current`，口径对不上就重新排队。
 
+**重跑完成后的落地顺序**（顺序有依赖，不能跳）：
+
+1. 核对 `results/discharge-v2/` 的 157 个任务全齐，且每个 JSON 的
+   `feature_version` 都是 `discharge-v2`、`torch_num_threads` 都是 1。
+2. 把这批 JSON **覆盖进 `results/`**。旧 172 个已在 `results/fullcycle-bug/`
+   完整归档（逐 run 核对过：差集为空），所以覆盖不丢东西；分区文件
+   （`partition-*.json`、`heterogeneity.json`）与特征口径无关，原地不动。
+3. `summarize_results.py --write-plan docs/plan.md` 重生成 §10.2 的表，
+   `--judge --hetero results/heterogeneity.json` 重出 H1–H4 判定。
+4. 重生成图 1–3，`--compare results/ablation-old-features` 出新旧逐 run 对比。
+5. 把新数字写进 §13.5.6 的判定对照表，新增一列「新表（1 线程）」。
+
+第 2 步必须做而不是让 CI 改指 `results/discharge-v2`：CI 的
+`no-fabricated-results` job 跑的是 `--check-plan docs/plan.md`（默认
+`--results results`），不覆盖就会红；而把 CI 改成指另一个目录，等于让仓库的
+默认路径指向一个临时名字。
+
 两条命令的 `--threads`、解释器、划分文件完全相同，所以两者的差就是特征口径
 的差。
 
