@@ -69,10 +69,11 @@
 | **`src/flsoh/segments.py`** | App 侧路径：原始采样记录 → 放电段 → (V, Q) 对，然后直接进 `delta_q_curve`——就是 `build_features.py` 调用的同一个函数（plan §8.2） |
 | **`src/flsoh/simulate.py`** | 带**真值**的模拟 App 会话。物理模型刻意简单（OCV 幂律、内阻压降、√ 衰减）——它的用途是检验管道，不是证明方法 |
 | **`src/flsoh/ingest.py`** | 校验 → 去重 → 组装。去重按**内容指纹**而不是 session ID：重装 App 后 ID 会复用 |
-| **`scripts/check_features.py`** | 本该拦住 2026-10-25 那个特征 bug 的闸门：逐行算总变差 / 幅度。正确数据 5.9，错配数据 122.4 |
+| **`scripts/check_features.py`** | 本该拦住 2026-10-25 那个特征 bug 的闸门：逐行算总变差 / 幅度。正确数据 5.9，错配数据 122.4。另有第三道：特征到底有没有携带**老化**（ΔQ(V) 与循环号的 Spearman ρ）——常数曲线在 TV 上是 0 分，完美光滑 |
 | **`scripts/simulate_sessions.py`** | 产出 Schema v1 JSONL 与真值。**自己的输出也过一遍 schema 校验**——模拟数据不享受豁免 |
 | **`scripts/run_e2e.py`** | 端到端：会话 → 入库 → 特征 → 光滑性闸门 → 划分 → 联邦训练 → 结果 JSON。五道闸门各有非零退出码，并把常数基线一起报出来——只报 MAE 是不可判读的 |
 | **`scripts/rerun_all.py`** | 从每个 run 的结果 JSON 反推命令行，重放全部 172 个 run。三种情况直接拒绝：汇总表比分片旧、解释器的 torch 版本与记录不符、线程数与记录不符——这三样都会改数字而不改产物的形状 |
+| **`scripts/promote_results.py`** | 把跑完的重跑目录提升为正式的 `results/`，并拒绝**提升一半**：源里每条记录的口径与线程数都要对、目标里已有的 run 必须全被覆盖、拷完重扫一遍。半途提升会让 `--check-plan` 在一张混杂的表上通过 |
 | **`scripts/check_schema.py`** | 按 Schema v1 校验 JSONL 会话转储。坏会话退 1、输入解析不了退 2，绝不静默跳过 |
 | **`scripts/check_dp_budget.py`** | 在扫 `noise_multiplier` **之前**把 ε 算出来。ε 不是自由变量：q 与步数由协议钉死，本协议下 nm=1 对应 ε=152.31 |
 | **`scripts/check_continuations.py`** | 用四条独立证据证明批次 2 的 5 颗是批次 1 的延续段。配错一对就会静默删掉正常电池 |
