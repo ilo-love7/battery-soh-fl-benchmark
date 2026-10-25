@@ -25,6 +25,7 @@ from flsoh import segments as sg  # noqa: E402
 from flsoh.features import make_v_grid  # noqa: E402
 from flsoh.schema import validate_session, validate_sessions  # noqa: E402
 from flsoh.simulate import (  # noqa: E402
+    GAMMA_AGING_COEF,
     OCV_HI_V,
     OCV_LO_V,
     REST_POINTS,
@@ -126,6 +127,65 @@ class TestInternalResistance:
         """容量高于出厂值时 loss 为负，不能让内阻掉到 r0 以下。"""
         spec = _spec()
         assert internal_resistance(spec, spec.q0_ah * 1.1) == pytest.approx(spec.r0_ohm)
+
+
+# ---------------------------------------------------------------------------
+# 形状机制：γ 随老化变化的强度
+#
+# 这个系数是**唯一的**「形状随老化变化」机制，量级很小（12% 容量损失下 γ 只变
+# 1.8%），后果是阶梯表里「幅度」一格拿到全部信息，与真实 MATR 表结论相反。
+# 测试钉住的是「它确实被用上了」与「默认值没被悄悄改大」——改大就等于偷偷
+# 换了一个模拟器，而所有历史数字都建立在 0.15 上。
+
+
+class TestGammaAging:
+    def test_default_magnitude_is_pinned(self):
+        """默认值不能悄悄变。改它等于换模拟器，历史数字全部作废。"""
+        assert GAMMA_AGING_COEF == pytest.approx(0.15)
+
+    def test_coefficient_actually_changes_the_curve(self, monkeypatch):
+        """把系数设成 0 与 0.15，同一循环的电压曲线必须不同。
+
+        否则这个常量就是死代码，而「形状机制存在」只是一句注释。
+        """
+        spec = _spec()
+        curves = {}
+        for coef in (0.0, 0.15):
+            monkeypatch.setattr("flsoh.simulate.GAMMA_AGING_COEF", coef)
+            rng = np.random.default_rng(0)
+            session, _ = simulate_cycle(spec, 10, total_cycles=20, rng=rng)
+            curves[coef] = np.array([r["V"] for r in session["records"]])
+        assert not np.allclose(curves[0.0], curves[0.15])
+
+    def test_aging_softens_the_low_soc_end(self, monkeypatch):
+        """系数越大，老电池低 SOC 端的 γ 越小、同一点的开路电压越高。"""
+        spec = _spec()
+        gammas = {}
+        for coef in (0.0, 2.0):
+            monkeypatch.setattr("flsoh.simulate.GAMMA_AGING_COEF", coef)
+            # 老电池：容量衰减 12% → 直接算 γ
+            loss = 0.12
+            gammas[coef] = spec.gamma * (1.0 - coef * loss)
+        assert gammas[2.0] < gammas[0.0]
+        # γ 更小 → 低 SOC 端更陡：同一 soc 处开路电压更高
+        soc = 0.05
+        assert open_circuit_voltage(soc, gamma=gammas[2.0]) > open_circuit_voltage(
+            soc, gamma=gammas[0.0]
+        )
+
+    def test_cutoff_truncation_is_negligible(self):
+        """把「放电截止电压截断」当形状机制是死路，这里把量级钉住。
+
+        端电压到 2.0 V 时，开路电压 = 2.0 + I·R。R 从 r0 涨到 3 倍，可用窗口
+        只少 0.02%。若哪天有人真去改网格下界来实现截断，这条测试会提醒他
+        换不来东西。
+        """
+        current = 1.10
+        for r_ratio, max_loss in ((1.0, 1e-5), (3.0, 2e-4)):
+            ocv_end = 2.0 + current * 0.030 * r_ratio
+            frac = (ocv_end - OCV_LO_V) / (OCV_HI_V - OCV_LO_V)
+            soc_end = frac ** (1.0 / 0.35)
+            assert soc_end < max_loss
 
 
 # ---------------------------------------------------------------------------

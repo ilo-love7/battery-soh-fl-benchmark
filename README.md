@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-808-blue)](./tests)
+[![Tests](https://img.shields.io/badge/tests-812-blue)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
