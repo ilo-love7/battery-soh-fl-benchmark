@@ -1451,6 +1451,7 @@ TV 差 1280 倍，相关系数 −0.02。**也就是说 M1–M4 用的「ΔQ 特
 | 结果目录新旧混杂（部分 run 缺 `torch_num_threads`） | 重跑中断后续跑，半新半旧。带 `--skip-existing` 时降级为逐产物核对，否则续跑会被自己的闸门拒死 |
 | `--skip-existing` 按产物自报口径判 | 只判文件存在 → 跳过上一版的结果（坑 31） |
 | 反推不出参数 / 划分文件缺失 / C1 客户端数不符 | 悄悄换了个实验 |
+| 提升时少拷 run / 拷进口径不符的 run（`promote_results.py`） | `results/` 内部新旧混杂，而 `--check-plan` 照样绿 |
 
 **两道运行时闸门的实测依据**（同一份特征表、同一 seed、同一仓库、C0 seed0）：
 
@@ -1506,9 +1507,17 @@ python scripts/rerun_all.py --execute --jobs 12 --threads 1 \
 
 1. 核对 `results/discharge-v2/` 的 157 个任务全齐，且每个 JSON 的
    `feature_version` 都是 `discharge-v2`、`torch_num_threads` 都是 1。
-2. 把这批 JSON **覆盖进 `results/`**。旧 172 个已在 `results/fullcycle-bug/`
-   完整归档（逐 run 核对过：差集为空），所以覆盖不丢东西；分区文件
-   （`partition-*.json`、`heterogeneity.json`）与特征口径无关，原地不动。
+2. 把这批 JSON **覆盖进 `results/`**——用 `scripts/promote_results.py`，不要手写
+   `cp`：
+
+   ```bash
+   python scripts/promote_results.py --from results/discharge-v2 --to results \
+       --expect-feature-version discharge-v2 --threads 1 --execute
+   ```
+
+   旧 172 个已在 `results/fullcycle-bug/` 完整归档（逐 run 核对过：差集为空），
+   所以覆盖不丢东西；分区文件（`partition-*.json`、`heterogeneity.json`）与
+   特征口径无关，脚本按「有没有 `final_mae`」区分，原地不动。
 3. `summarize_results.py --write-plan docs/plan.md` 重生成 §10.2 的表，
    `--judge --hetero results/heterogeneity.json` 重出 H1–H4 判定。
 4. 重生成图 1–3，`--compare results/ablation-old-features` 出新旧逐 run 对比。
@@ -1518,6 +1527,14 @@ python scripts/rerun_all.py --execute --jobs 12 --threads 1 \
 `no-fabricated-results` job 跑的是 `--check-plan docs/plan.md`（默认
 `--results results`），不覆盖就会红；而把 CI 改成指另一个目录，等于让仓库的
 默认路径指向一个临时名字。
+
+**为什么第 2 步要一个脚本**：`cp` 有两种半途而废的方式，两种都看不出来——
+少拷几个（某个任务失败了，旧的留在原地）、拷进口径不同的几个（源目录里混了
+上一版）。后果是同一条：`--write-plan` 把**混杂的表**写进文档，而 CI 的
+`--check-plan` 会**通过**，因为它只核对「文档与 `results/` 是否一致」，不核对
+「`results/` 内部是否同源」。`promote_results.py` 的四道检查就针对这个：
+源口径逐个核对、目标里的 run 必须全部出现在源里、拷完重扫目标目录、任一条
+不过就**一个文件都不拷**（「提升一半」比「不提升」更糟）。
 
 两条命令的 `--threads`、解释器、划分文件完全相同，所以两者的差就是特征口径
 的差。
