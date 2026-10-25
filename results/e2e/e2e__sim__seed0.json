@@ -313,7 +313,7 @@
       "rmse": 0.03181370564622604
     }
   ],
-  "wall_clock_s": 13.016,
+  "wall_clock_s": 20.714,
   "epochs": 300,
   "learning_rate": 0.001,
   "backend": "e2e-local-loop",
@@ -321,6 +321,18 @@
   "notes": "模拟会话（非真实数据），端到端联调用；网格 1000 点 [2.0, 3.5] V；标签相对每颗电池的首个会话",
   "baseline_mae": 0.026380283493968,
   "beats_baseline": true,
+  "baselines": {
+    "n_train": 342,
+    "n_test": 114,
+    "n_features": 1000,
+    "label_std_test": 0.03171311205628795,
+    "constant": 0.026380283493968,
+    "amplitude": 0.0035001945707779972,
+    "all_features": 0.006051302421854435,
+    "shape_only": 0.07209090122693926,
+    "alpha": 1.0
+  },
+  "beats_amplitude_baseline": false,
   "e2e": {
     "n_sessions_raw": 480,
     "n_sessions_accepted": 480,
@@ -361,6 +373,13 @@
     "tv_ratio_max": 45.545092995000374,
     "max_step_ratio_median": 0.1768391960240141,
     "max_step_ratio_max": 0.7432113113029664,
-    "max_tv_ratio": 60.0
+    "max_tv_ratio": 60.0,
+    "max_tv_ratio_hard": 180.0,
+    "tv_ratio_p99": 43.30973843727211,
+    "n_soft_over": 0,
+    "rho_median": -1.0,
+    "rho_frac_strong": 1.0,
+    "rho_undetermined": false,
+    "label_signal_bad": false
   }
 }

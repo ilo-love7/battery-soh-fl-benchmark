@@ -25,10 +25,29 @@
 | 标签 | 缺真值直接拒绝 | 缺标签的行把损失静默拉向 0 |
 | 训练 | 训练电池与测试电池不得相交 | val 指标虚高 |
 
+## 指标必须与平凡基线一起报
+
+``final_mae`` 单独一个数不可判读。本脚本报一条阶梯
+（:func:`flsoh.baselines.feature_ladder`）::
+
+    常数基线（最弱）  <  只用幅度（最强平凡基线）  ≈  全部特征  >  只用形状
+
+模拟数据实测：常数 0.02703 / 只用幅度 **0.00430** / 全部 1000 维 0.00568 /
+只用形状 0.05411 / 神经网络 0.02289。
+
+读法：**信号几乎全在幅度里**，1 维线性模型就打败了 1000 维模型；归一化后
+（幅度信息被除掉）连水平线都不如，说明另外 999 维在模拟数据上主要是噪声。
+所以这里的 ``final_mae`` 证明的是管道接对，**不是**方法有效——而且它离最强
+平凡基线还差 5 倍，这一条比「比常数基线好」重要得多，却只在跑赢常数基线之后
+才看得见。脚本因此把它单独打印出来，但**不判失败**：模拟数据的任务本来就单薄，
+把它当失败会让 e2e 永远红着，而该修的是模拟器或模型。
+
 **为什么「老化信号」这道必须单独存在**：一条常数曲线的 TV/幅度 是 0，完美光滑。
 TV 判据问的是「曲线像不像一条曲线」，回答不了「曲线有没有在变」。模拟路径上
 实测 ρ 中位 −1.000（模拟器把 SOH 几乎全编码在幅度上，整条曲线按容量因子缩放），
 所以这道闸门在这里的余量很大；它真正的用途是拦「取错电压区间但恰好光滑」。
+注意 ρ = −1.000 恰好**区分不了**「只有幅度变」与「形状也在变」——两种情况下
+每列都随循环单调下降。形状那一路要看阶梯表里的 ``shape_only`` 一格。
 
 ## 为什么这里的 TV 阈值是 60 而不是实验室路径的 20
 
@@ -73,7 +92,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import numpy as np  # noqa: E402
 
 from check_features import check_feature_frame, report_is_ok  # noqa: E402
+from flsoh.baselines import feature_ladder, ladder_note  # noqa: E402
 from flsoh.features import FeatureTable, make_v_grid  # noqa: E402
+
+#: 训练量的默认值。**必须是「复现已提交产物」的那一组**，不是「跑得最好的
+#: 那一组」：``results/e2e/e2e__sim__seed0.json`` 是 60 轮 × 5 本地 epoch
+#: （共 300）跑出来的，默认值改成别的会让「照着文档跑一条命令」得到另一个数，
+#: 而那个数还可能是红的。
+#:
+#: 曾经默认是 ``local_epochs=2``（共 120），跑出来 MAE 0.05623——**比常数基线
+#: 0.02638 还差**，直接判 FAIL。任何人第一次跑都会以为管道坏了。
+#:
+#: 但**不要**把这理解成「训练量不够」。同一份数据、同一个 seed 扫一遍
+#: ``local_epochs``：2 → 0.0562，3 → 0.0229，4 → 0.0620，5 → 0.0229，
+#: 8 → 0.0098。**非单调**。所以真正的事实是：这个模型在这份数据上的结果被
+#: 优化噪声主导，不能当学习曲线读，也不能拿「挑一个过的设置」当修复——
+#: 那正是本项目禁止的「挑最好的一次」。默认值取 5 的唯一理由是它与归档产物
+#: 一致，``tests/test_baselines.py`` 里有一条闸门钉住这一点。
+DEFAULT_ROUNDS = 60
+DEFAULT_LOCAL_EPOCHS = 5
 from flsoh.ingest import (  # noqa: E402
     IngestError,
     ingest_sessions,
@@ -126,8 +163,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--clients", type=int, default=4, help="客户端数（默认 4）")
     ap.add_argument("--test-fraction", type=float, default=0.25,
                     help="留作全局测试的电池比例（默认 0.25）")
-    ap.add_argument("--rounds", type=int, default=60)
-    ap.add_argument("--local-epochs", type=int, default=2)
+    ap.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
+    ap.add_argument("--local-epochs", type=int, default=DEFAULT_LOCAL_EPOCHS)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--points", type=int, default=1000, help="电压网格点数")
@@ -274,6 +311,26 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
+    # 常数基线是**最弱**的平凡基线，过了它不代表模型有用。这里再算一道
+    # 「只用幅度」的岭回归——ΔQ 曲线的 max|ΔQ| 一个标量。1000 维模型如果
+    # 打不过它，说明多余维度在贡献噪声，而这件事在 final_mae 一个数上
+    # 完全看不出来（模拟数据实测：1 维 0.0043，1000 维 0.0057，神经网络
+    # 0.0229——只看最后一个数会以为「还行」）。
+    feats = [c for c in frame.columns if c.startswith("f")]
+    ladder = feature_ladder(
+        frame[feats].to_numpy(dtype=float),
+        frame["soh"].to_numpy(dtype=float),
+        train_mask.to_numpy(),
+        test_mask.to_numpy(),
+    )
+    print(
+        f"[e2e] 平凡基线阶梯：常数 {ladder['constant']:.5f}  "
+        f"只用幅度 {ladder['amplitude']:.5f}（最强）  "
+        f"全部 {ladder['n_features']} 维 {ladder['all_features']:.5f}  "
+        f"只用形状 {ladder['shape_only']:.5f}",
+        flush=True,
+    )
+
     try:
         from run_federated import run_federation
     except ImportError as exc:
@@ -331,6 +388,11 @@ def main(argv: list[str] | None = None) -> int:
         # 一个「看起来正常」的 MAE 可能比常数基线还差。
         "baseline_mae": baseline_mae,
         "beats_baseline": bool(result["final_mae"] < baseline_mae),
+        # 平凡基线阶梯：``amplitude`` 是**最强**平凡基线（1 维岭回归），
+        # 比 ``baseline_mae``（常数基线）有分辨力得多。这两个数放在一起，
+        # 「模型学没学到幅度之外的信号」才是可判读的。
+        "baselines": ladder,
+        "beats_amplitude_baseline": bool(result["final_mae"] < ladder["amplitude"]),
         "e2e": {
             "n_sessions_raw": report["n_total"],
             "n_sessions_accepted": report["n_accepted"],
@@ -377,6 +439,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    # 跑赢常数基线不等于模型有用。这一条只提示、不判失败：模拟数据的任务
+    # 本来就单薄（标签几乎全在幅度里），把它当失败会让 e2e 永远红着，
+    # 而真正该修的是模拟器或模型，不是这道闸门。
+    print(f"[e2e] {ladder_note(ladder, result['final_mae'])}", flush=True)
     return 0
 
 

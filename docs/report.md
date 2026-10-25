@@ -330,7 +330,10 @@ Spearman 相关，取中位数再跨电池汇总。物理依据是硬约束：SO
 |---|---|
 | 入库 | 480 → 接收 480，拒收 0，重复 0 |
 | 特征 | 456 行 × 1000 维，跳过 0 |
-| 常数基线 MAE | 0.02638 |
+| 常数基线 MAE（最弱） | 0.02638 |
+| **只用幅度（1 维岭回归，最强）** | **0.00350** |
+| 全部 1000 维岭回归 | 0.00605 |
+| 只用形状（归一化后 1000 维） | 0.07209 |
 | 联邦 MAE | 0.02289 |
 
 只比常数基线好 13%。**这个数不能读成「管道有问题」也不能读成「方法有效」**：
@@ -338,6 +341,17 @@ Spearman 相关，取中位数再跨电池汇总。物理依据是硬约束：SO
 `LocalStandardizer` 逐客户端标准化会把「幅度」按客户端归一化掉，而模拟数据把
 SOH 几乎全编码在幅度上（逐电池标准化后线性回归退化到 0.0397，比常数基线还差）。
 **这是模拟器的局限**：真实 LFP 的 ΔQ 随老化同时改变形状，模拟器只改了幅度。
+
+上表的中间三行是 2026-10-25 补的平凡基线阶梯（`src/flsoh/baselines.py`），
+它们把话说得更死：**1 维线性模型就打败了 1000 维神经网络，差 6.54 倍**；而
+归一化后（幅度信息被除掉）连水平线都不如，说明另外 999 维在这份数据上主要
+是噪声。所以这里唯一站得住的陈述是「管道接通」，任何关于精度的陈述都不成立。
+
+顺带一条工程事实：`--local-epochs` 的默认值原本是 2（共 120 epoch），跑出来
+MAE 0.05623——**比常数基线还差，直接判 FAIL**，而归档的 0.02289 是 le=5 跑的。
+默认值现已改为 5 以复现归档。但同一份数据扫 `local_epochs` 是
+2 → 0.0562、3 → 0.0229、4 → 0.0620、5 → 0.0229、8 → 0.0098，**非单调**，
+所以这个模型的结果是优化噪声主导的，不能当学习曲线读。
 
 ## 6. 局限
 
@@ -389,9 +403,10 @@ python3 scripts/summarize_results.py --judge --write-plan docs/plan.md
 python3 scripts/make_figure1.py && python3 scripts/make_figure2.py && \
 python3 scripts/make_figure3.py
 
-# 端到端联调（模拟数据）
+# 端到端联调（模拟数据）。默认训练量就是归档用的 60 轮 × 5 本地 epoch，
+# 不用显式给 —— 默认值被一条测试钉在「复现归档产物」上
 python3 scripts/simulate_sessions.py --cells 24 --cycles 20 \
     --out data/simulated/sessions.jsonl --truth data/simulated/truth.json
 python3 scripts/run_e2e.py --sessions data/simulated/sessions.jsonl \
-    --truth data/simulated/truth.json --rounds 60 --local-epochs 5
+    --truth data/simulated/truth.json
 ```
