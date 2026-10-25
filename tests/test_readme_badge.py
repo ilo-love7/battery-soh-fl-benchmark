@@ -44,6 +44,38 @@ def _badge_numbers(text: str) -> list[int]:
     return [int(m) for m in _BADGE_RE.findall(text)]
 
 
+def find_shadowed_definitions(test_dir: Path = TEST_DIR) -> list[str]:
+    """找出被同名定义遮住的测试类/测试方法。
+
+    Python 允许重名，后一个定义**静默覆盖**前一个。对测试来说这意味着：
+    粘贴时多贴一遍整个类，pytest 只收集到一份，没有任何报错，测试数也不变
+    （静态清点会把两份都数上，于是徽章比 pytest 实际收集的多）。
+
+    这不是假想的：本仓库真发生过——一个 `TestMixedDirectoryResume` 被贴了
+    两遍，`pytest tests/test_rerun_all.py` 照样全绿，只有徽章数与
+    「新增 3 条测试」的预期对不上才露出来。
+    """
+    found: list[str] = []
+    for path in sorted(test_dir.glob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        classes: dict[str, int] = {}
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            classes[node.name] = classes.get(node.name, 0) + 1
+            methods: dict[str, int] = {}
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    methods[sub.name] = methods.get(sub.name, 0) + 1
+            for name, n in methods.items():
+                if n > 1:
+                    found.append(f"{path.name}: {node.name}.{name} 定义了 {n} 次")
+        for name, n in classes.items():
+            if n > 1:
+                found.append(f"{path.name}: class {name} 定义了 {n} 次")
+    return found
+
+
 class TestBadgeMatchesReality:
     def test_badge_exists_in_both_readmes(self):
         """双版都必须有徽章，且形状对得上。"""
@@ -102,3 +134,52 @@ class TestStaticCounter:
 
     def test_empty_dir_counts_zero(self, tmp_path):
         assert count_test_functions(tmp_path) == 0
+
+
+class TestNoShadowedTests:
+    """重名定义会静默吞掉测试：pytest 全绿，而你以为写了的那些根本没跑。
+
+    这是「输出正常但错了」的另一种形态——不是数字错，是**测试消失了**，
+    而消失没有任何信号（退出码 0、收集数少几条、没有 warning）。本仓库真的
+    发生过：一个测试类被粘贴两遍，pytest 只收集到一份，全绿。
+    """
+
+    def test_repo_has_no_shadowed_definitions(self):
+        shadowed = find_shadowed_definitions()
+        assert not shadowed, "同名定义互相覆盖（后一个静默覆盖前一个）：\n" + "\n".join(
+            shadowed
+        )
+
+    def test_detector_catches_a_duplicated_class(self, tmp_path):
+        """负控：整个类贴两遍必须被抓到。"""
+        (tmp_path / "test_dup.py").write_text(
+            "class TestA:\n"
+            "    def test_one(self):\n        pass\n\n\n"
+            "class TestA:\n"
+            "    def test_one(self):\n        pass\n",
+            encoding="utf-8",
+        )
+        shadowed = find_shadowed_definitions(tmp_path)
+        assert any("TestA" in s and "2" in s for s in shadowed), shadowed
+
+    def test_detector_catches_a_duplicated_method(self, tmp_path):
+        """同一个类里同名方法贴两遍同样静默——只留后一个。"""
+        (tmp_path / "test_dup.py").write_text(
+            "class TestA:\n"
+            "    def test_one(self):\n        pass\n\n"
+            "    def test_one(self):\n        pass\n",
+            encoding="utf-8",
+        )
+        shadowed = find_shadowed_definitions(tmp_path)
+        assert any("test_one" in s for s in shadowed), shadowed
+
+    def test_detector_does_not_flag_distinct_names(self, tmp_path):
+        """正控：名字不同就不许报，否则这条闸门只是在拒绝一切。"""
+        (tmp_path / "test_ok.py").write_text(
+            "class TestA:\n"
+            "    def test_one(self):\n        pass\n\n\n"
+            "class TestB:\n"
+            "    def test_one(self):\n        pass\n",
+            encoding="utf-8",
+        )
+        assert find_shadowed_definitions(tmp_path) == []

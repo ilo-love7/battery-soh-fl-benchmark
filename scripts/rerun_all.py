@@ -366,7 +366,9 @@ def check_torch_version(runs: dict[str, dict], python: str) -> list[str]:
     return []
 
 
-def check_thread_count(runs: dict[str, dict], threads: int) -> list[str]:
+def check_thread_count(
+    runs: dict[str, dict], threads: int, *, allow_mixed: bool = False
+) -> list[str]:
     """记录里带了 `torch_num_threads` 的 run，线程数必须与 `--threads` 一致。
 
     早期结果没有这个字段（它是 2026-10-25 才加进产物的），那时不检查——
@@ -377,6 +379,11 @@ def check_thread_count(runs: dict[str, dict], threads: int) -> list[str]:
     **「部分有、部分没有」是另一种错误**：那说明新旧结果混在同一个目录里
     （典型成因是重跑中断后用 `--skip-existing` 续跑）。只看「有字段的那些」
     会得到 `{1}` 而判定一致，于是混杂目录被放行——这比线程数本身更危险。
+
+    ``allow_mixed=True`` 只给一种场景用：**已经带了 `--skip-existing`**。
+    那时混杂是续跑的正常中间态，而且每个产物都会过 ``artifact_is_current``
+    逐个核对（旧产物线程数对不上就重新排队），混杂不再是静默的。没有这条例外，
+    中断一次就再也续不上——一道防止静默混杂的闸门变成禁止续跑的闸门。
     """
     recorded = {
         int(r["torch_num_threads"]) for r in runs.values() if "torch_num_threads" in r
@@ -387,7 +394,7 @@ def check_thread_count(runs: dict[str, dict], threads: int) -> list[str]:
     missing = sorted(
         rid for rid, r in runs.items() if "torch_num_threads" not in r
     )
-    if missing:
+    if missing and not allow_mixed:
         problems.append(
             f"{len(missing)}/{len(runs)} 个 run 没有 torch_num_threads 而其余有："
             f"新旧结果混在同一个目录里（例如重跑中断后用 --skip-existing 续跑）。"
@@ -586,7 +593,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"WARN {p}（--allow-torch-mismatch 已显式放行）")
     else:
         problems += torch_problems
-    problems += check_thread_count(runs, args.threads)
+    problems += check_thread_count(
+        runs, args.threads, allow_mixed=args.skip_existing
+    )
+    if args.skip_existing:
+        mixed = [
+            rid for rid, r in runs.items() if "torch_num_threads" not in r
+        ]
+        if mixed and len(mixed) < len(runs):
+            print(
+                f"注意：{len(mixed)}/{len(runs)} 个 run 是上一版产物（无 "
+                "torch_num_threads）。带 --skip-existing 时这是续跑的正常中间态，"
+                "逐个产物会过 artifact_is_current 核对，旧的会重新排队"
+            )
     jobs, job_problems = preflight(
         runs, features=features, baseline_partition=Path(args.baseline_partition)
     )
