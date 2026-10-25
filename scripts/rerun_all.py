@@ -374,7 +374,8 @@ def check_probed_threads(probed: int | None, threads: int) -> list[str]:
         f"请求 {threads} 线程，但 torch 实际拿到 {probed}：这台机器上 torch 会把"
         f"请求钳到它自己的上限。钉住的线程数必须与产物里记的一致，否则"
         f"「判据阈值 5%」挡不住环境差异——实测同一 run 在 1 线程与 {probed} 线程"
-        "下 final_mae 差 1.80 倍，且两边都逐位可复现。改用 "
+        "下 final_mae 差 1.80 倍（激进配置；温和配置只差 1.7%，所以不能靠「这个"
+        f"配置应该没事」来豁免），且两边都逐位可复现。改用 "
         f"--threads {probed}（或 1），不要用一个钉不住的值"
     ]
 
