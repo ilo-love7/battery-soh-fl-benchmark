@@ -193,11 +193,15 @@ def main(argv: list[str] | None = None) -> int:
     draw(ax2, middle)
     draw(ax3, right)
     ax1.set_ylabel("test MAE (log scale)")
-    ax1.set_title("H1: training budget dominates the gap",
+    # 标题**只描述画了什么，不下判定**。上一版把结论写进标题
+    # （"H1: training budget dominates the gap" / "H2: label skew, not quantity
+    # skew, is what costs accuracy" / "H3: FedProx is worse at every μ tested"），
+    # 重跑之后三条全部变成「未判定」，而图看起来完全正常——这类过期比数字过期
+    # 更危险，因为图会被单独引用。判定写在 docs/report.md 与 plan §11.3。
+    ax1.set_title("H1: FedAvg / IID vs C0 centralized", fontsize=10)
+    ax2.set_title("H2: FedAvg under label skew (sohrank) / quantity skew (Dirichlet)",
                   fontsize=10)
-    ax2.set_title("H2: label skew, not quantity skew, is what costs accuracy",
-                  fontsize=10)
-    ax3.set_title("H3: FedProx is worse at every μ tested",
+    ax3.set_title("H3: FedProx at μ=0.01 / 0.1 vs FedAvg, same partition",
                   fontsize=10)
     fig.suptitle(
         "MIT-Stanford, 135 cells (115 train / 20 test), N=23 clients — "

@@ -31,6 +31,9 @@ train = [
 ]
 # 完整版 D8 才需要
 privacy = ["opacus==1.6.0"]
+# 出图（scripts/make_figure*.py）。单独一组：不装也能跑全部实验与检查器，
+# 只是 docs/figures/ 下的图重生成不了。
+figures = ["matplotlib>=3.8"]
 dev = ["pytest>=8.0"]
 
 [project.urls]

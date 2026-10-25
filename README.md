@@ -12,43 +12,46 @@
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-> **Status: third experimental batch complete (2026-10-25), results still provisional.**
-> With 8 seeds per configuration all three hypotheses are now settled:
-> **H1 rejected** (federated beats centralized by 23.5% at 3.3× the training
-> budget; at equal budget it is 6.4× worse — the two framings disagree in sign),
-> **H2 accepted** (SOH-sorted shards at 47.1% label skew cost +24.2% against a
-> same-budget IID control, p_t=0.0013), **H3 rejected** (μ=0.01 and μ=0.1 are
-> both worse than μ=0, with no usable interior point). Dirichlet α=0.5 stays
-> *undecided (treatment not applied)*: its label skew (12.2%) is below the IID
-> baseline (17.3%).
-> M3 added the skew sweep (k=1/2/5/10, each tier against a same-k IID control)
-> and **FedAdam**: server-side momentum recovers 86.1% of the accuracy lost to
-> `local_epochs=3` (p_t=0.0056, 8/8 seeds) and reaches centralized-level MAE at
-> 1/3.3 of the training budget — but adds nothing once local epochs suffice.
-> FedBN is deferred (the model deliberately has no BatchNorm, and no second
-> chemistry's ΔQ(V) features are available locally).
-> **M4 added local DP-SGD** (`docs/memo-m4.md`): H4 splits in two. Monotonicity
-> is **supported** (MAE rises strictly with the noise multiplier, 8/8 seeds,
-> p_sign=0.0078), but usability at ε ≤ 8 is **rejected** — the only arm that
-> reaches it (nm=8, ε=7.84) degrades +186.3% against the mechanism control and
-> is **34.7% worse than not federating at all**. ε is not a free variable:
-> q=0.5 and 600 steps put nm=1 at ε=152.31, so the DOD's literal "ε ≤ 8 at
-> noise=1.0" is structurally unreachable under this protocol.
-> Every number in the table is regenerated from `results/*.json` by CI,
-> so nothing in it can be hand-edited.
+> **Status: feature table rebuilt, all 172 runs re-executed on it (2026-10-26).
+> The rebuild fixed a real defect — and the rerun moved the conclusions.**
 >
-> **M5 (current) found a data defect that invalidates those numbers.** The
-> feature extractor was feeding the **whole cycle** (charge + discharge) into
-> the voltage-sorted interpolator, so the discharge segment — whose `Qc` channel
-> is constant — was scattered into the charge segment's voltage range. Measured
-> on real data: total variation 269.60 vs 0.21 for the correct pipeline, and a
-> correlation of **−0.019** with the true ΔQ(V). The table above was computed on
-> that broken table. It is being rebuilt (`scripts/check_features.py` now gates
-> every build at TV/amplitude ≤ 20, and the extraction version is part of the
-> resume fingerprint so old shards cannot be silently reused). Methodology
-> conclusions — training-budget accounting, seed-noise magnitude, the ε
-> derivation, "stability ≠ correctness" — are unaffected; every MAE is pending
-> re-verification. See `docs/report.md` §0.
+> **H1, H2 and H3 are now all *undetermined*.** Not because the effects shrank:
+> H1's gap at `local_epochs=10` grew from −22.8% to −40.2%. The corrected table
+> has **2–5× larger seed variance** (C0's coefficient of variation went from
+> 14.3% to **77.2%**, Dirichlet from 7.6% to **44.3%**), and the paired test has
+> only 8 seeds. Reporting these as settled would be reporting the old table, not
+> this one.
+>
+> **H4 is the only verdict that survives.** Monotonicity holds (MAE rises
+> strictly with the noise multiplier, 8/8 seeds, p_sign=0.0078); usability at
+> ε ≤ 8 is still **rejected** — the only arm that reaches it (nm=8, ε=7.84)
+> degrades **+58.8%** against the non-DP same-budget arm and **+281.1%** against
+> the mechanism control. ε is not a free variable: q=0.5 and 600 steps put nm=1
+> at ε=152.31, so the DOD's literal "ε ≤ 8 at noise=1.0" is structurally
+> unreachable under this protocol.
+>
+> **What was fixed.** The feature extractor was feeding the **whole cycle**
+> (charge + discharge) into the voltage-sorted interpolator, so the discharge
+> segment — whose `Qc` channel is constant — was scattered into the charge
+> segment's voltage range. Measured on real data: total variation 269.60 vs 0.21
+> for the correct pipeline, and a correlation of **−0.019** with the true ΔQ(V).
+> `scripts/check_features.py` now gates every build at TV/amplitude ≤ 20, and the
+> extraction version is part of the resume fingerprint so old shards cannot be
+> silently reused.
+>
+> **One claim was withdrawn.** An earlier note said the corrected features lost
+> the ability to track *within-cell* ageing. That came from dividing a **pooled**
+> RMSE by a **per-cell median** standard deviation — two quantities 4.8× apart.
+> On a like-for-like basis the new table tracks within-cell variation at **0.42×**
+> the label's own within-cell spread (< 1 means it tracks), versus 0.31× for the
+> broken table. The corrected features are uniformly ~20–30% *worse*, not
+> qualitatively different. See `docs/report.md` §5.5.
+>
+> Methodology conclusions — training-budget accounting, seed-noise magnitude, the
+> ε derivation, "stability ≠ correctness", the deployment-gap measurement — are
+> unaffected. Every MAE above is regenerated from `results/*.json` by CI, so
+> nothing in the tables can be hand-edited. See `docs/report.md` §0 and
+> `docs/plan.md` §13.5.7.
 
 ---
 
