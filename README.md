@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-812-blue)](./tests)
+[![Tests](https://img.shields.io/badge/tests-831-blue)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -82,7 +82,8 @@ So this repo treats the *checkers* as the deliverable, not the training loop.
 | **`src/flsoh/simulate.py`** | Synthetic app sessions with **ground truth**. Deliberately simple physics (OCV power law, IR sag, √-fade) — its job is to exercise the pipeline, not to prove the method |
 | **`src/flsoh/ingest.py`** | Validate → deduplicate → assemble. Deduplication is by **content fingerprint**, not session ID: a reinstalled app reuses IDs |
 | **`scripts/check_features.py`** | The gate that would have caught the 2026-10-25 feature bug: per-row total variation / amplitude. Correct data scores 5.9, mis-paired points score 122.4. A third check asks whether the feature carries **aging** at all (Spearman ρ between ΔQ(V) and cycle number) — a constant curve scores 0 on TV and is perfectly smooth |
-| **`scripts/check_feature_ladder.py`** | Answers "where does the signal live?" on any feature table: constant / amplitude-only / all features / shape-only. On the real MATR table **no single scalar amplitude beats a horizontal line** (1.14–1.31×) while all 1000 dims reach 0.36× — the opposite of the simulator, where one scalar suffices |
+| **`scripts/check_feature_ladder.py`** | Answers "where does the signal live?" on any feature table: constant / amplitude-only / all features / shape-only, plus a between-cell vs within-cell split of the error. On the real MATR table **no single scalar amplitude beats a horizontal line** (1.09–1.32×) while all 1000 dims reach 0.31× — the opposite of the simulator, where one scalar suffices |
+| **`scripts/compare_feature_versions.py`** | Pairs two result directories run-by-run and reports the median ratio, an exact sign test, and each family's seed CV — so a "17% worse" is read against the noise it sits in. Refuses to pair runs whose thread counts differ: that mixes in a random source as large as the seed |
 | **`scripts/simulate_sessions.py`** | Emits Schema v1 JSONL + a truth file. Validates its own output against the schema — synthetic data does not get a pass |
 | **`scripts/run_e2e.py`** | End-to-end: sessions → ingest → features → smoothness gate → split → federated training → results JSON. Five gates, each with a non-zero exit code. Reports a baseline ladder (constant / amplitude-only / all features / shape-only) alongside MAE, because MAE alone is unreadable — on simulated data a 1-feature linear model beats the 1000-dim network by 6.5× |
 | **`scripts/rerun_all.py`** | Reconstructs each run's command line from its result JSON and replays all 172 runs. Refuses to run when the assembled feature table is stale, when the interpreter's torch version differs from the recorded one, or when the thread count differs — all three change the numbers without changing the output's shape |
