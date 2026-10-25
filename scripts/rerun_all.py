@@ -332,6 +332,53 @@ def probe_torch_version(python: str) -> str | None:
     return (proc.stdout or "").strip() or None
 
 
+def probe_thread_count(python: str, threads: int) -> int | None:
+    """在 `pinned_env(threads)` 下问 torch **实际**拿到几个线程。
+
+    为什么需要这一步：`pinned_env` 只设 `OMP_NUM_THREADS` 等环境变量，而 torch
+    会按自己的规则**钳**这个值。实测（本机 24 核、torch 2.10.0+cpu）：请求 24，
+    `torch.get_num_threads()` 返回 **16**。也就是说 `--threads 24` 在这台机器上
+    根本不是一个能钉住的值——产物里会如实记 16，然后 `check_thread_count` 在
+    全部跑完之后才报不一致。
+
+    钉不住的代价不是时间，是数值：同一个 run、同一份表、同一个 torch，
+    1 线程与 16 线程的 `final_mae` 分别是 0.0021398472785949707 与
+    0.0011869078874588012，差 **1.80 倍**，而且两边都逐位可复现。
+    """
+    try:
+        proc = subprocess.run(
+            [python, "-c", "import torch; print(torch.get_num_threads())"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=pinned_env(threads),
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    text = (proc.stdout or "").strip().splitlines()
+    try:
+        return int(text[-1])
+    except (IndexError, ValueError):
+        return None
+
+
+def check_probed_threads(probed: int | None, threads: int) -> list[str]:
+    """请求的线程数必须等于 torch 实际拿到的线程数。
+
+    ``probed is None`` 时不判——解释器里没有 torch 时，这条检查没有话可说，
+    假装检查过比不检查更糟。
+    """
+    if probed is None or probed == threads:
+        return []
+    return [
+        f"请求 {threads} 线程，但 torch 实际拿到 {probed}：这台机器上 torch 会把"
+        f"请求钳到它自己的上限。钉住的线程数必须与产物里记的一致，否则"
+        f"「判据阈值 5%」挡不住环境差异——实测同一 run 在 1 线程与 {probed} 线程"
+        "下 final_mae 差 1.80 倍，且两边都逐位可复现。改用 "
+        f"--threads {probed}（或 1），不要用一个钉不住的值"
+    ]
+
+
 def check_torch_version(runs: dict[str, dict], python: str) -> list[str]:
     """目标解释器的 torch 版本必须与结果记录里的一致。
 
@@ -596,6 +643,13 @@ def main(argv: list[str] | None = None) -> int:
     problems += check_thread_count(
         runs, args.threads, allow_mixed=args.skip_existing
     )
+    # 线程数不仅要「记录一致」，还要「真的钉住了」。torch 会把
+    # OMP_NUM_THREADS 钳到自己的上限（实测请求 24 拿到 16），于是
+    # --threads 24 是个钉不住的值：跑完才发现产物记的是 16。
+    probed = probe_thread_count(python, args.threads)
+    problems += check_probed_threads(probed, args.threads)
+    if probed is not None and probed == args.threads:
+        print(f"线程数钉住了：请求 {args.threads}，torch 实际 {probed}")
     if args.skip_existing:
         mixed = [
             rid for rid, r in runs.items() if "torch_num_threads" not in r

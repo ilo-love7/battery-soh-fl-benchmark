@@ -392,6 +392,36 @@ class TestThreadCountGate:
         assert ra.check_thread_count({"a": {"torch_version": "2.10.0+cpu"}}, 1) == []
 
 
+class TestProbedThreadCount:
+    """「记录一致」不等于「真的钉住了」：torch 会把 OMP_NUM_THREADS 钳掉。
+
+    实测（本机 24 核、torch 2.10.0+cpu）：请求 24，`torch.get_num_threads()`
+    返回 **16**。所以 `--threads 24` 是个钉不住的值——`pinned_env` 设了 24，
+    torch 只给 16，产物如实记 16，然后全部跑完之后 `check_thread_count` 才报
+    不一致（如果它报的话）。
+
+    代价不是时间而是数值：同一个 run、同一份表、同一个 torch，
+    1 线程 → 0.0021398472785949707，16 线程 → 0.0011869078874588012，
+    差 **1.80 倍**，两边都逐位可复现。
+    """
+
+    def test_mismatch_is_refused_and_names_both_numbers(self):
+        problems = ra.check_probed_threads(16, 24)
+        assert problems
+        assert "16" in problems[0] and "24" in problems[0]
+        assert "1.80" in problems[0], "证据要跟着报错一起出现"
+
+    def test_match_passes(self):
+        assert ra.check_probed_threads(1, 1) == []
+
+    def test_unknown_probe_is_not_a_failure(self):
+        """探不出线程数时不判——假装检查过比不检查更糟。"""
+        assert ra.check_probed_threads(None, 24) == []
+
+    def test_probe_returns_none_for_a_bogus_interpreter(self):
+        assert ra.probe_thread_count("/nonexistent/python-xyz", 1) is None
+
+
 class TestPinnedEnv:
     def test_all_four_thread_variables_are_pinned(self):
         env = ra.pinned_env(3)
