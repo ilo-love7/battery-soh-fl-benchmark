@@ -50,11 +50,37 @@ def amplitude(features: np.ndarray) -> np.ndarray:
 
     「幅度」是 ΔQ(V) 曲线最朴素的一个标量摘要。它不含任何形状信息，所以
     拿它当基线，等于问：**除了「这条曲线整体多大」，特征还提供了什么？**
+
+    **它不是一个「万能的」标量**：真实 MATR 数据上，``max|ΔQ|`` 的判别力比
+    常数基线还差（1.17 倍）。:func:`scalar_summaries` 把常见的几种摘要都算
+    出来——如果**每一种**都不如常数基线，那结论是「SOH 不在任何标量幅度里」，
+    而不是「我选的这个标量不好」。
     """
     X = np.asarray(features, dtype=float)
     if X.ndim != 2:
         raise ValueError(f"features 必须是二维，收到 shape={X.shape}")
     return np.abs(X).max(axis=1, keepdims=True)
+
+
+def scalar_summaries(features: np.ndarray) -> dict[str, np.ndarray]:
+    """一组「一维摘要」候选，每个返回 ``(n, 1)``。
+
+    目的是把「幅度有没有用」这个问题与「我选的幅度统计量对不对」分开。
+    只用 ``max|ΔQ|`` 一个数就下结论，等于把两件事混在一起；真实数据上
+    它们全都比常数基线差（1.14–1.31 倍），所以那个结论是稳的。
+    """
+    X = np.asarray(features, dtype=float)
+    if X.ndim != 2:
+        raise ValueError(f"features 必须是二维，收到 shape={X.shape}")
+    absX = np.abs(X)
+    return {
+        "max|ΔQ|": absX.max(axis=1, keepdims=True),
+        "median|ΔQ|": np.median(absX, axis=1, keepdims=True),
+        "mean|ΔQ|": absX.mean(axis=1, keepdims=True),
+        "L2 范数": np.sqrt((X**2).sum(axis=1, keepdims=True)),
+        "峰峰值": (X.max(axis=1) - X.min(axis=1)).reshape(-1, 1),
+        "中点电压处的值": X[:, X.shape[1] // 2].reshape(-1, 1),
+    }
 
 
 def ridge_predict(
@@ -167,6 +193,35 @@ def feature_ladder(
         "shape_only": shape_mae,
         "alpha": float(alpha),
     }
+
+
+def ladder_verdict(ladder: dict) -> str:
+    """把阶梯表读成一句话。**四种情形必须分开**，不能合并成「有没有信号」。
+
+    上一版把 ``shape_only > constant`` 直接写成「形状里没有标签信息（幅度是
+    唯一载体）」——在真实数据上这是**错的**：那里 ``amplitude`` 也比常数基线
+    差（1.17 倍），所以幅度不是载体；信息在幅度与形状的**组合**里（全量
+    0.36 倍）。两件事混成一句，就把一个反直觉的发现读成了「符合预期」。
+    """
+    amp_ok = ladder["amplitude"] < ladder["constant"]
+    shape_ok = ladder["shape_only"] < ladder["constant"]
+    multi_ok = ladder["all_features"] < ladder["amplitude"]
+
+    if amp_ok and shape_ok:
+        head = "幅度与形状各自单独就带信息"
+    elif amp_ok and not shape_ok:
+        head = "信息在幅度里，形状是噪声"
+    elif shape_ok and not amp_ok:
+        head = "信息在形状里，标量幅度是噪声"
+    elif multi_ok:
+        head = "任何一个一维摘要都不够，信息在幅度与形状的组合里"
+    else:
+        head = "特征里没有可用信号（全部特征也不如只用幅度）"
+
+    if multi_ok:
+        gain = ladder["amplitude"] / ladder["all_features"]
+        return f"{head}；全部特征比只用幅度好 {gain:.2f} 倍"
+    return head
 
 
 def ladder_note(ladder: dict, neural_mae: float | None = None) -> str:

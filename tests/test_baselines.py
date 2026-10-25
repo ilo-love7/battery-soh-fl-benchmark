@@ -16,7 +16,9 @@ from flsoh.baselines import (  # noqa: E402
     amplitude,
     feature_ladder,
     ladder_note,
+    ladder_verdict,
     ridge_predict,
+    scalar_summaries,
 )
 
 
@@ -227,3 +229,84 @@ class TestE2EDefaults:
         )
         payload = json.loads(archive.read_text(encoding="utf-8"))
         assert payload["final_mae"] < payload["baseline_mae"]
+
+
+class TestScalarSummaries:
+    def test_every_summary_is_a_column(self):
+        X = np.random.default_rng(0).normal(size=(17, 30))
+        for name, col in scalar_summaries(X).items():
+            assert col.shape == (17, 1), name
+            assert np.isfinite(col).all(), name
+
+    def test_max_summary_agrees_with_amplitude(self):
+        X = np.random.default_rng(1).normal(size=(11, 9))
+        assert np.allclose(scalar_summaries(X)["max|ΔQ|"], amplitude(X))
+
+    def test_magnitude_summaries_are_sign_invariant(self):
+        """ΔQ 整体为负是正常的（容量衰减），**幅度类**摘要不该依赖符号。
+
+        「中点电压处的值」是**带符号**的单个采样点，不在这一条里——它不是
+        幅度摘要，岭回归可以自己翻符号。第一版把六个摘要一起断言，当场被
+        这一格否掉：测试的前提错了，不是代码错了。
+        """
+        rng = np.random.default_rng(2)
+        X = rng.normal(size=(9, 12))
+        pos = scalar_summaries(X)
+        neg = scalar_summaries(-X)
+        magnitudes = [k for k in pos if k != "中点电压处的值"]
+        assert len(magnitudes) == 5
+        for name in magnitudes:
+            assert np.allclose(pos[name], neg[name]), name
+
+    def test_signed_summary_is_not_claimed_to_be_a_magnitude(self):
+        X = np.array([[1.0, -2.0, 3.0]])
+        assert scalar_summaries(X)["中点电压处的值"][0, 0] == -2.0
+
+    def test_rejects_one_dimensional_input(self):
+        with pytest.raises(ValueError, match="二维"):
+            scalar_summaries(np.arange(5.0))
+
+
+class TestLadderVerdict:
+    """四种情形必须分开判。
+
+    上一版把「形状不如常数基线」直接读成「幅度是唯一载体」，而真实数据上
+    幅度也比常数基线差——一句话把反直觉的发现读成了「符合预期」。
+    """
+
+    def _ladder(self, *, constant, amplitude, all_features, shape_only):
+        return {"constant": constant, "amplitude": amplitude,
+                "all_features": all_features, "shape_only": shape_only}
+
+    def test_both_single_views_carry_information(self):
+        v = ladder_verdict(self._ladder(constant=1.0, amplitude=0.5,
+                                        all_features=0.3, shape_only=0.8))
+        assert "各自单独就带信息" in v
+
+    def test_simulated_case_amplitude_only(self):
+        """模拟数据：幅度好、形状是噪声（0.0721 > 0.0264）。"""
+        v = ladder_verdict(self._ladder(constant=0.0264, amplitude=0.0035,
+                                        all_features=0.0061, shape_only=0.0721))
+        assert "信息在幅度里，形状是噪声" in v
+
+    def test_shape_only_case(self):
+        v = ladder_verdict(self._ladder(constant=1.0, amplitude=1.2,
+                                        all_features=0.9, shape_only=0.5))
+        assert "信息在形状里" in v
+
+    def test_real_data_case_neither_view_alone(self):
+        """真实 MATR：幅度 1.174、形状 2.099，都不如常数；全量 0.361。
+
+        这一格最容易被读错——两个单视图都失败，但特征其实很有用。
+        """
+        v = ladder_verdict(self._ladder(constant=0.00179, amplitude=0.00210,
+                                        all_features=0.00065, shape_only=0.00376))
+        assert "任何一个一维摘要都不够" in v
+        assert "组合" in v
+        assert "3.23" in v
+        assert "唯一载体" not in v
+
+    def test_no_signal_at_all(self):
+        v = ladder_verdict(self._ladder(constant=1.0, amplitude=1.1,
+                                        all_features=1.2, shape_only=1.3))
+        assert "没有可用信号" in v
