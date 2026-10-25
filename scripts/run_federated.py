@@ -50,6 +50,7 @@ from flsoh.data import (  # noqa: E402
     make_client_loaders_by_time,
     make_global_test_loader,
 )
+from flsoh.featurespec import read_feature_version  # noqa: E402
 from flsoh.model import build_model  # noqa: E402
 from flsoh.protocol import (  # noqa: E402
     ProtocolError,
@@ -92,6 +93,7 @@ def run_federation(
     noise_multiplier: float | None = None,
     max_grad_norm: float = 1.0,
     target_delta: float = 1e-5,
+    features: str | None = None,
 ) -> dict:
     """跑一轮完整的联邦实验，返回结果 dict（plan.md §9.3 的字段）。
 
@@ -236,6 +238,11 @@ def run_federation(
         # 见 run_local_baseline.py 同名字段：线程数改数值，必须留痕。
         "torch_num_threads": torch.get_num_threads(),
         "python_version": platform.python_version(),
+        # 产物自报「拿哪一版特征训的」。没有这一项，`--skip-existing` 只能
+        # 判文件在不在，于是重跑中断后会把上一版特征的结果当成已完成跳过。
+        "feature_version": (
+            read_feature_version(features) if features else None
+        ),
     }
     if server is not None:
         # 服务端超显必须落盘：默认值来自 flwr，而"默认"会随库版本漂移。
@@ -396,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
         noise_multiplier=noise_multiplier,
         max_grad_norm=max_grad_norm,
         target_delta=target_delta,
+        features=args.features,
     )
 
     scheme = payload.get("scheme") or "unknown"

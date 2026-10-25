@@ -55,6 +55,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+sys.path.insert(0, str(ROOT / "src"))
+
+from flsoh.featurespec import read_feature_version  # noqa: E402
+
 FEDERATED_STRATEGIES = ("fedavg", "fedprox", "fedadam")
 BASELINE_STRATEGIES = ("centralized", "local")
 
@@ -369,18 +373,66 @@ def check_thread_count(runs: dict[str, dict], threads: int) -> list[str]:
     也不假装检查过。字段一旦存在就当成硬约束：实测 C0 在 24 线程与 1 线程下
     差 2.1%（0.0015666428208351135 vs 0.0015997225046157837），而默认线程数
     还意味着结果随机器核数变化。
+
+    **「部分有、部分没有」是另一种错误**：那说明新旧结果混在同一个目录里
+    （典型成因是重跑中断后用 `--skip-existing` 续跑）。只看「有字段的那些」
+    会得到 `{1}` 而判定一致，于是混杂目录被放行——这比线程数本身更危险。
     """
     recorded = {
         int(r["torch_num_threads"]) for r in runs.values() if "torch_num_threads" in r
     }
     if not recorded:
         return []
+    problems: list[str] = []
+    missing = sorted(
+        rid for rid, r in runs.items() if "torch_num_threads" not in r
+    )
+    if missing:
+        problems.append(
+            f"{len(missing)}/{len(runs)} 个 run 没有 torch_num_threads 而其余有："
+            f"新旧结果混在同一个目录里（例如重跑中断后用 --skip-existing 续跑）。"
+            f"例：{missing[:3]}"
+        )
     if recorded != {int(threads)}:
-        return [
+        problems.append(
             f"线程数不一致：--threads {threads}，记录里是 {sorted(recorded)}。"
             "线程数改浮点累加顺序，实测 C0 在 24 与 1 线程下差 2.1%"
-        ]
-    return []
+        )
+    return problems
+
+
+def artifact_is_current(
+    path: Path,
+    *,
+    torch_version: str | None,
+    threads: int,
+    feature_version: str | None,
+) -> bool:
+    """这个产物是不是**本次重跑**的产物——决定 `--skip-existing` 能不能跳。
+
+    原来只判「文件在不在」。`--out` 默认是 `results/`，而那里装的可能是上一次
+    的结果，于是重跑中断后带 `--skip-existing` 续跑会跳过全部任务、打印
+    「剩 0 个」、退出码 0，接着汇总出一张新旧混杂的表。这类错误不抛异常、
+    行数也对，只有数字是旧的。
+
+    判据取「产物自己记了什么」：线程数必须一致；torch 版本与特征口径在能读到
+    期望值时也必须一致。读不出（None）就不拿它下结论——拿一份不报口径的表去
+    证明一致，等于没查。
+    """
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(d, dict) or "final_mae" not in d:
+        return False
+    if d.get("torch_num_threads") != threads:
+        return False
+    if torch_version is not None and d.get("torch_version") != torch_version:
+        return False
+    if feature_version is not None and d.get("feature_version") != feature_version:
+        return False
+    return True
+
 
 
 def pinned_env(threads: int) -> dict[str, str]:
@@ -546,15 +598,43 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.skip_existing:
+        target_torch = probe_torch_version(python)
+        want_version = read_feature_version(features)
+        if target_torch is None or want_version is None:
+            print(
+                "WARN 读不出目标 torch 版本或特征口径（"
+                f"torch={target_torch!r}，feature_version={want_version!r}），"
+                "跳过判定只能靠线程数——这时 --skip-existing 的风险更高，"
+                "确认输出目录本来就是空的更稳妥"
+            )
         kept = []
         skipped = 0
+        stale = 0
         for job in jobs:
-            if all((out_dir / f"{r}.json").exists() for r in job["run_ids"]):
+            fresh = all(
+                artifact_is_current(
+                    out_dir / f"{r}.json",
+                    torch_version=target_torch,
+                    threads=args.threads,
+                    feature_version=want_version,
+                )
+                for r in job["run_ids"]
+            )
+            if fresh:
                 skipped += 1
             else:
+                if any((out_dir / f"{r}.json").exists() for r in job["run_ids"]):
+                    stale += 1
                 kept.append(job)
         jobs = kept
-        print(f"--skip-existing：跳过 {skipped} 个已完成的任务，剩 {len(jobs)} 个")
+        print(
+            f"--skip-existing：跳过 {skipped} 个已完成的任务，剩 {len(jobs)} 个"
+        )
+        if stale:
+            print(
+                f"  其中 {stale} 个任务目录里已有产物，但**不是本次设置的产物**"
+                "（线程数/torch 版本/特征口径对不上），已重新排队"
+            )
 
     est = sum(
         float(job["run"].get("wall_clock_s") or 0) if job["kind"] == "federated"

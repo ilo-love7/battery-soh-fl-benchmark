@@ -39,6 +39,7 @@ from flsoh.data import (  # noqa: E402
     load_feature_table,
     make_global_test_loader,
 )
+from flsoh.featurespec import read_feature_version  # noqa: E402
 from flsoh.model import MLP, build_model  # noqa: E402
 from flsoh.protocol import (  # noqa: E402
     ProtocolError,
@@ -105,7 +106,7 @@ def _train(model, loader, *, epochs: int, lr: float, optimizer: str = "adam") ->
 
 
 def _result(run_id: str, cfg_path: str, strategy: str, *, cells, seed, epochs, lr,
-            mae, rmse, wall, notes="") -> dict:
+            mae, rmse, wall, notes="", features: str | None = None) -> dict:
     """plan.md §9.3 的固定字段。缺的留 null，不删键。"""
     return {
         "run_id": run_id,
@@ -122,6 +123,10 @@ def _result(run_id: str, cfg_path: str, strategy: str, *, cells, seed, epochs, l
         # 机器复现就永远对不上，而且没人知道原因。
         "torch_num_threads": torch.get_num_threads(),
         "python_version": platform.python_version(),
+        # 见 run_federated.py 同名字段：让产物自报特征口径。
+        "feature_version": (
+            read_feature_version(features) if features else None
+        ),
         "final_mae": mae,
         "final_rmse": rmse,
         "rounds_to_target": None,
@@ -210,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         run = _result(
             f"c0__centralized__seed{seed}", args.config, "centralized",
             cells=None, seed=seed, epochs=epochs, lr=lr,
-            mae=m["mae"], rmse=m["rmse"], wall=wall,
+            mae=m["mae"], rmse=m["rmse"], wall=wall, features=args.features,
             notes=(
                 f"test_standardizer={std_strategy}; 全局统计量（C0 允许）; "
                 f"训练电池 {len(train_cells)} 颗，单模型（无客户端概念，n_clients 留空）; "
@@ -244,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
             f"c1__local__seed{seed}", args.config, "local",
             cells=list(partition), seed=seed, epochs=epochs, lr=lr,
             mae=sum(maes) / len(maes), rmse=sum(rmses) / len(rmses), wall=wall,
+            features=args.features,
             notes=(
                 f"test_standardizer={std_strategy}; "
                 f"{len(partition)} 个客户端各训各的，指标为均值（非平均模型）; "

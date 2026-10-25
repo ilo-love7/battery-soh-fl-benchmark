@@ -457,3 +457,247 @@ class TestVerifyOutputs:
         self._write(tmp_path / "a.json", "b")
         problems = ra.verify_outputs({"a": {}}, tmp_path)
         assert problems and "不一致" in problems[0]
+
+
+class TestMixedDirectory:
+    """「部分有字段、部分没有」是另一种错误，必须与「全都没有」分开。
+
+    全都没有 = 一整批旧结果（合法）；部分有 = 新旧混在一个目录里（危险）。
+    原来的检查只看「有字段的那些」，于是混杂目录会得到 {1} 并判定一致，
+    被安静放行。
+    """
+
+    def test_mixed_directory_is_refused(self):
+        runs = {
+            "new": {"torch_num_threads": 1},
+            "old": {"torch_version": "2.10.0+cpu"},
+        }
+        problems = ra.check_thread_count(runs, 1)
+        assert problems, "混杂目录必须被拒绝"
+        assert "1/2" in problems[0]
+        assert "old" in problems[0]
+
+    def test_all_old_is_still_tolerated(self):
+        runs = {"a": {"torch_version": "2.10.0+cpu"},
+                "b": {"torch_version": "2.10.0+cpu"}}
+        assert ra.check_thread_count(runs, 1) == []
+
+
+class TestSkipExistingFreshness:
+    """`--skip-existing` 只能跳「本次设置」的产物。
+
+    原来只判文件存不存在。`--out` 默认是 `results/`，那里装的可能是上一版的
+    结果，于是重跑中断后续跑会跳过全部任务、打印「剩 0 个」、退出码 0，接着
+    汇总出一张新旧混杂的表——不抛异常、行数也对，只有数字是旧的。
+    """
+
+    def _write(self, path, **fields):
+        import json
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"final_mae": 0.001, **fields}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_missing_file_is_not_current(self, tmp_path):
+        assert not ra.artifact_is_current(
+            tmp_path / "x.json",
+            torch_version="2.10.0+cpu",
+            threads=1,
+            feature_version="discharge-v2",
+        )
+
+    def test_old_artifact_without_thread_field_is_not_current(self, tmp_path):
+        """旧产物没有 torch_num_threads，必须重跑而不是跳过。"""
+        path = self._write(tmp_path / "x.json", torch_version="2.10.0+cpu")
+        assert not ra.artifact_is_current(
+            path, torch_version="2.10.0+cpu", threads=1, feature_version=None
+        )
+
+    def test_other_thread_count_is_not_current(self, tmp_path):
+        path = self._write(
+            tmp_path / "x.json", torch_version="2.10.0+cpu",
+            torch_num_threads=24, feature_version="discharge-v2",
+        )
+        assert not ra.artifact_is_current(
+            path, torch_version="2.10.0+cpu", threads=1,
+            feature_version="discharge-v2",
+        )
+
+    def test_other_feature_version_is_not_current(self, tmp_path):
+        path = self._write(
+            tmp_path / "x.json", torch_version="2.10.0+cpu",
+            torch_num_threads=1, feature_version="charge-v1",
+        )
+        assert not ra.artifact_is_current(
+            path, torch_version="2.10.0+cpu", threads=1,
+            feature_version="discharge-v2",
+        )
+
+    def test_other_torch_version_is_not_current(self, tmp_path):
+        path = self._write(
+            tmp_path / "x.json", torch_version="2.14.1+cpu",
+            torch_num_threads=1, feature_version="discharge-v2",
+        )
+        assert not ra.artifact_is_current(
+            path, torch_version="2.10.0+cpu", threads=1,
+            feature_version="discharge-v2",
+        )
+
+    def test_matching_artifact_is_current(self, tmp_path):
+        path = self._write(
+            tmp_path / "x.json", torch_version="2.10.0+cpu",
+            torch_num_threads=1, feature_version="discharge-v2",
+        )
+        assert ra.artifact_is_current(
+            path, torch_version="2.10.0+cpu", threads=1,
+            feature_version="discharge-v2",
+        )
+
+    def test_unknown_expectation_does_not_veto_but_threads_still_count(self, tmp_path):
+        """期望值读不出就不拿它下结论；线程数照样要查。"""
+        ok = self._write(tmp_path / "ok.json", torch_num_threads=1)
+        assert ra.artifact_is_current(
+            ok, torch_version=None, threads=1, feature_version=None
+        )
+        bad = self._write(tmp_path / "bad.json", torch_num_threads=24)
+        assert not ra.artifact_is_current(
+            bad, torch_version=None, threads=1, feature_version=None
+        )
+
+    def test_broken_json_is_not_current(self, tmp_path):
+        path = tmp_path / "x.json"
+        path.write_text("{not json", encoding="utf-8")
+        assert not ra.artifact_is_current(
+            path, torch_version=None, threads=1, feature_version=None
+        )
+
+    def test_file_without_final_mae_is_not_current(self, tmp_path):
+        """划分文件也放在同一个目录，不能被当成已完成产物。"""
+        path = tmp_path / "x.json"
+        path.write_text('{"torch_num_threads": 1}', encoding="utf-8")
+        assert not ra.artifact_is_current(
+            path, torch_version=None, threads=1, feature_version=None
+        )
+
+
+class TestMixedDirectory:
+    """「部分有字段、部分没有」是另一种错误，必须与「全都没有」分开。
+
+    全都没有 = 一整批旧结果（合法）；部分有 = 新旧混在一个目录里（危险）。
+    原来的检查只看「有字段的那些」，于是混杂目录会得到 {1} 并判定一致，
+    被安静放行。
+    """
+
+    def test_mixed_directory_is_refused(self):
+        runs = {
+            "new": {"torch_num_threads": 1},
+            "old": {"torch_version": "2.10.0+cpu"},
+        }
+        problems = ra.check_thread_count(runs, 1)
+        assert problems, "混杂目录必须被拒绝"
+        assert "1/2" in problems[0]
+        assert "old" in problems[0]
+
+    def test_all_old_is_still_tolerated(self):
+        runs = {"a": {"torch_version": "2.10.0+cpu"},
+                "b": {"torch_version": "2.10.0+cpu"}}
+        assert ra.check_thread_count(runs, 1) == []
+
+
+class TestSkipExistingFreshness:
+    """`--skip-existing` 只能跳「本次设置」的产物。
+
+    原来只判文件存不存在。`--out` 默认是 `results/`，那里装的可能是上一版的
+    结果，于是重跑中断后续跑会跳过全部任务、打印「剩 0 个」、退出码 0，接着
+    汇总出一张新旧混杂的表——不抛异常、行数也对，只有数字是旧的。
+    """
+
+    def _write(self, path, **fields):
+        import json
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"final_mae": 0.001, **fields}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_missing_file_is_not_current(self, tmp_path):
+        assert not ra.artifact_is_current(
+            tmp_path / "x.json",
+            torch_version="2.10.0+cpu",
+            threads=1,
+            feature_version="discharge-v2",
+        )
+
+    def test_old_artifact_without_thread_field_is_not_current(self, tmp_path):
+        """旧产物没有 torch_num_threads，必须重跑而不是跳过。"""
+        path = self._write(tmp_path / "x.json", torch_version="2.10.0+cpu")
+        assert not ra.artifact_is_current(
+            path, torch_version="2.10.0+cpu", threads=1, feature_version=None
+        )
+
+    def test_other_thread_count_is_not_current(self, tmp_path):
+        path = self._write(
+            tmp_path / "x.json", torch_version="2.10.0+cpu",
+            torch_num_threads=24, feature_version="discharge-v2",
+        )
+        assert not ra.artifact_is_current(
+            path, torch_version="2.10.0+cpu", threads=1,
+            feature_version="discharge-v2",
+        )
+
+    def test_other_feature_version_is_not_current(self, tmp_path):
+        path = self._write(
+            tmp_path / "x.json", torch_version="2.10.0+cpu",
+            torch_num_threads=1, feature_version="charge-v1",
+        )
+        assert not ra.artifact_is_current(
+            path, torch_version="2.10.0+cpu", threads=1,
+            feature_version="discharge-v2",
+        )
+
+    def test_other_torch_version_is_not_current(self, tmp_path):
+        path = self._write(
+            tmp_path / "x.json", torch_version="2.14.1+cpu",
+            torch_num_threads=1, feature_version="discharge-v2",
+        )
+        assert not ra.artifact_is_current(
+            path, torch_version="2.10.0+cpu", threads=1,
+            feature_version="discharge-v2",
+        )
+
+    def test_matching_artifact_is_current(self, tmp_path):
+        path = self._write(
+            tmp_path / "x.json", torch_version="2.10.0+cpu",
+            torch_num_threads=1, feature_version="discharge-v2",
+        )
+        assert ra.artifact_is_current(
+            path, torch_version="2.10.0+cpu", threads=1,
+            feature_version="discharge-v2",
+        )
+
+    def test_unknown_expectation_does_not_veto_but_threads_still_count(self, tmp_path):
+        """期望值读不出就不拿它下结论；线程数照样要查。"""
+        ok = self._write(tmp_path / "ok.json", torch_num_threads=1)
+        assert ra.artifact_is_current(
+            ok, torch_version=None, threads=1, feature_version=None
+        )
+        bad = self._write(tmp_path / "bad.json", torch_num_threads=24)
+        assert not ra.artifact_is_current(
+            bad, torch_version=None, threads=1, feature_version=None
+        )
+
+    def test_broken_json_is_not_current(self, tmp_path):
+        path = tmp_path / "x.json"
+        path.write_text("{not json", encoding="utf-8")
+        assert not ra.artifact_is_current(
+            path, torch_version=None, threads=1, feature_version=None
+        )
+
+    def test_file_without_final_mae_is_not_current(self, tmp_path):
+        """划分文件也放在同一个目录，不能被当成已完成产物。"""
+        path = tmp_path / "x.json"
+        path.write_text('{"torch_num_threads": 1}', encoding="utf-8")
+        assert not ra.artifact_is_current(
+            path, torch_version=None, threads=1, feature_version=None
+        )
