@@ -1,0 +1,21 @@
+{
+  "run_id": "c0__centralized__seed4",
+  "config": "configs/mvp.toml",
+  "strategy": "centralized",
+  "n_clients": null,
+  "scheme": null,
+  "alpha": null,
+  "seed": 4,
+  "flwr_version": null,
+  "torch_version": "2.10.0+cpu",
+  "torch_num_threads": 1,
+  "python_version": "3.13.14",
+  "final_mae": 0.0016466563940048219,
+  "final_rmse": 0.003124307141432095,
+  "rounds_to_target": null,
+  "curve": [],
+  "wall_clock_s": 39.463,
+  "epochs": 300,
+  "learning_rate": 0.001,
+  "notes": "test_standardizer=test; 全局统计量（C0 允许）; 训练电池 115 颗，单模型（无客户端概念，n_clients 留空）; optimizer=adam; label_center=SOH_CENTER"
+}

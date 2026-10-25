@@ -580,6 +580,19 @@ def heal_stale_empty(parts: Path, cells: list[dict]) -> list[str]:
     return healed
 
 
+def resume_hint(restart: bool) -> str:
+    """网络中断后的续跑提示。
+
+    ``--restart`` 在 ``main`` 开头就 ``rmtree(parts)``，所以「重跑同一条命令」
+    在带 ``--restart`` 时是**错的**——照抄会把刚攒的分片全删掉再从头跑。
+    这条提示写错不会报任何异常，只是让用户在 3.5 小时的任务上反复白跑，
+    所以单独抽出来测。
+    """
+    if restart:
+        return "重跑时**去掉 --restart**（它会先清空分片目录），已有的分片会跳过。"
+    return "重跑同一条命令即可续跑，已有的分片会跳过。"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="生成 MATR per-cycle 特征表")
     parser.add_argument("--manifest", required=True, type=Path)
@@ -776,8 +789,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(flush=True)
                 print(f"网络失败，本轮中止：{pending[0]}", flush=True)
                 print(
-                    f"已落盘 {done_now} 颗。重跑**同一条命令**即可续跑，"
-                    "已有的分片会跳过。",
+                    f"已落盘 {done_now} 颗。{resume_hint(args.restart)}",
                     flush=True,
                 )
                 return 1

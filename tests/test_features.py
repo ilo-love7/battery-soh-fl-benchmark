@@ -478,3 +478,44 @@ class TestResumeEndToEnd:
         assert main(self._args(tmp_path, manifest, raw, out)) == 0
         assert len(pd.read_parquet(out)) == 12, "重新抽一遍，结果必须一样"
 
+
+
+class TestResumeHint:
+    """续跑提示必须与实际行为一致。
+
+    这类错误的形状是「输出完全正常，只是把用户引到错的操作上」：
+    提示本身不抛异常、不影响任何数值，但照做会删掉已落盘的分片。
+    """
+
+    def test_restart_is_told_to_be_dropped(self):
+        hint = bf.resume_hint(restart=True)
+        assert "--restart" in hint
+        assert "去掉" in hint
+
+    def test_plain_rerun_is_fine_without_restart(self):
+        hint = bf.resume_hint(restart=False)
+        assert "--restart" not in hint
+        assert "同一条命令" in hint
+
+    def test_restart_really_does_wipe_parts(self, tmp_path):
+        """负控：如果 --restart 不删分片，上面那条提示就是多余的。
+
+        这条测试直接钉住「--restart 会 rmtree」这个事实。哪天 --restart
+        改成只清状态不清分片，这里会红，提示文字也该跟着改。
+        """
+        import shutil
+
+        from build_features import main
+
+        manifest, raw = TestResumeEndToEnd()._setup(tmp_path)
+        args = TestResumeEndToEnd()._args(
+            tmp_path, manifest, raw, tmp_path / "features.parquet"
+        )
+        assert main(args + ["--keep-parts"]) == 0
+        parts = parts_dir_for(tmp_path / "features.parquet")
+        assert list(parts.glob("*.parquet")), "前提：第一轮应当留下分片"
+
+        # 再跑一次带 --restart：分片目录被清空后重建，中间不留旧文件。
+        assert main(args + ["--keep-parts", "--restart"]) == 0
+        assert parts.is_dir(), "重启后应当重新生成分片"
+        shutil.rmtree(parts)
