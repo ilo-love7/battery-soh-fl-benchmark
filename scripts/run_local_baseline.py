@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import sys
 import time
 from pathlib import Path
@@ -116,6 +117,11 @@ def _result(run_id: str, cfg_path: str, strategy: str, *, cells, seed, epochs, l
         "seed": seed,
         "flwr_version": None,   # 基线不走 flwr 运行时，如实留空
         "torch_version": torch.__version__,
+        # 线程数要落盘：它改浮点累加顺序，实测 C0 在 24 线程与 1 线程下
+        # 差 2.1%（0.0015666 vs 0.0015997）。不记这一项，换台核数不同的
+        # 机器复现就永远对不上，而且没人知道原因。
+        "torch_num_threads": torch.get_num_threads(),
+        "python_version": platform.python_version(),
         "final_mae": mae,
         "final_rmse": rmse,
         "rounds_to_target": None,

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import sys
 import time
 from pathlib import Path
@@ -232,6 +233,9 @@ def run_federation(
         "test_standardizer": used_test_strategy,
         "backend": "local-loop",
         "torch_version": torch.__version__,
+        # 见 run_local_baseline.py 同名字段：线程数改数值，必须留痕。
+        "torch_num_threads": torch.get_num_threads(),
+        "python_version": platform.python_version(),
     }
     if server is not None:
         # 服务端超显必须落盘：默认值来自 flwr，而"默认"会随库版本漂移。

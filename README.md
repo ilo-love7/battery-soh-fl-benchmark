@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-653-blue)](./tests)
+[![Tests](https://img.shields.io/badge/tests-699-blue)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -84,6 +84,7 @@ So this repo treats the *checkers* as the deliverable, not the training loop.
 | **`scripts/check_features.py`** | The gate that would have caught the 2026-10-25 feature bug: per-row total variation / amplitude. Correct data scores 5.9, mis-paired points score 122.4 |
 | **`scripts/simulate_sessions.py`** | Emits Schema v1 JSONL + a truth file. Validates its own output against the schema — synthetic data does not get a pass |
 | **`scripts/run_e2e.py`** | End-to-end: sessions → ingest → features → smoothness gate → split → federated training → results JSON. Five gates, each with a non-zero exit code. Reports a constant baseline alongside MAE, because MAE alone is unreadable |
+| **`scripts/rerun_all.py`** | Reconstructs each run's command line from its result JSON and replays all 172 runs. Refuses to run when the assembled feature table is stale, when the interpreter's torch version differs from the recorded one, or when the thread count differs — all three change the numbers without changing the output's shape |
 | **`scripts/check_schema.py`** | Validates a JSONL session dump against Schema v1. Exit 1 for a bad session, 2 for unparseable input — never a silent skip |
 | **`scripts/check_dp_budget.py`** | Computes ε **before** you sweep `noise_multiplier`. ε is not a free variable: `q` and the step count are fixed by the protocol, and nm=1 lands at ε=152.31 here |
 | **`scripts/check_continuations.py`** | Proves that 5 batch-2 cells are continuations of 5 batch-1 cells, using four independent lines of evidence. Wrong pairing would delete healthy cells invisibly |
