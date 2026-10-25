@@ -148,11 +148,17 @@ torch 就换了 BLAS 内核与算子实现，累加顺序随之改变，300 个 
 「复现了」。所以本轮统一钉 `OMP_NUM_THREADS=1`（比 24 线程慢约 9%，但唯一与
 硬件无关），产物里同时记 `torch_num_threads` 与 `python_version`。
 
+**上表只给了 1 个样本，会低估线程数的影响。** 补跑 56 对配对（旧表，24 线程
+→ 1 线程，7 配置 × 8 seeds）后：|相对差| **中位 1.86%、最大 27.37%**，方向
+**28 好 / 28 差完全对称**。对称说明它是随机源而非系统性偏移——量级与 seed
+噪声（相对标准差 5%–63%）同阶，等价于「又抽了一次 seed」。判据阈值是 5%，
+而线程数能单独造成 27%，所以跨机器比较必然失效；C0 seed0 的 2.1% 只是运气好。
+
 **这带来一个对比上的约束**：`results/fullcycle-bug/` 里归档的旧口径数字跑在
 24 线程下，**不能**与新的 1 线程数字直接相减。要量「特征修复改了多少」，必须
-在同一线程数下把旧表重跑一遍（`scripts/rerun_all.py --features
-data/mit-stanford/features.fullcycle-bug.parquet`）。`scripts/rerun_all.py` 把
-torch 版本与线程数不一致都做成了硬闸门。
+在同一线程数下把旧表重跑一遍——已跑完，56 个 run 在
+`results/ablation-old-features/`（旧表 + 1 线程），作为特征效应的对照基准。
+`scripts/rerun_all.py` 把 torch 版本与线程数不一致都做成了硬闸门。
 
 
 ## 4. 主结果（**待复核**，见 §0）
