@@ -875,6 +875,22 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
+        # 真实电池必然老化：同一电压点的放电容量随循环只会变小。所以「量不出
+        # 相关」在真实数据上不是「未判定」，是特征没取到容量——模拟数据路径
+        # 才允许未判定（那里的电池不随老化改变形状，M5 遗留）。
+        if report["rho_undetermined"]:
+            print(
+                f"老化信号量不出来：{report['rho_n_cells_total']} 颗电池里只有 "
+                f"{report['rho_n_cells_judged']} 颗算得出「特征 vs 循环号」的相关。"
+                "真实电池必然老化，出现这一行说明特征里没有容量衰减信息"
+                "（例如取到了 Qc 恒定的充电段）。",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"老化信号自检：跨电池 ρ 中位 {report['rho_median']:.3f}"
+              f"（上限 {report['rho_min_median_rho']:.2f}），"
+              f"ρ ≤ −0.8 的电池 {report['rho_frac_strong']:.0%}"
+              f"（下限 {report['rho_min_fraction_strong']:.0%}）")
         if not report_is_ok(report):
             if report["median_over_limit"]:
                 print(
@@ -884,13 +900,26 @@ def main(argv: list[str] | None = None) -> int:
                     "充电+放电两段），再查电压网格是否落在数据值域内。",
                     file=sys.stderr,
                 )
-            else:
+            elif report["n_over_limit"]:
                 print(
                     f"{report['n_over_limit']} 行越过单行硬上限 "
                     f"{report['max_tv_ratio_hard']:.1f}——个别行坏掉，"
                     "中位数看不出来。",
                     file=sys.stderr,
                 )
+            if report["label_signal_bad"]:
+                print(
+                    f"老化信号不够强：跨电池 ρ 中位 {report['rho_median']:.3f}"
+                    f"（应低于 {report['rho_min_median_rho']:.2f}），"
+                    f"ρ ≤ −0.8 的电池只占 {report['rho_frac_strong']:.0%}"
+                    f"（应不低于 {report['rho_min_fraction_strong']:.0%}）。"
+                    "曲线可以很光滑却不随老化变化——错口径的旧表就是这种情况"
+                    "（ρ 中位 −0.168）。",
+                    file=sys.stderr,
+                )
+                for row in report["rho_weakest"]:
+                    print(f"    {row['cell_id']}: ρ = {row['rho']:.3f}",
+                          file=sys.stderr)
             for row in report["worst"]:
                 print(f"    {row['cell_id']} 循环 {row['cycle']}: "
                       f"TV/幅度 = {row['tv_ratio']:.1f}", file=sys.stderr)

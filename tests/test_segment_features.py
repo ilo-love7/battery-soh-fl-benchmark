@@ -400,3 +400,98 @@ class TestTwoTierGate:
                            ("median_over_limit", True),
                            ("n_over_limit", 3)):
             assert cf.report_is_ok({**base, key: value}) is False, key
+
+
+class TestLabelSignal:
+    """光滑 ≠ 有信息：第三道闸门测的是「特征有没有随老化变化」。
+
+    为什么必须单独有这道：一条常数曲线的 TV/幅度 是 0，完美光滑。所以前两道
+    闸门（中位数、单行硬上限）**结构上不可能**发现「特征与标签无关」。
+    2026-10-25 的错口径表恰好两者都坏，但如果只修好光滑性而取错电压区间，
+    就会得到一张又光滑又无信息的表——这道闸门就是为那种情况准备的。
+
+    真实数据上的分辨力（每颗电池取 1000 个电压点的中位 ρ，再跨电池汇总）：
+
+    ============ =========== ================
+    表            ρ 中位      ρ ≤ −0.8 的占比
+    ============ =========== ================
+    错口径旧表     −0.1677     0/135
+    正确新表       −0.9789     61/67
+    ============ =========== ================
+    """
+
+    CYCLES = list(range(5, 105, 5))
+    N = 200
+
+    @staticmethod
+    def _frame(*, decay: float, jitter: float = 0.0, cells: int = 6):
+        """造一张「每颗电池 K 个循环」的特征表。
+
+        ``decay`` 是每个循环的幅度衰减比例（0.2 = 100 个循环掉 20%），
+        ``jitter`` 是逐循环的独立噪声幅度。jitter 与循环号无关时，ρ ≈ 0：
+        曲线仍然很光滑，但它不含任何老化信息。
+        """
+        rng = np.random.default_rng(0)
+        base = np.linspace(0.0, 0.03, TestLabelSignal.N)
+        cycles = TestLabelSignal.CYCLES
+        noise = {k: rng.normal(0.0, jitter, TestLabelSignal.N) for k in cycles}
+        rows = []
+        for c in range(cells):
+            for k in cycles:
+                amp = (1.0 + 0.01 * c) * (1.0 - decay * (k - 1) / 100.0)
+                values = base * amp + noise[k]
+                rows.append({
+                    "cell_id": f"c{c}", "cycle": k, "soh": 1.0,
+                    **{f"f{j}": float(v) for j, v in enumerate(values)},
+                })
+        return pd.DataFrame(rows)
+
+    def test_aging_table_passes(self):
+        """正控：幅度随循环衰减 → ρ 接近 −1，通过。"""
+        report = cf.check_feature_frame(self._frame(decay=0.2))
+        assert report["rho_median"] < -0.9
+        assert report["rho_frac_strong"] == 1.0
+        assert report["label_signal_bad"] is False
+        assert report["rho_undetermined"] is False
+        assert cf.report_is_ok(report) is True
+
+    def test_smooth_but_uninformative_table_fails(self):
+        """负控（这道闸门存在的理由）：光滑通过、信号为零 → 必须失败。
+
+        这张表的 TV/幅度 是 1.0（远低于 20），两道光滑性闸门都放行。
+        只有 ρ 能指出「每颗电池的曲线在 20 个循环里没变过」。
+        """
+        report = cf.check_feature_frame(self._frame(decay=0.0, jitter=1e-6))
+        assert report["median_over_limit"] is False, "前提：光滑性闸门必须放行"
+        assert report["n_over_limit"] == 0, "前提：光滑性闸门必须放行"
+        assert abs(report["rho_median"]) < 0.3
+        assert report["label_signal_bad"] is True
+        assert cf.report_is_ok(report) is False
+
+    def test_reversed_trend_also_fails(self):
+        """幅度随循环变大（比无信息更坏）同样要被拦。"""
+        report = cf.check_feature_frame(self._frame(decay=-0.2))
+        assert report["rho_median"] > 0.9
+        assert report["label_signal_bad"] is True
+        assert cf.report_is_ok(report) is False
+
+    def test_all_constant_table_is_undetermined_not_passed(self):
+        """整表常数 → 「未判定」，**不是**「通过」。
+
+        秩相关会把「所有值相同」变成「秩 0,1,2,…」，看起来像完美正相关；
+        必须显式把常数列判成 NaN。另外这里用的是 ptp 而不是 std——`np.std`
+        对完全相同的值会因均值误差给出 6e-19，判不出 0（实测踩过）。
+        """
+        report = cf.check_feature_frame(self._frame(decay=0.0))
+        assert report["rho_n_cells_judged"] == 0
+        assert report["rho_undetermined"] is True
+        assert report["label_signal_bad"] is False, "未判定不许写成失败"
+        # report_is_ok 不把「未判定」当失败（模拟路径需要），但调用点必须
+        # 自己看这个标志——build_features.py 就是这么做的。
+        assert cf.report_is_ok(report) is True
+
+    def test_report_is_ok_includes_the_label_signal(self):
+        base = {"too_many_zero_rows": False, "median_over_limit": False,
+                "n_over_limit": 0}
+        assert cf.report_is_ok(base) is True
+        assert cf.report_is_ok({**base, "label_signal_bad": True}) is False

@@ -67,6 +67,35 @@ TV ≈ TV_信号 + TV_噪声，幅度越小，噪声占比越大，比值就越�
   60 对两边各留约 2.7 倍余量。
 
 退出码：0 = 通过；1 = 中位数超限或有行越过硬上限；2 = 输入读不了。
+
+## 第三道检查：特征到底有没有携带「老化」这件事
+
+TV/幅度 只能说明「曲线是光滑的」。**光滑但无意义同样能过**——一条常数曲线
+的 TV/幅度 是 0，完美光滑，而它不含任何信息。所以这里再加一条与光滑性完全
+无关的物理约束：同一电压点上，SOH 从 1.0 掉到 0.8 时放电容量只会变小，因此
+``ΔQ_k(V) = Qd_k(V) − Qd_ref(V)`` 与循环号 k 的 Spearman 相关**必须显著为负**。
+
+2026-10-25 实测（每颗电池取 1000 个电压点的中位相关，再跨电池汇总）：
+
+    ============ ============ ==========================
+    表             ρ 中位       ρ > −0.5 的电池
+    ============ ============ ==========================
+    错口径（旧）    −0.1677      135/135
+    正确（新）      −0.9789      6/67
+    ============ ============ ==========================
+
+分辨力比 TV/幅度 强得多：错口径**一颗电池都没过** −0.5，正确口径 61/67 颗
+低于 −0.8。原因是它测的是「特征与标签有没有关系」，而这正是特征存在的理由；
+TV/幅度 测的是「曲线像不像一条曲线」，与信息量无关。
+
+阈值 ``--min-median-rho -0.7``（跨电池中位）与 ``--min-fraction-strong 0.8``
+（ρ ≤ −0.8 的电池占比）：正确数据 −0.979 / 0.91，错口径 −0.168 / 0.00，
+两边都不贴线。
+
+**「量不出来」与「量出来是坏的」必须分开报**。模拟数据路径上电池不随老化
+改变形状（M5 遗留），ρ 全为 NaN，那时输出「未判定」而不是「通过」——
+这与仓库里「算法免疫 vs 处理未施加」是同一个坑：两种情况的指标一样，
+结论相反。真实电池必然老化，所以 ``build_features.py`` 把「未判定」也判失败。
 """
 
 from __future__ import annotations
@@ -94,12 +123,105 @@ DEFAULT_MAX_TV_RATIO = 20.0
 #: **单行**硬上限：管个别行坏掉。正确数据最大 21.75，错配逐行 122–172。
 DEFAULT_MAX_TV_RATIO_HARD = 60.0
 
+#: 跨电池的「每颗电池中位 ρ」必须低于它。正确 −0.979，错口径 −0.168。
+DEFAULT_MAX_MEDIAN_RHO = -0.7
+
+#: ρ ≤ −0.8 的电池至少要占这个比例。正确 0.91，错口径 0.00。
+DEFAULT_MIN_FRACTION_STRONG = 0.8
+
+#: 低于这个数的电池算「没有明显衰减信号」，用于 ``min_fraction_strong``。
+_STRONG_RHO = -0.8
+
+#: 能算出 ρ 的电池占比低于它 → 「未判定」，不假装通过也不假装失败。
+_MIN_JUDGED_FRACTION = 0.5
+
+
+def _column_ranks(values: np.ndarray) -> np.ndarray:
+    """按列取秩（0,1,2,…）。
+
+    用 ``argsort`` 的秩而不是平均秩：特征列是连续浮点，实测无并列值。并列值
+    存在时这里给的是「按出现顺序的秩」，与平均秩略有差异——这条检查只做
+    「显著为负 / 不显著为负」的判定，差异远小于阈值间隔，所以不做并列平均。
+    """
+    order = np.argsort(values, axis=0, kind="stable")
+    ranks = np.empty(order.shape, dtype=float)
+    grid = np.arange(values.shape[0], dtype=float)[:, None]
+    np.put_along_axis(ranks, order, np.broadcast_to(grid, order.shape), axis=0)
+    return ranks
+
+
+def label_signal(
+    matrix: np.ndarray,
+    cells: np.ndarray,
+    cycles: np.ndarray,
+    *,
+    min_median_rho: float = DEFAULT_MAX_MEDIAN_RHO,
+    min_fraction_strong: float = DEFAULT_MIN_FRACTION_STRONG,
+) -> dict:
+    """每颗电池「特征 vs 循环号」的 Spearman 相关——特征有没有携带老化信息。
+
+    与 TV/幅度 完全独立：那条看曲线像不像曲线，这条看曲线**有没有变**。
+    一条常数曲线 TV/幅度 = 0（完美光滑）却毫无信息，只有这条能抓到。
+
+    逐列算 ρ 后取中位数：个别电压点落在平台区、或噪声主导，中位数比均值稳。
+    """
+    per_cell: list[tuple[str, float]] = []
+    for cell in dict.fromkeys(cells.tolist()):  # 保持出现顺序去重
+        mask = cells == cell
+        if int(mask.sum()) < 3:
+            continue  # 少于 3 个循环点算不出相关
+        block = matrix[mask]
+        if not np.isfinite(block).all():
+            continue
+        rx = _column_ranks(block)
+        rk = _column_ranks(cycles[mask].reshape(-1, 1)).ravel()
+        rx = rx - rx.mean(axis=0)
+        rk = rk - rk.mean()
+        denom = np.sqrt((rx**2).sum(axis=0) * (rk**2).sum())
+        with np.errstate(invalid="ignore", divide="ignore"):
+            rho = (rx * rk[:, None]).sum(axis=0) / denom
+        # 常数列必须显式判掉：秩变换会把「所有值相同」变成「秩 0,1,2,…」，
+        # 于是常数列看起来是完美正相关（+1），而它其实什么信息都没有。
+        # 这是秩相关最容易踩的坑，也让「整块常数」误判成「信号反向」。
+        # 用 ptp 而不是 std：`np.std` 对完全相同的值会因均值误差给出 6e-19，
+        # 判不出 0（实测踩过）。
+        flat = np.ptp(block, axis=0) == 0.0
+        rho = np.where(flat, np.nan, rho)
+        if not np.isfinite(rho).any():
+            continue  # 整块常数：算不出相关
+        per_cell.append((str(cell), float(np.nanmedian(rho))))
+
+    n_total = len(set(cells.tolist()))
+    n_judged = len(per_cell)
+    undetermined = n_total == 0 or n_judged < max(1, _MIN_JUDGED_FRACTION * n_total)
+    rhos = np.array([r for _, r in per_cell], dtype=float)
+    rho_median = float(np.median(rhos)) if n_judged else float("nan")
+    frac_strong = float((rhos <= _STRONG_RHO).sum() / n_judged) if n_judged else 0.0
+    weak = sorted(per_cell, key=lambda t: t[1], reverse=True)[:5]
+    bad = bool(
+        not undetermined
+        and (rho_median > min_median_rho or frac_strong < min_fraction_strong)
+    )
+    return {
+        "rho_median": rho_median,
+        "rho_frac_strong": frac_strong,
+        "rho_min_median_rho": min_median_rho,
+        "rho_min_fraction_strong": min_fraction_strong,
+        "rho_n_cells_judged": n_judged,
+        "rho_n_cells_total": n_total,
+        "rho_undetermined": bool(undetermined),
+        "label_signal_bad": bad,
+        "rho_weakest": [{"cell_id": c, "rho": r} for c, r in weak],
+    }
+
 
 def check_feature_table(
     path: str | Path,
     *,
     max_tv_ratio: float = DEFAULT_MAX_TV_RATIO,
     max_tv_ratio_hard: float = DEFAULT_MAX_TV_RATIO_HARD,
+    min_median_rho: float = DEFAULT_MAX_MEDIAN_RHO,
+    min_fraction_strong: float = DEFAULT_MIN_FRACTION_STRONG,
     top: int = 10,
 ) -> dict:
     """对特征表文件逐行算 TV/幅度，返回统计与超限行。
@@ -131,6 +253,8 @@ def check_feature_table(
         n_features=len(feats),
         max_tv_ratio=max_tv_ratio,
         max_tv_ratio_hard=max_tv_ratio_hard,
+        min_median_rho=min_median_rho,
+        min_fraction_strong=min_fraction_strong,
         top=top,
     )
     report["path"] = str(path)
@@ -142,6 +266,8 @@ def check_feature_frame(
     *,
     max_tv_ratio: float = DEFAULT_MAX_TV_RATIO,
     max_tv_ratio_hard: float = DEFAULT_MAX_TV_RATIO_HARD,
+    min_median_rho: float = DEFAULT_MAX_MEDIAN_RHO,
+    min_fraction_strong: float = DEFAULT_MIN_FRACTION_STRONG,
     top: int = 10,
 ) -> dict:
     """同一套判据，输入换成 DataFrame。
@@ -165,6 +291,8 @@ def check_feature_frame(
         n_features=len(feats),
         max_tv_ratio=max_tv_ratio,
         max_tv_ratio_hard=max_tv_ratio_hard,
+        min_median_rho=min_median_rho,
+        min_fraction_strong=min_fraction_strong,
         top=top,
     )
     report["path"] = "<memory>"
@@ -179,6 +307,8 @@ def check_matrix(
     n_features: int,
     max_tv_ratio: float = DEFAULT_MAX_TV_RATIO,
     max_tv_ratio_hard: float = DEFAULT_MAX_TV_RATIO_HARD,
+    min_median_rho: float = DEFAULT_MAX_MEDIAN_RHO,
+    min_fraction_strong: float = DEFAULT_MIN_FRACTION_STRONG,
     top: int = 10,
 ) -> dict:
     """判据本体：逐行 TV/幅度。文件与 DataFrame 两条入口都走这里。"""
@@ -265,6 +395,12 @@ def check_matrix(
         "max_step_ratio_max": float(np.max(steps)) if steps else float("nan"),
         "worst": [{"cell_id": c, "cycle": k, "tv_ratio": v}
                   for v, c, k in over_hard[:top]],
+        # 第三道：特征有没有携带老化信息（与上面两道完全独立）。
+        **label_signal(
+            matrix, cells, cycles,
+            min_median_rho=min_median_rho,
+            min_fraction_strong=min_fraction_strong,
+        ),
     }
 
     # 注：`worst` 只列越过硬上限的行。中位数超限时那几行的具体值意义不大
@@ -277,11 +413,17 @@ def report_is_ok(report: dict) -> bool:
     三个调用点（本脚本的 CLI、``build_features.py``、``run_e2e.py``）必须用
     同一个规则。各自拼条件的话，改判据时漏掉一处就会「一个入口说通过、
     另一个说失败」，而两条路径的输出都很正常。
+
+    ``rho_undetermined`` **不算失败**——模拟数据路径上电池不随老化改变形状，
+    量不出相关是正常的。但也不等于通过：调用点要自己决定要不要把它当失败
+    （``build_features.py`` 会，因为真实电池必然老化）。把「未判定」写成
+    「通过」正是仓库里「算法免疫 vs 处理未施加」那个坑的形状。
     """
     return not (
         report.get("too_many_zero_rows")
         or report.get("median_over_limit")
         or report.get("n_over_limit")
+        or report.get("label_signal_bad")
     )
 
 
@@ -297,6 +439,14 @@ def main(argv=None) -> int:
                         default=DEFAULT_MAX_TV_RATIO_HARD,
                         help=f"TV/幅度 的**单行**硬上限（默认 "
                              f"{DEFAULT_MAX_TV_RATIO_HARD}），管个别坏行")
+    parser.add_argument("--min-median-rho", type=float,
+                        default=DEFAULT_MAX_MEDIAN_RHO,
+                        help="跨电池的「特征 vs 循环号」中位 Spearman 相关上限"
+                             f"（默认 {DEFAULT_MAX_MEDIAN_RHO}，越负越好）")
+    parser.add_argument("--min-fraction-strong", type=float,
+                        default=DEFAULT_MIN_FRACTION_STRONG,
+                        help="ρ ≤ −0.8 的电池至少要占这个比例"
+                             f"（默认 {DEFAULT_MIN_FRACTION_STRONG}）")
     parser.add_argument("--top", type=int, default=10, help="最多打印几行越界样本")
     args = parser.parse_args(argv)
 
@@ -305,6 +455,8 @@ def main(argv=None) -> int:
             args.table,
             max_tv_ratio=args.max_tv_ratio,
             max_tv_ratio_hard=args.max_tv_ratio_hard,
+            min_median_rho=args.min_median_rho,
+            min_fraction_strong=args.min_fraction_strong,
             top=args.top,
         )
     except DataContractError as exc:
@@ -321,6 +473,16 @@ def main(argv=None) -> int:
         print(f"[check_features] 诊断：{report['n_soft_over']} 行落在中位数阈值与"
               "硬上限之间。它们是低幅度行（噪声占比高），不判失败；"
               "只在幅度分位表里看它们是否集中在最小那一档。")
+    if report["rho_undetermined"]:
+        print(f"[check_features] 未判定：{report['rho_n_cells_total']} 颗电池里只有 "
+              f"{report['rho_n_cells_judged']} 颗算得出「特征 vs 循环号」的相关。"
+              "模拟数据路径上电池不随老化改变形状，这是预期的；真实数据上"
+              "出现这一行说明特征没取到容量衰减。", file=sys.stderr)
+    else:
+        print(f"[check_features] 老化信号：跨电池 ρ 中位 {report['rho_median']:.3f}"
+              f"（上限 {report['rho_min_median_rho']:.2f}），"
+              f"ρ ≤ −0.8 的电池 {report['rho_frac_strong']:.0%}"
+              f"（下限 {report['rho_min_fraction_strong']:.0%}）")
     if report["too_many_zero_rows"]:
         print(f"[check_features] FAIL：{report['n_reference_rows']} 行全零，"
               f"而只有 {report['n_cells']} 颗电池。每颗电池最多一个参考循环——"
@@ -336,10 +498,19 @@ def main(argv=None) -> int:
               f"超过 {report['max_tv_ratio']:.1f}。这不是「精度差一点」，是整张表的"
               "插值链把不相干的点配到了一起——先查分段（MATR 每个循环含充电+放电"
               "两段）再查电压网格。", file=sys.stderr)
-    else:
+    elif report["n_over_limit"]:
         print(f"[check_features] FAIL：{report['n_over_limit']} 行越过单行硬上限 "
               f"{report['max_tv_ratio_hard']:.1f}。个别行坏掉（NaN、整行常数、"
               "某颗电池曲线错配），中位数看不出来，所以单独拦。", file=sys.stderr)
+    if report["label_signal_bad"]:
+        print(f"[check_features] FAIL：特征与循环号的相关**不够负**——跨电池 ρ 中位 "
+              f"{report['rho_median']:.3f}（应低于 {report['rho_min_median_rho']:.2f}），"
+              f"ρ ≤ −0.8 的电池只占 {report['rho_frac_strong']:.0%}"
+              f"（应不低于 {report['rho_min_fraction_strong']:.0%}）。曲线可能很光滑，"
+              "但它没有随老化变化——错口径的旧表 ρ 中位只有 −0.168。"
+              "最弱的几颗：", file=sys.stderr)
+        for row in report["rho_weakest"]:
+            print(f"    {row['cell_id']}: ρ = {row['rho']:.3f}", file=sys.stderr)
     for row in report["worst"]:
         print(f"    {row['cell_id']} 循环 {row['cycle']}: TV/幅度 = {row['tv_ratio']:.1f}",
               file=sys.stderr)

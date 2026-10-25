@@ -21,8 +21,14 @@
 | 入库 | Schema v1 校验（:mod:`flsoh.schema`） | 结构合法、语义相反的数据进训练集 |
 | 去重 | 按内容指纹去重 | 重试上传被算成新数据，客户端样本量虚高 |
 | 特征 | TV/幅度 ≤ 60（:mod:`check_features`） | 插值把不相干的点配到一起，而形状完全正常 |
+| 特征 | 老化信号 ρ ≤ −0.7（同一模块） | 曲线又光滑又不随老化变化——TV 结构上抓不到 |
 | 标签 | 缺真值直接拒绝 | 缺标签的行把损失静默拉向 0 |
 | 训练 | 训练电池与测试电池不得相交 | val 指标虚高 |
+
+**为什么「老化信号」这道必须单独存在**：一条常数曲线的 TV/幅度 是 0，完美光滑。
+TV 判据问的是「曲线像不像一条曲线」，回答不了「曲线有没有在变」。模拟路径上
+实测 ρ 中位 −1.000（模拟器把 SOH 几乎全编码在幅度上，整条曲线按容量因子缩放），
+所以这道闸门在这里的余量很大；它真正的用途是拦「取错电压区间但恰好光滑」。
 
 ## 为什么这里的 TV 阈值是 60 而不是实验室路径的 20
 
@@ -203,6 +209,24 @@ def main(argv: list[str] | None = None) -> int:
         f"（诊断量，不设闸门）",
         flush=True,
     )
+    # 光滑 ≠ 有信息：一条常数曲线 TV/幅度 也是 0。所以这里同时报「特征有没有
+    # 随老化变化」。模拟器只改幅度不改形状，这条信号仍然应该很强（整条曲线
+    # 按容量因子缩放 → 每个电压点都随循环单调下降）。
+    if smooth["rho_undetermined"]:
+        print(
+            f"[e2e] 老化信号：未判定（{smooth['rho_n_cells_judged']}/"
+            f"{smooth['rho_n_cells_total']} 颗电池算得出相关）——模拟数据里"
+            "电池不随老化改变形状是已知局限，不算失败",
+            flush=True,
+        )
+    else:
+        print(
+            f"[e2e] 老化信号：跨电池 ρ 中位 {smooth['rho_median']:.3f}"
+            f"（上限 {smooth['rho_min_median_rho']:.2f}），"
+            f"ρ ≤ −0.8 的电池 {smooth['rho_frac_strong']:.0%}"
+            f"（下限 {smooth['rho_min_fraction_strong']:.0%}）",
+            flush=True,
+        )
     if not report_is_ok(smooth):
         print(
             "FAIL 特征表不够光滑——这不是精度问题，是插值链上把不相干的点配到了"
@@ -214,6 +238,13 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"    {row['cell_id']} 第 {row['cycle']} 个会话: "
                 f"TV/幅度 = {row['tv_ratio']:.1f}",
+                file=sys.stderr,
+            )
+        if smooth["label_signal_bad"]:
+            print(
+                f"    老化信号不够强：ρ 中位 {smooth['rho_median']:.3f}，"
+                f"ρ ≤ −0.8 只占 {smooth['rho_frac_strong']:.0%}。"
+                "曲线光滑但不随老化变化。",
                 file=sys.stderr,
             )
         return 1
@@ -318,6 +349,11 @@ def main(argv: list[str] | None = None) -> int:
             "max_tv_ratio_hard": args.max_tv_ratio_hard,
             "tv_ratio_p99": smooth["tv_ratio_p99"],
             "n_soft_over": smooth["n_soft_over"],
+            # 第三道检查：特征有没有携带老化信息（与光滑性独立）
+            "rho_median": smooth["rho_median"],
+            "rho_frac_strong": smooth["rho_frac_strong"],
+            "rho_undetermined": smooth["rho_undetermined"],
+            "label_signal_bad": smooth["label_signal_bad"],
         },
     }
 
