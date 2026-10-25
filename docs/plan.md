@@ -1444,7 +1444,7 @@ TV 差 1280 倍，相关系数 −0.02。**也就是说 M1–M4 用的「ΔQ 特
 | `feature_version` 不符 | 同上，按口径字符串判 |
 | 解释器 torch 版本不符 | 换版本会改数值（下表） |
 | `torch_num_threads` 不符 | 同上 |
-| 结果目录新旧混杂（部分 run 缺 `torch_num_threads`） | 重跑中断后续跑，半新半旧 |
+| 结果目录新旧混杂（部分 run 缺 `torch_num_threads`） | 重跑中断后续跑，半新半旧。带 `--skip-existing` 时降级为逐产物核对，否则续跑会被自己的闸门拒死 |
 | `--skip-existing` 按产物自报口径判 | 只判文件存在 → 跳过上一版的结果（坑 31） |
 | 反推不出参数 / 划分文件缺失 / C1 客户端数不符 | 悄悄换了个实验 |
 
@@ -1472,10 +1472,17 @@ python scripts/rerun_all.py --execute --jobs 8 --threads 1 \
   --features data/mit-stanford/features.fullcycle-bug.parquet \
   --out results/fullcycle-bug-rerun --only 'c0__|c1__|iid__le10|iid__seed|dirichlet0.5|sohrank__seed'
 
-# 全量重跑（新表）
-python scripts/rerun_all.py --execute --jobs 8 --threads 1 \
-  --expect-feature-version discharge-v2
+# 全量重跑（新表）：写到独立目录，不在 results/ 上原地覆盖
+# --compare 指向同线程数的旧口径消融（56 run 重叠），这样差值只剩特征本身
+python scripts/rerun_all.py --execute --jobs 12 --threads 1 \
+  --out results/discharge-v2 --compare results/ablation-old-features \
+  --expect-feature-version discharge-v2 --skip-existing
 ```
+
+`--out` 特意不是 `results/`：那里装的正是**作废的旧结果**，原地覆盖会让
+「中断后重跑」与「跑完了吗」两个问题都变成不可判定的。写到独立目录后，
+`results/discharge-v2/` 里出现的东西只可能来自这一次重跑。`--skip-existing`
+配合它才是安全的续跑——产物逐个过 `artifact_is_current`，口径对不上就重新排队。
 
 两条命令的 `--threads`、解释器、划分文件完全相同，所以两者的差就是特征口径
 的差。
@@ -1579,6 +1586,7 @@ Dirichlet α=0.5 的客户端身份解释方差 **12.2%**，比同 N 的 IID **1
 31. **`--skip-existing` 只判「文件在不在」，会把上一版的结果当成已完成跳过**（2026-10-25 修）。`--out` 默认是 `results/`，而那里装的正是上一次跑的结果。于是「重跑中断 → 带 `--skip-existing` 续跑」会跳过全部任务、打印「剩 0 个」、退出码 0，接着 `summarize_results` 汇总出一张**新旧混杂的表**——不抛异常、行数也对、seeds 也齐，只有一部分数字是上一版的。这与坑 26/27/30 是同一个形状：错的不是数值计算，是「什么算已完成」。
     - 更隐蔽的是配套的 `check_thread_count`：它只看「带 `torch_num_threads` 的那些 run」，混杂目录因此得到 `{1}` 并判定一致。**「全都没有」是合法旧目录，「部分有」才是混杂**——两者必须分开判。
     - 修法三件：① 产物记 `feature_version`（`src/flsoh/featurespec.py`，纯标准库，两个训练脚本各加一个 `features=` 参数）；② `artifact_is_current()` 按「线程数 + torch 版本 + 特征口径」判能否跳过，读不出的期望值不拿来下结论；③ `check_thread_count` 增加混杂检测。
+    - **混杂检测不能连续跑一起禁掉**：重跑中断后结果目录**必然**半新半旧，一律判失败等于逼人删掉已完成的一半重来，而删数据比混数据更贵。所以 `allow_mixed` 只跟随 `--skip-existing` 打开——那时每个产物都过 `artifact_is_current` 逐个核对，混杂不再是静默的。**线程数取值不符仍然硬拒**（`--threads 8` 打错成 `1` 不是续跑能解释的）。
     - 实测：修前对 172 个旧结果跑 `--skip-existing` 是「跳过 157 个，剩 0 个」，修后是「跳过 0 个，剩 157 个，其中 157 个已有产物但不是本次设置的产物」。
     - **教训的形状**：这一条和坑 26/27 是同一类——错的东西不抛异常、不改形状、指标还很好看。区别是 26/27 错在数据，这条错在**环境**，而环境从来不在产物里，除非你主动记。
 
@@ -1597,6 +1605,12 @@ Dirichlet α=0.5 的客户端身份解释方差 **12.2%**，比同 N 的 IID **1
     - 判定规则收敛到 `check_features.report_is_ok()` 一个函数，三个调用点（CLI、`build_features.py`、`run_e2e.py`）共用——否则改判据时漏掉一处，就会出现「一个入口说通过、另一个说失败」，而两条路径的输出都正常。
     - **负控**：旧错表仍判 FAIL（中位 122.41 > 20），新表判 PASS（中位 5.29、越硬上限 0 行、2 行落在两线之间作诊断）。回归测试 `test_a_tail_of_low_amplitude_rows_does_not_fail` 直接把「76 行正常 + 4 行低幅度噪声行」钉成必须通过。
     - 这条的元教训：**闸门本身也要有「为什么是这个阈值」的实测依据**。原来的 20 是拿中位数 5.9 估的「3 倍余量」，却当成了逐行上限用——把分布统计量当逐行判据，是这次返工的全部原因。
+
+33. **重名定义会静默吞掉测试：pytest 全绿，而你以为写了的那些根本没跑**（2026-10-25 加闸门）。Python 允许重名，后一个定义**静默覆盖**前一个；对测试来说就是「粘贴时多贴一遍整个类」→ pytest 只收集最后一份，退出码 0、没有 warning、收集数只少几条，而少的那几条你正好以为在跑。这是坑 26/27/30/31 之外的第四种「输出正常但错了」：前三种错在数字、数据、环境，这一种错在**测试本身消失了**。
+    - 不是假想的：`find_shadowed_definitions()` 第一次运行就抓到 `tests/test_rerun_all.py` 里 `TestMixedDirectory` 与 `TestSkipExistingFreshness` 各被贴了两遍——122 行死代码、**11 个测试函数从来没跑过**。而就在同一次会话里，`TestMixedDirectoryResume` 又被贴了两遍（`pytest tests/test_rerun_all.py` 照样全绿）。
+    - 暴露它的是**徽章**：静态清点会把两份都数上，于是徽章数（748）与「实际新增 3 条」的预期对不上。也就是说，这个洞是被「另一条看似无关的闸门」抓住的——闸门之间互相校对的价值就在这里。
+    - 闸门 `tests/test_readme_badge.py::TestNoShadowedTests`：仓库自身必须干净 + 重复类必须被抓 + 重复方法必须被抓 + **名字不同不许误报**（正控，否则这条闸门只是在拒绝一切）。
+    - 顺带一条工程习惯：粘贴大段代码后不要只看「测试全绿」，要看**收集数变化是不是你预期的那个数**。
 
 ---
 
