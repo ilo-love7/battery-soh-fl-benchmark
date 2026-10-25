@@ -58,10 +58,21 @@ enabled = true
 # ε 不是自由变量。
 #
 # **注意 full.toml 的 num_rounds=200、local_epochs=1，且 k=2 时每客户端
-# 只有 32 行 → 1 批 → q=1.0**（比 dp.toml 的 0.5 更贵）。跑全矩阵前
-# 必须重算一次预算，否则扫出来的点可能一个都达不到 dp_epsilon_max：
-#   python scripts/check_dp_budget.py --config configs/full.toml
-noise_multiplier = [0, 1, 2, 4, 8]
+# 只有 32 行 → 1 批 → q=1.0**（比 dp.toml 的 0.5 更贵）。
+#
+# 2026-10-25 重算过了（`python scripts/check_dp_budget.py --config configs/full.toml`，
+# opacus 1.6.0，δ=1e-5，200 步，q=1.0）：
+#
+#   nm=1 → ε=166.04   nm=2 → 57.30   nm=4 → 22.02
+#   nm=8 → ε=9.23（**不达标**）       nm=9 → 8.02（仍不达标）
+#   nm=10 → ε=7.08（**第一个达标点**）
+#
+# 所以原来那套 [0,1,2,4,8] 在 full 矩阵上**一个点都达不到 ε ≤ 8**。
+# 这与 dp.toml 不同：那边 600 步、q=0.5，nm=8 就是 7.84（唯一达标点）。
+# 网格补一个 10，让 H4 有可判定的落点——「没有任何点达标」与「达标的那一点
+# 劣化多少」是两个完全不同的结论，前者让 H4 无法判定，后者能。
+# 预期 nm=10 的效用比 dp.toml 的 nm=8（劣化 +186.3%）更差，因为噪声更大。
+noise_multiplier = [0, 1, 2, 4, 8, 10]
 max_grad_norm = 1.0
 target_delta = 1e-5
 
