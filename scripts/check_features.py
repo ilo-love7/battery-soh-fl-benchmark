@@ -37,12 +37,36 @@ TV 差 1280 倍，相关系数 −0.02。**而那 2700 行特征照样训出了 
 
 所以这个脚本不做「像不像 ΔQ」的主观判断，只算一个数，跟一个阈值比。
 
-## 阈值怎么定
+## 阈值怎么定：中位数闸门 + 单行硬上限
 
-默认 ``--max-tv-ratio 20``：TV / 曲线幅度 ≤ 20。正确数据实测约 6.8
-（0.21 / 0.031），留 3 倍余量。比值而不是绝对值，因为幅度随电池而变。
+**这道闸门最初是逐行卡 20，那是错的。** TV/幅度 被「1/幅度」污染，不是纯粹的
+「对齐」度量。2026-10-25 修完特征口径后，1080 行实测：
 
-退出码：0 = 全部通过；1 = 有行超限（打印最差的几行）；2 = 输入读不了。
+    ============== ========== ============= =======
+    幅度分组        幅度中位    TV/幅度 中位   最大
+    ============== ========== ============= =======
+    最小 25%        0.0137      8.13          21.75
+    25–50%          0.0197      5.84          12.75
+    50–75%          0.0282      4.43           9.72
+    最大 25%        0.0430      3.45           6.74
+    ============== ========== ============= =======
+
+单调下降，且 ``corr(TV/幅度, 1/幅度) = 0.774``。原因很直白：噪声不随幅度缩放，
+TV ≈ TV_信号 + TV_噪声，幅度越小，噪声占比越大，比值就越大。所以逐行卡阈值
+实际测的是「这一行的幅度够不够大」，而不是「对齐对不对」——而且**失败概率随
+表规模增长**：多加几十颗电池，尾部的低幅度行迟早会踩线。一道会因为「数据变多」
+而失败的闸门，测的不是数据质量。
+
+于是拆成两道，各管一件事：
+
+- ``--max-tv-ratio 20``（**中位数**）：管**系统性错位**。那个 bug 的签名是
+  *所有* 行一起坏——实测中位 122.41、最大 172.15，所以中位数离阈值有 6 倍余量；
+  正确数据中位 5.3，离阈值有 3.7 倍余量。单行噪声影响不了中位数。
+- ``--max-tv-ratio-hard 60``（**逐行**）：管**个别行坏掉**（NaN、整行常数、
+  某颗电池的曲线错配）。错配数据逐行 122–172，正确数据最大 21.75，
+  60 对两边各留约 2.7 倍余量。
+
+退出码：0 = 通过；1 = 中位数超限或有行越过硬上限；2 = 输入读不了。
 """
 
 from __future__ import annotations
@@ -64,14 +88,18 @@ from flsoh.features import (  # noqa: E402
     curve_total_variation,
 )
 
-#: TV / 幅度 的上限。实测正确数据约 6.8，留 3 倍余量。
+#: **中位数**闸门：管系统性错位。正确数据中位 5.3，那个 bug 中位 122.41。
 DEFAULT_MAX_TV_RATIO = 20.0
+
+#: **单行**硬上限：管个别行坏掉。正确数据最大 21.75，错配逐行 122–172。
+DEFAULT_MAX_TV_RATIO_HARD = 60.0
 
 
 def check_feature_table(
     path: str | Path,
     *,
     max_tv_ratio: float = DEFAULT_MAX_TV_RATIO,
+    max_tv_ratio_hard: float = DEFAULT_MAX_TV_RATIO_HARD,
     top: int = 10,
 ) -> dict:
     """对特征表文件逐行算 TV/幅度，返回统计与超限行。
@@ -102,6 +130,7 @@ def check_feature_table(
         np.asarray(table.column(CYCLE_COL).to_pylist()),
         n_features=len(feats),
         max_tv_ratio=max_tv_ratio,
+        max_tv_ratio_hard=max_tv_ratio_hard,
         top=top,
     )
     report["path"] = str(path)
@@ -112,6 +141,7 @@ def check_feature_frame(
     frame,
     *,
     max_tv_ratio: float = DEFAULT_MAX_TV_RATIO,
+    max_tv_ratio_hard: float = DEFAULT_MAX_TV_RATIO_HARD,
     top: int = 10,
 ) -> dict:
     """同一套判据，输入换成 DataFrame。
@@ -134,6 +164,7 @@ def check_feature_frame(
         frame[CYCLE_COL].to_numpy(),
         n_features=len(feats),
         max_tv_ratio=max_tv_ratio,
+        max_tv_ratio_hard=max_tv_ratio_hard,
         top=top,
     )
     report["path"] = "<memory>"
@@ -147,6 +178,7 @@ def check_matrix(
     *,
     n_features: int,
     max_tv_ratio: float = DEFAULT_MAX_TV_RATIO,
+    max_tv_ratio_hard: float = DEFAULT_MAX_TV_RATIO_HARD,
     top: int = 10,
 ) -> dict:
     """判据本体：逐行 TV/幅度。文件与 DataFrame 两条入口都走这里。"""
@@ -175,8 +207,18 @@ def check_matrix(
         ratios.append((curve_total_variation(row) / span,
                        str(cells[i]), int(cycles[i])))
 
-    bad = sorted([r for r in ratios if r[0] > max_tv_ratio], reverse=True)
+    # 两道闸门，管两件事（理由见模块 docstring 的「阈值怎么定」）：
+    #   - 中位数管系统性错位：那个 bug 让**所有**行一起坏，中位 122.41；
+    #   - 单行硬上限管个别行坏掉：NaN、整行常数、某颗电池曲线错配。
+    # 逐行卡中位数阈值是错的——TV/幅度 被 1/幅度 污染，低幅度行的比值天然偏高，
+    # 逐行卡会让「多加几颗电池」本身变成失败原因。
+    over_hard = sorted(
+        [r for r in ratios if r[0] > max_tv_ratio_hard], reverse=True
+    )
+    soft = [r for r in ratios if max_tv_ratio < r[0] <= max_tv_ratio_hard]
     finite = [r[0] for r in ratios if np.isfinite(r[0])]
+    median_ratio = float(np.median(finite)) if finite else float("nan")
+    median_over_limit = bool(np.isfinite(median_ratio) and median_ratio > max_tv_ratio)
     n_cells = len(set(cells.tolist()))
     # 每颗电池最多一个参考循环。零行比电池还多，说明整张表退化成全零，
     # 而「全零」在 TV/幅度 上恰好是算不出比值的——不设这道闸门就会静默通过。
@@ -207,16 +249,40 @@ def check_matrix(
         "n_rows": n_rows,
         "n_features": n_features,
         "max_tv_ratio": max_tv_ratio,
+        "max_tv_ratio_hard": max_tv_ratio_hard,
         "n_reference_rows": n_reference_rows,
         "n_cells": n_cells,
-        "tv_ratio_median": float(np.median(finite)) if finite else float("nan"),
+        "tv_ratio_median": median_ratio,
         "tv_ratio_max": float(np.max(finite)) if finite else float("inf"),
-        "n_over_limit": len(bad),
+        "tv_ratio_p99": float(np.percentile(finite, 99)) if finite else float("inf"),
+        "median_over_limit": median_over_limit,
+        # 越过**硬上限**的行数。落在中位数阈值与硬上限之间的行只作诊断
+        # （``n_soft_over``），不判失败——它们是低幅度行，不是坏行。
+        "n_over_limit": len(over_hard),
+        "n_soft_over": len(soft),
         "too_many_zero_rows": too_many_zero_rows,
         "max_step_ratio_median": float(np.median(steps)) if steps else float("nan"),
         "max_step_ratio_max": float(np.max(steps)) if steps else float("nan"),
-        "worst": [{"cell_id": c, "cycle": k, "tv_ratio": v} for v, c, k in bad[:top]],
+        "worst": [{"cell_id": c, "cycle": k, "tv_ratio": v}
+                  for v, c, k in over_hard[:top]],
     }
+
+    # 注：`worst` 只列越过硬上限的行。中位数超限时那几行的具体值意义不大
+    # （坏的是整张表的对齐，不是某几行），要看分布就直接看中位数与 p99。
+
+
+def report_is_ok(report: dict) -> bool:
+    """这份报告算不算通过。
+
+    三个调用点（本脚本的 CLI、``build_features.py``、``run_e2e.py``）必须用
+    同一个规则。各自拼条件的话，改判据时漏掉一处就会「一个入口说通过、
+    另一个说失败」，而两条路径的输出都很正常。
+    """
+    return not (
+        report.get("too_many_zero_rows")
+        or report.get("median_over_limit")
+        or report.get("n_over_limit")
+    )
 
 
 def main(argv=None) -> int:
@@ -225,34 +291,55 @@ def main(argv=None) -> int:
     )
     parser.add_argument("table", help="特征表 parquet")
     parser.add_argument("--max-tv-ratio", type=float, default=DEFAULT_MAX_TV_RATIO,
-                        help=f"TV/幅度 上限（默认 {DEFAULT_MAX_TV_RATIO}）")
-    parser.add_argument("--top", type=int, default=10, help="最多打印几行超限样本")
+                        help=f"TV/幅度 的**中位数**上限（默认 {DEFAULT_MAX_TV_RATIO}），"
+                             "管系统性错位")
+    parser.add_argument("--max-tv-ratio-hard", type=float,
+                        default=DEFAULT_MAX_TV_RATIO_HARD,
+                        help=f"TV/幅度 的**单行**硬上限（默认 "
+                             f"{DEFAULT_MAX_TV_RATIO_HARD}），管个别坏行")
+    parser.add_argument("--top", type=int, default=10, help="最多打印几行越界样本")
     args = parser.parse_args(argv)
 
     try:
-        report = check_feature_table(args.table, max_tv_ratio=args.max_tv_ratio,
-                                     top=args.top)
+        report = check_feature_table(
+            args.table,
+            max_tv_ratio=args.max_tv_ratio,
+            max_tv_ratio_hard=args.max_tv_ratio_hard,
+            top=args.top,
+        )
     except DataContractError as exc:
         print(f"[check_features] 输入有问题：{exc}", file=sys.stderr)
         return 2
 
     print(f"[check_features] {report['n_rows']} 行 × {report['n_features']} 特征"
           f"（其中 {report['n_reference_rows']} 行是参考循环自身，ΔQ ≡ 0）")
-    print(f"[check_features] TV/幅度 中位数 {report['tv_ratio_median']:.2f}，"
-          f"最大 {report['tv_ratio_max']:.2f}，阈值 {report['max_tv_ratio']:.1f}")
+    print(f"[check_features] TV/幅度 中位数 {report['tv_ratio_median']:.2f}"
+          f"（阈值 {report['max_tv_ratio']:.1f}），"
+          f"p99 {report['tv_ratio_p99']:.2f}，最大 {report['tv_ratio_max']:.2f}"
+          f"（硬上限 {report['max_tv_ratio_hard']:.1f}）")
+    if report["n_soft_over"]:
+        print(f"[check_features] 诊断：{report['n_soft_over']} 行落在中位数阈值与"
+              "硬上限之间。它们是低幅度行（噪声占比高），不判失败；"
+              "只在幅度分位表里看它们是否集中在最小那一档。")
     if report["too_many_zero_rows"]:
         print(f"[check_features] FAIL：{report['n_reference_rows']} 行全零，"
               f"而只有 {report['n_cells']} 颗电池。每颗电池最多一个参考循环——"
               "整表退化成全零时 TV/幅度 算不出比值，不拦就会静默通过。",
               file=sys.stderr)
         return 1
-    if report["n_over_limit"] == 0:
-        print("[check_features] PASS：每一行的 ΔQ(V) 都够光滑")
+    if report_is_ok(report):
+        print("[check_features] PASS：ΔQ(V) 的对齐没问题")
         return 0
 
-    print(f"[check_features] FAIL：{report['n_over_limit']} 行的 ΔQ(V) 不够光滑。"
-          "这不是「精度差一点」，是插值链上把不相干的点配到了一起——"
-          "先查分段（MATR 每个循环含充电+放电两段）再查电压网格。", file=sys.stderr)
+    if report["median_over_limit"]:
+        print(f"[check_features] FAIL：TV/幅度 的**中位数** {report['tv_ratio_median']:.2f} "
+              f"超过 {report['max_tv_ratio']:.1f}。这不是「精度差一点」，是整张表的"
+              "插值链把不相干的点配到了一起——先查分段（MATR 每个循环含充电+放电"
+              "两段）再查电压网格。", file=sys.stderr)
+    else:
+        print(f"[check_features] FAIL：{report['n_over_limit']} 行越过单行硬上限 "
+              f"{report['max_tv_ratio_hard']:.1f}。个别行坏掉（NaN、整行常数、"
+              "某颗电池曲线错配），中位数看不出来，所以单独拦。", file=sys.stderr)
     for row in report["worst"]:
         print(f"    {row['cell_id']} 循环 {row['cycle']}: TV/幅度 = {row['tv_ratio']:.1f}",
               file=sys.stderr)

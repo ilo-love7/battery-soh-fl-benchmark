@@ -66,7 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import numpy as np  # noqa: E402
 
-from check_features import check_feature_frame  # noqa: E402
+from check_features import check_feature_frame, report_is_ok  # noqa: E402
 from flsoh.features import FeatureTable, make_v_grid  # noqa: E402
 from flsoh.ingest import (  # noqa: E402
     IngestError,
@@ -129,7 +129,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--v-hi", type=float, default=3.5)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-tv-ratio", type=float, default=60.0,
-                    help="光滑性闸门的 TV/幅度 上限（默认 60，见下方说明）")
+                    help="光滑性闸门的 TV/幅度 **中位数**上限（默认 60，"
+                         "见下方说明）。这是主判据")
+    ap.add_argument("--max-tv-ratio-hard", type=float, default=180.0,
+                    help="TV/幅度 的**单行**硬上限（默认 180）。只做兜底："
+                         "NaN、整行常数这类个别坏行，中位数看不出来")
     args = ap.parse_args(argv)
 
     t0 = time.time()
@@ -184,15 +188,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    跳过 {message}", file=sys.stderr)
 
     # ---- 3. 光滑性闸门 -------------------------------------------------------
-    smooth = check_feature_frame(frame, max_tv_ratio=args.max_tv_ratio)
+    smooth = check_feature_frame(
+        frame,
+        max_tv_ratio=args.max_tv_ratio,
+        max_tv_ratio_hard=args.max_tv_ratio_hard,
+    )
     print(
-        f"[e2e] 光滑性：TV/幅度 中位 {smooth['tv_ratio_median']:.2f}，"
-        f"最大 {smooth['tv_ratio_max']:.2f}，阈值 {args.max_tv_ratio:.0f}；"
+        f"[e2e] 光滑性：TV/幅度 中位 {smooth['tv_ratio_median']:.2f}"
+        f"（阈值 {args.max_tv_ratio:.0f}），"
+        f"p99 {smooth['tv_ratio_p99']:.2f}，"
+        f"最大 {smooth['tv_ratio_max']:.2f}"
+        f"（硬上限 {args.max_tv_ratio_hard:.0f}）；"
         f"最大跳变/幅度 中位 {smooth['max_step_ratio_median']:.3f}"
         f"（诊断量，不设闸门）",
         flush=True,
     )
-    if smooth["too_many_zero_rows"] or smooth["n_over_limit"]:
+    if not report_is_ok(smooth):
         print(
             "FAIL 特征表不够光滑——这不是精度问题，是插值链上把不相干的点配到了"
             "一起。先查分段（每个循环含充电+放电两段），再查电压网格是否落在"
@@ -304,6 +315,9 @@ def main(argv: list[str] | None = None) -> int:
             "max_step_ratio_median": smooth["max_step_ratio_median"],
             "max_step_ratio_max": smooth["max_step_ratio_max"],
             "max_tv_ratio": args.max_tv_ratio,
+            "max_tv_ratio_hard": args.max_tv_ratio_hard,
+            "tv_ratio_p99": smooth["tv_ratio_p99"],
+            "n_soft_over": smooth["n_soft_over"],
         },
     }
 

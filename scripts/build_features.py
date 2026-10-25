@@ -102,7 +102,7 @@ from flsoh.features import (  # noqa: E402
     make_v_grid,
     validate_feature_table,
 )
-from check_features import check_feature_table  # noqa: E402
+from check_features import check_feature_table, report_is_ok  # noqa: E402
 from flsoh.matr import MatrBatch, MatrError, MatrTransportError  # noqa: E402
 
 DEFAULT_CYCLES = "5:100:5"
@@ -858,11 +858,15 @@ def main(argv: list[str] | None = None) -> int:
     # 能指出数据是错的（实测 TV/幅度 86 vs 正确的 5.9）。
     if not args.no_check:
         report = check_feature_table(args.out, top=5)
-        ratio = report["tv_ratio_median"]
-        print(f"光滑性自检：TV/幅度 中位数 {ratio:.2f}，"
-              f"最大 {report['tv_ratio_max']:.2f}，"
-              f"超限 {report['n_over_limit']}/{report['n_rows']} 行，"
+        print(f"光滑性自检：TV/幅度 中位数 {report['tv_ratio_median']:.2f}"
+              f"（阈值 {report['max_tv_ratio']:.1f}），"
+              f"p99 {report['tv_ratio_p99']:.2f}，"
+              f"最大 {report['tv_ratio_max']:.2f}"
+              f"（硬上限 {report['max_tv_ratio_hard']:.1f}），"
               f"参考循环行 {report['n_reference_rows']}（ΔQ ≡ 0，不计入比值）")
+        if report["n_soft_over"]:
+            print(f"  诊断：{report['n_soft_over']} 行在两条线之间（低幅度行，"
+                  "噪声占比高），不判失败")
         if report["too_many_zero_rows"]:
             print(
                 f"整表退化成全零：{report['n_reference_rows']} 行零而只有 "
@@ -871,13 +875,22 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        if report["n_over_limit"]:
-            print(
-                "特征表不够光滑——这不是精度问题，是插值链上把不相干的点"
-                "配到了一起。先查分段（MATR 每个循环含充电+放电两段），"
-                "再查电压网格是否落在数据值域内。",
-                file=sys.stderr,
-            )
+        if not report_is_ok(report):
+            if report["median_over_limit"]:
+                print(
+                    f"中位数 {report['tv_ratio_median']:.2f} 超过 "
+                    f"{report['max_tv_ratio']:.1f}——这不是精度问题，是整张表的"
+                    "插值链把不相干的点配到了一起。先查分段（MATR 每个循环含"
+                    "充电+放电两段），再查电压网格是否落在数据值域内。",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"{report['n_over_limit']} 行越过单行硬上限 "
+                    f"{report['max_tv_ratio_hard']:.1f}——个别行坏掉，"
+                    "中位数看不出来。",
+                    file=sys.stderr,
+                )
             for row in report["worst"]:
                 print(f"    {row['cell_id']} 循环 {row['cycle']}: "
                       f"TV/幅度 = {row['tv_ratio']:.1f}", file=sys.stderr)

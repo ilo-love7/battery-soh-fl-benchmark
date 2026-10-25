@@ -298,3 +298,105 @@ class TestChecker:
         assert cf.main([str(self._table(tmp_path, good, "good.parquet"))]) == 0
         assert cf.main([str(self._table(tmp_path, bad, "bad.parquet"))]) == 1
         assert cf.main([str(tmp_path / "missing.parquet")]) == 2
+
+
+def _row(n: int, amp: float, ratio: float) -> np.ndarray:
+    """造一行 ΔQ：线性斜坡 + 交替噪声，使 TV/幅度 ≈ ratio。
+
+    斜坡本身的 TV = 幅度。交替噪声让每个相邻差分从 step 变成 |step ± ε|，
+    ε ≫ step 时 TV ≈ (n−1)·ε，而幅度 ≈ amp + ε，解出 ε 即可指定比值。
+    系数写成 ``(n−1)−ratio`` 而不是 ``2(n−1)−ratio``：相邻点是
+    ``base_i`` 与 ``base_{i+1}+ε`` 交替，差分只被加了**一次** ε。
+    """
+    eps = ratio * amp / ((n - 1) - ratio)
+    return np.linspace(0.0, amp, n) + eps * (np.arange(n) % 2)
+
+
+class TestTwoTierGate:
+    """判据从「逐行卡 20」改成「中位数 20 + 单行硬上限 60」。
+
+    改的理由：TV/幅度 被 1/幅度 污染（1080 行实测 corr(TV/幅度, 1/幅度) = 0.774，
+    按幅度四分组的比值中位从 8.13 单调降到 3.45）。逐行卡阈值时，**多加几颗
+    低幅度电池本身**就会让闸门失败——一道会因为「数据变多」而失败的闸门，
+    测的不是数据质量。下面 `test_a_tail_of_low_amplitude_rows_does_not_fail`
+    把这个场景直接做成回归测试。
+    """
+
+    N = 1000
+
+    @staticmethod
+    def _table(tmp_path, rows, name="t.parquet"):
+        df = pd.DataFrame({
+            "cell_id": [f"c{i}" for i in range(len(rows))],
+            "cycle": [5] * len(rows),
+        })
+        for j in range(len(rows[0])):
+            df[f"f{j}"] = [float(r[j]) for r in rows]
+        path = tmp_path / name
+        df.to_parquet(path)
+        return path
+
+    def test_helper_produces_the_ratio_it_claims(self):
+        """前提检查：造行函数真的造出了目标比值。
+
+        少了这条，下面所有测试都可能因为「造出来的行比值是 1」而通过，
+        而失败场景根本没被覆盖。
+        """
+        for target in (5.0, 25.0, 100.0):
+            report = cf.check_feature_frame(pd.DataFrame(
+                {"cell_id": ["c0"], "cycle": [5],
+                 **{f"f{j}": [float(v)] for j, v in enumerate(_row(self.N, 0.01, target))}}
+            ))
+            assert abs(report["tv_ratio_median"] - target) / target < 0.15, (
+                f"目标 {target}，实测 {report['tv_ratio_median']:.2f}"
+            )
+
+    def test_systematic_misalignment_fails_on_the_median(self, tmp_path):
+        """负控：那个 bug 让所有行一起坏，中位数必须报出来。"""
+        rows = [_row(self.N, 0.01, 120.0) for _ in range(40)]
+        report = cf.check_feature_table(self._table(tmp_path, rows))
+        assert report["median_over_limit"] is True
+        assert report["tv_ratio_median"] > 100
+        assert cf.report_is_ok(report) is False
+
+    def test_a_tail_of_low_amplitude_rows_does_not_fail(self, tmp_path):
+        """回归：76 行正常 + 4 行低幅度噪声行 → 必须通过。
+
+        这 4 行在旧判据（逐行卡 20）下会让整张表失败。它们不是坏行，是
+        幅度小到噪声占主导的行——真实数据里就是最小的那一档幅度。
+        """
+        rows = [_row(self.N, 0.03, 5.0) for _ in range(76)]
+        rows += [_row(self.N, 0.008, 25.0) for _ in range(4)]
+        report = cf.check_feature_table(self._table(tmp_path, rows))
+        assert report["n_soft_over"] == 4
+        assert report["n_over_limit"] == 0
+        assert report["median_over_limit"] is False
+        assert cf.report_is_ok(report) is True
+
+    def test_one_broken_row_fails_on_the_hard_cap(self, tmp_path):
+        """中位数管不到个别坏行，所以硬上限必须独立存在。"""
+        rows = [_row(self.N, 0.03, 5.0) for _ in range(79)]
+        rows.append(_row(self.N, 0.01, 120.0))
+        report = cf.check_feature_table(self._table(tmp_path, rows))
+        assert report["n_over_limit"] == 1
+        assert report["median_over_limit"] is False
+        assert cf.report_is_ok(report) is False
+        assert report["worst"][0]["cell_id"] == "c79"
+
+    def test_constant_row_is_still_caught(self, tmp_path):
+        """整行常数 → 比值 inf，两道闸门里至少硬上限要抓住。"""
+        rows = [_row(self.N, 0.03, 5.0) for _ in range(20)]
+        rows.append(np.full(self.N, 0.3))
+        report = cf.check_feature_table(self._table(tmp_path, rows))
+        assert report["n_over_limit"] == 1
+        assert cf.report_is_ok(report) is False
+
+    def test_report_is_ok_is_the_single_source_of_truth(self):
+        """三个调用点共用这一个规则，避免改判据时漏掉一处。"""
+        base = {"too_many_zero_rows": False, "median_over_limit": False,
+                "n_over_limit": 0}
+        assert cf.report_is_ok(base) is True
+        for key, value in (("too_many_zero_rows", True),
+                           ("median_over_limit", True),
+                           ("n_over_limit", 3)):
+            assert cf.report_is_ok({**base, key: value}) is False, key
