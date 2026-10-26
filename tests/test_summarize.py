@@ -973,3 +973,61 @@ class TestDPVerdict:
         assert "nm=0" not in h1 and "nm=1" not in h1 and "nm=8" not in h1
         # 但 M4 段必须还在
         assert "M4 / H4" in out
+
+
+class TestTailMetric:
+    """`final_mae` 是轨迹上的一个采样点，末段平均才是「学到了什么」。
+
+    C0 的 8 个 seed 实测（同数据、同 1 线程、可逐位复现）：末轮瞬时值的
+    CV 是 **77.2%**，末 30 epoch 中位是 **23.7%**。77.2% 这个数一度让
+    H1/H2/H3 全部退回「未判定」，而其中三分之二的波动来自「停在哪个
+    相位」。这一组测试钉住换口径的**语义**，不钉住那个具体数。
+    """
+
+    def _run_with_curve(self, maes, *, seed=0):
+        r = _run("fedavg", seed, maes[-1], scheme="iid", le=10)
+        r["curve"] = [{"round": i + 1, "mae": m} for i, m in enumerate(maes)]
+        return r
+
+    def test_tail_mae_is_the_mean_of_the_last_n(self):
+        r = self._run_with_curve([0.9, 0.9, 0.2, 0.4, 0.6])
+        assert sr._tail_mae(r, 3) == pytest.approx((0.2 + 0.4 + 0.6) / 3)
+
+    def test_tail_mae_is_none_when_curve_is_too_short(self):
+        r = self._run_with_curve([0.5, 0.6])
+        assert sr._tail_mae(r, 3) is None
+
+    def test_run_without_curve_is_none(self):
+        assert sr._tail_mae(_run("fedavg", 0, 0.001, scheme="iid", le=10), 3) is None
+
+    def test_spike_at_the_end_does_not_move_the_tail_metric(self):
+        """负控：末轮是尖峰时，末轮值被尖峰带走，末段平均不被带走。
+
+        这正是 seed2 的形态——末轮 0.00758，末 30 epoch 中位 0.00265。
+        """
+        r = self._run_with_curve([0.0025] * 9 + [0.0076])
+        assert r["final_mae"] == pytest.approx(0.0076)
+        assert sr._tail_mae(r, 10) == pytest.approx((0.0025 * 9 + 0.0076) / 10)
+
+    def test_final_metric_does_not_touch_anything(self):
+        runs = [self._run_with_curve([0.1, 0.2])]
+        changed, fell_back = sr._apply_metric(runs, "final", 10)
+        assert (changed, fell_back) == (0, 0)
+        assert runs[0]["final_mae"] == pytest.approx(0.2)
+        # final 口径下不许留下 last_round_mae，否则下游分不清用的是哪个
+        assert "last_round_mae" not in runs[0]
+
+    def test_tail_metric_preserves_the_original_value(self):
+        runs = [self._run_with_curve([0.002] * 10 + [0.008])]
+        changed, fell_back = sr._apply_metric(runs, "tail", 10)
+        assert (changed, fell_back) == (1, 0)
+        assert runs[0]["last_round_mae"] == pytest.approx(0.008)
+        assert runs[0]["final_mae"] == pytest.approx((0.002 * 9 + 0.008) / 10)
+
+    def test_runs_without_curve_fall_back_and_are_counted(self):
+        """回退必须被数出来：静默回退会得到「一半末段平均、一半末轮」的表。"""
+        runs = [self._run_with_curve([0.002] * 10), _run("local", 0, 0.03)]
+        changed, fell_back = sr._apply_metric(runs, "tail", 10)
+        assert (changed, fell_back) == (1, 1)
+        assert runs[1]["final_mae"] == pytest.approx(0.03)
+        assert runs[1]["last_round_mae"] == pytest.approx(0.03)

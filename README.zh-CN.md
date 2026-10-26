@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-850-blue)](./tests)
+[![Tests](https://img.shields.io/badge/tests-873-blue)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -19,6 +19,16 @@
 > `local_epochs=10` 下的差距从 −22.8% 走到 −40.2%。是修正后的表**seed 波动大了
 > 2–5 倍**（C0 的变异系数从 14.3% 涨到 **77.2%**，Dirichlet 从 7.6% 涨到
 > **44.3%**），而配对检验只有 8 个 seed。把它们写成「已定」等于在报旧表。
+>
+> **而这个波动的来源已经查清了，不是特征变坏。** 100 轮 / 300 epoch 这套预算下，
+> 停训时 **156 个联邦 run 里有 88 个还在降**（`scripts/check_convergence.py`，
+> 判据：末 20% 曲线内 |斜率| ≤ 0.2%/轮 且 IQR/中位 ≤ 10%）。对没收敛的模型，
+> 报出来的 MAE 主要是「你停在哪」的函数：C0 自己的数在「末轮」与「末 10 个
+> 检查点均值」之间就差 **19.3%**，而判据阈值是 5%。把预算乘 3，C0 的 CV 从
+> **77.2% 掉到 14.7%**、FedAvg 从 20.9% 掉到 **10.3%**；H1 的主臂从「−40.2%、
+> 5/8 同向、p=0.15」变成「**−30.3%、8/8 同向、p_t=0.0014、p_sign=0.0078**」。
+> **效应变小了、判定反而稳了**，这是降方差而不是放大效应的指纹。加 seed 只会
+> 把同一个偏置测得更精确。
 >
 > **H4 是唯一维持原判的。** 单调性成立（MAE 随噪声倍数严格递增，8/8 同向，
 > p_sign=0.0078）；「ε ≤ 8 时仍可用」依然**推翻**——唯一达标的那一档
@@ -77,6 +87,7 @@
 | **`scripts/check_features.py`** | 本该拦住 2026-10-25 那个特征 bug 的闸门：逐行算总变差 / 幅度。正确数据 5.9，错配数据 122.4。另有第三道：特征到底有没有携带**老化**（ΔQ(V) 与循环号的 Spearman ρ）——常数曲线在 TV 上是 0 分，完美光滑 |
 | **`scripts/check_feature_ladder.py`** | 回答「信号到底在哪」：常数 / 只用幅度 / 全部特征 / 只用形状 四格，误差的组间-组内拆分，以及主成分阶梯。真实 MATR 表上**任何单一标量幅度都比水平线差**（1.05–1.27 倍），1000 维全量到 0.33 倍，而**前 10 个主成分略好于全部 1000 维**（0.32 倍）——所以有效自由度约 10，第 1 主成分（占 91% 方差）是干扰方向 |
 | **`scripts/compare_feature_versions.py`** | 把两个结果目录逐 run 配对，报中位比值、精确符号检验、以及每个配置家族的 seed 变异系数——让「劣化 17%」跟它所在的噪声放在一起读。线程数不同的两个 run 直接拒绝对比：那会混进一个与 seed 同量级的随机源 |
+| **`scripts/check_convergence.py`** | 在任何人拿某个 run 去判假设之前，先问它**收敛了没有**：末 20% 曲线上的稳健斜率与 IQR/中位。**156 个联邦 run 里有 88 个在第 100 轮还在降**——它们的 MAE 主要是「训练停在哪」的函数。同时报「口径差」（末 10 均 vs 末轮），把「停在哪」的代价直接量化；`--fail-on-unconverged` 可以当 CI 闸门 |
 | **`scripts/simulate_sessions.py`** | 产出 Schema v1 JSONL 与真值。**自己的输出也过一遍 schema 校验**——模拟数据不享受豁免 |
 | **`scripts/run_e2e.py`** | 端到端：会话 → 入库 → 特征 → 光滑性闸门 → 划分 → 联邦训练 → 结果 JSON。五道闸门各有非零退出码，并把一条平凡基线阶梯（常数 / 只用幅度 / 全部特征 / 只用形状）与 MAE 一起报出来——只报 MAE 是不可判读的，模拟数据上 1 维线性模型比 1000 维网络好 6.5 倍 |
 | **`scripts/rerun_all.py`** | 从每个 run 的结果 JSON 反推命令行，重放全部 172 个 run。三种情况直接拒绝：汇总表比分片旧、解释器的 torch 版本与记录不符、线程数与记录不符——这三样都会改数字而不改产物的形状 |

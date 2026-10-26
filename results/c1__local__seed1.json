@@ -15,7 +15,7 @@
   "final_rmse": 0.03885232013213029,
   "rounds_to_target": null,
   "curve": [],
-  "wall_clock_s": 46.112,
+  "wall_clock_s": 31.696,
   "epochs": 300,
   "learning_rate": 0.001,
   "notes": "test_standardizer=test; 23 个客户端各训各的，指标为均值（非平均模型）; optimizer=adam"

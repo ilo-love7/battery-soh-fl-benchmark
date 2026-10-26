@@ -51,6 +51,48 @@ BEGIN_MARK = "<!-- BEGIN GENERATED: results-table -->"
 END_MARK = "<!-- END GENERATED: results-table -->"
 
 
+def _tail_mae(run: dict, points: int) -> float | None:
+    """末 ``points`` 个记录点的平均 MAE；曲线不够长返回 None。
+
+    为什么需要这个口径：`final_mae` 是**轨迹上的一个采样点**，而轨迹本身
+    是尖峰的。C0 的 8 个 seed 实测（同数据、同 1 线程、可逐位复现）：
+
+    | 口径 | 均值 | CV |
+    |---|---|---|
+    | 第 300 epoch 瞬时值 | 0.002709 | **77.2%** |
+    | 末 30 epoch 中位 | 0.002105 | **23.7%** |
+
+    77.2% 这个数一度让 H1/H2/H3 全部退回「未判定」——但其中三分之二的
+    波动来自「停在哪个相位」，不是「学到了什么」。末段平均把这一部分消掉。
+    """
+    maes = [float(p["mae"]) for p in (run.get("curve") or []) if "mae" in p]
+    if len(maes) < points:
+        return None
+    return statistics.mean(maes[-points:])
+
+
+def _apply_metric(runs: list[dict], metric: str, points: int) -> tuple[int, int]:
+    """把选定口径写进 ``final_mae``，原值留在 ``last_round_mae``。
+
+    下游 20 多处都读 ``final_mae``，就地归一化比逐个改调用点安全——少改
+    一处就会得到「一半末段平均、一半末轮」的混合表，而这种表看起来完全
+    正常。返回 ``(改写的 run 数, 没有曲线而回退的 run 数)``。
+    """
+    if metric == "final":
+        return 0, 0
+    changed = fell_back = 0
+    for run in runs:
+        if "last_round_mae" not in run:
+            run["last_round_mae"] = run["final_mae"]
+        tail = _tail_mae(run, points)
+        if tail is None:
+            fell_back += 1
+            continue
+        run["final_mae"] = tail
+        changed += 1
+    return changed, fell_back
+
+
 def _load(results_dir: Path) -> list[dict]:
     runs = []
     for path in sorted(results_dir.glob("*.json")):
@@ -792,12 +834,22 @@ def main(argv: list[str] | None = None) -> int:
                     help="把表写回 plan.md 的生成区")
     ap.add_argument("--check-plan", metavar="PLAN",
                     help="只核对 plan.md 的生成区是否与 results/ 一致")
+    ap.add_argument("--metric", choices=("final", "tail"), default="final",
+                    help="final=末轮瞬时值（历史口径）；tail=末 N 个记录点的平均")
+    ap.add_argument("--tail-points", type=int, default=10,
+                    help="--metric tail 的窗口（默认 10 个记录点）")
     args = ap.parse_args(argv)
 
     runs = _load(Path(args.results))
     if not runs:
         print(f"FAIL {args.results} 里没有带 final_mae 的 run")
         return 1
+
+    changed, fell_back = _apply_metric(runs, args.metric, args.tail_points)
+    if args.metric != "final":
+        print(f"口径 = 末 {args.tail_points} 点平均：改写 {changed} 个 run"
+              + (f"，{fell_back} 个没有足够曲线、回退到末轮值" if fell_back else ""),
+              file=sys.stderr)
 
     table = "\n".join(build_table(runs, args.baseline))
 

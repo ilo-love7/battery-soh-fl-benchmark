@@ -87,12 +87,21 @@ def _make_optimizer(model, name: str, lr: float):
     raise ValueError(f"未知优化器 {name!r}（adam/sgd）")
 
 
-def _train(model, loader, *, epochs: int, lr: float, optimizer: str = "adam") -> float:
+def _train(model, loader, *, epochs: int, lr: float, optimizer: str = "adam",
+           probe=None, probe_every: int = 0) -> float:
+    """训练 ``epochs`` 个 epoch，返回最后一个 epoch 的训练损失。
+
+    ``probe`` 是「返回当前测试 MAE」的可调用对象，每 ``probe_every`` 个
+    epoch 调一次，用于记录曲线。**它必须不消耗全局 RNG**，否则训练时的
+    shuffle 顺序会被评估次数改变——2026-10-26 踩过：中途评估让 seed2 从
+    0.00758 变成 0.00236，看起来像「结果不可复现」。调用方负责给评估
+    loader 挂显式 ``generator``（见 :func:`_probe_loader`）。
+    """
     opt = _make_optimizer(model, optimizer, lr)
     loss_fn = torch.nn.MSELoss()
     model.train()
     last = float("nan")
-    for _ in range(epochs):
+    for epoch in range(1, epochs + 1):
         total, seen = 0.0, 0
         for x, y in loader:
             opt.zero_grad()
@@ -102,11 +111,30 @@ def _train(model, loader, *, epochs: int, lr: float, optimizer: str = "adam") ->
             total += float(loss.detach()) * x.shape[0]
             seen += x.shape[0]
         last = total / max(seen, 1)
+        if probe is not None and probe_every > 0 and epoch % probe_every == 0:
+            probe(epoch)
     return last
 
 
+def _probe_loader(loader):
+    """给评估 loader 挂显式 generator，使它迭代时**不动全局 RNG**。
+
+    ``iter(DataLoader)`` 在 ``num_workers=0`` 时也会从全局 RNG 抽一个
+    ``_base_seed``（``torch.empty((), dtype=torch.int64).random_()``）。
+    中途评估若沿用默认 generator，训练侧的 shuffle 流就被改写，同一 seed
+    训出不同结果——这会让「不可复现」的假象覆盖真结论。
+    """
+    return DataLoader(
+        loader.dataset,
+        batch_size=loader.batch_size,
+        shuffle=False,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+
 def _result(run_id: str, cfg_path: str, strategy: str, *, cells, seed, epochs, lr,
-            mae, rmse, wall, notes="", features: str | None = None) -> dict:
+            mae, rmse, wall, notes="", features: str | None = None,
+            curve: list[dict] | None = None) -> dict:
     """plan.md §9.3 的固定字段。缺的留 null，不删键。"""
     return {
         "run_id": run_id,
@@ -130,7 +158,7 @@ def _result(run_id: str, cfg_path: str, strategy: str, *, cells, seed, epochs, l
         "final_mae": mae,
         "final_rmse": rmse,
         "rounds_to_target": None,
-        "curve": [],
+        "curve": curve or [],
         "wall_clock_s": wall,
         "epochs": epochs,
         "learning_rate": lr,
@@ -152,6 +180,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="默认取 train.optimizer；adam 是实测可用的那个")
     ap.add_argument("--seeds", default="",
                     help="逗号分隔的 seed 列表，覆盖配置里的 seeds.values")
+    ap.add_argument("--curve-every", type=int, default=10,
+                    help="每多少个 epoch 记一次测试 MAE 进 curve（0=不记）。"
+                         "C0 只记一个模型；C1 是 23 个独立模型，不记")
     args = ap.parse_args(argv)
 
     try:
@@ -209,13 +240,22 @@ def main(argv: list[str] | None = None) -> int:
     for seed in seeds:
         t0 = time.time()
         model = build_model(table.input_dim, seed=seed)
-        _train(model, c0_loader, epochs=epochs, lr=lr, optimizer=optimizer)
+        curve: list[dict] = []
+        probe_loader = _probe_loader(test_loader)
+        _train(
+            model, c0_loader, epochs=epochs, lr=lr, optimizer=optimizer,
+            probe=(lambda ep: curve.append(
+                {"epoch": ep, "mae": _evaluate(model, probe_loader)["mae"]}
+            )) if args.curve_every > 0 else None,
+            probe_every=args.curve_every,
+        )
         wall = round(time.time() - t0, 3)
         m = _evaluate(model, test_loader)
         run = _result(
             f"c0__centralized__seed{seed}", args.config, "centralized",
             cells=None, seed=seed, epochs=epochs, lr=lr,
             mae=m["mae"], rmse=m["rmse"], wall=wall, features=args.features,
+            curve=curve,
             notes=(
                 f"test_standardizer={std_strategy}; 全局统计量（C0 允许）; "
                 f"训练电池 {len(train_cells)} 颗，单模型（无客户端概念，n_clients 留空）; "

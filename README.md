@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue)](./pyproject.toml)
 [![flwr](https://img.shields.io/badge/flwr-1.41.0-blue)](./docs/plan.md)
 [![torch](https://img.shields.io/badge/torch-2.10.0-blue)](./docs/plan.md)
-[![Tests](https://img.shields.io/badge/tests-850-blue)](./tests)
+[![Tests](https://img.shields.io/badge/tests-873-blue)](./tests)
 [![CI](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/ilo-love7/battery-soh-fl-benchmark/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
@@ -21,6 +21,19 @@
 > 14.3% to **77.2%**, Dirichlet from 7.6% to **44.3%**), and the paired test has
 > only 8 seeds. Reporting these as settled would be reporting the old table, not
 > this one.
+>
+> **And the cause of that variance is now known — it is not the features.**
+> At 100 rounds / 300 epochs, **88 of 156 federated runs are still descending**
+> when training stops (`scripts/check_convergence.py`, criterion: |slope| ≤
+> 0.2%/round and IQR/median ≤ 10% over the last 20% of the curve). For an
+> unconverged model, the reported MAE is mostly a function of *where you
+> stopped*: C0's own numbers move by **19.3%** between "last epoch" and "mean of
+> the last 10 checkpoints", against a 5% decision threshold. Tripling the budget
+> drops C0's CV from **77.2% to 14.7%** and FedAvg's from 20.9% to **10.3%** —
+> and H1's main arm goes from −40.2%, 5/8 seeds, p=0.15 to **−30.3%, 8/8 seeds,
+> p_t=0.0014, p_sign=0.0078**. The effect got *smaller* while the verdict became
+> determinate, which is the signature of variance reduction rather than effect
+> inflation. Adding seeds would only have measured the same bias more precisely.
 >
 > **H4 is the only verdict that survives.** Monotonicity holds (MAE rises
 > strictly with the noise multiplier, 8/8 seeds, p_sign=0.0078); usability at
@@ -87,6 +100,7 @@ So this repo treats the *checkers* as the deliverable, not the training loop.
 | **`scripts/check_features.py`** | The gate that would have caught the 2026-10-25 feature bug: per-row total variation / amplitude. Correct data scores 5.9, mis-paired points score 122.4. A third check asks whether the feature carries **aging** at all (Spearman ρ between ΔQ(V) and cycle number) — a constant curve scores 0 on TV and is perfectly smooth |
 | **`scripts/check_feature_ladder.py`** | Answers "where does the signal live?" on any feature table: constant / amplitude-only / all features / shape-only, a between-cell vs within-cell split of the error, and a principal-component ladder. On the real MATR table **no single scalar amplitude beats a horizontal line** (1.05–1.27×), all 1000 dims reach 0.33×, and the **first 10 components edge out all 1000** (0.32×) — so the effective dimensionality is ~10, and PC1 (91% of the variance) is a nuisance direction |
 | **`scripts/compare_feature_versions.py`** | Pairs two result directories run-by-run and reports the median ratio, an exact sign test, and each family's seed CV — so a "17% worse" is read against the noise it sits in. Refuses to pair runs whose thread counts differ: that mixes in a random source as large as the seed |
+| **`scripts/check_convergence.py`** | Asks whether a run had *converged* before anyone judges a hypothesis on it: robust slope and IQR/median over the last 20% of the curve. **88 of 156 federated runs are still descending at round 100** — their MAE is mostly a function of where training stopped. Reports the "metric gap" (last-10 mean vs last round) as the price of that choice, and `--fail-on-unconverged` turns it into a CI gate |
 | **`scripts/simulate_sessions.py`** | Emits Schema v1 JSONL + a truth file. Validates its own output against the schema — synthetic data does not get a pass |
 | **`scripts/run_e2e.py`** | End-to-end: sessions → ingest → features → smoothness gate → split → federated training → results JSON. Five gates, each with a non-zero exit code. Reports a baseline ladder (constant / amplitude-only / all features / shape-only) alongside MAE, because MAE alone is unreadable — on simulated data a 1-feature linear model beats the 1000-dim network by 6.5× |
 | **`scripts/rerun_all.py`** | Reconstructs each run's command line from its result JSON and replays all 172 runs. Refuses to run when the assembled feature table is stale, when the interpreter's torch version differs from the recorded one, or when the thread count differs — all three change the numbers without changing the output's shape |

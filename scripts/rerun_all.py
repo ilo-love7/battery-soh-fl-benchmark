@@ -186,6 +186,11 @@ def build_baseline_command(
         "--epochs", str(epochs),
         "--lr", _num(lr),
         "--optimizer", optimizer,
+        # 记曲线：C0 没有逐 epoch 记录时，`final_mae` 就是轨迹上的一个采样点，
+        # 而这条轨迹是尖峰的（seed2 在 epoch 120 冲到 0.0249、平时 0.0025），
+        # 于是「同一份数据同一个 seed」看起来像在随机跳。5 epoch 一个点，
+        # 末 10 点 = 末 50 epoch，够做末段平均。
+        "--curve-every", "5",
         "--out", out,
     ]
 
