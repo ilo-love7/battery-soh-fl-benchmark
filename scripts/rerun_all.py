@@ -103,20 +103,25 @@ def load_runs(results_dir: Path) -> dict[str, dict]:
 
 def build_federated_command(
     run: dict, *, config: str, features: str, out: str,
-    python: str | None = None,
+    python: str | None = None, rounds_override: int | None = None,
 ) -> list[str]:
     """把一个联邦 run 的 JSON 还原成命令行。
 
     `--tag` 用 run_id 原样传入：文件名必须逐字对上，否则重跑产物与
     `docs/plan.md` §10.2 的表、图 1–3 的分组键全部错位。
+
+    `rounds_override` 把轮数改掉（用于把 100 轮重跑成 300 轮，见 §13.5.8）。
+    它只改命令行上的 `--rounds`，**不改文件名**——产物会覆盖原轮数的那份，
+    这正是「按 300 轮重跑 H1/H2/H3 臂」想要的：同一个 run_id，新的更长的训练。
     """
+    effective_rounds = rounds_override if rounds_override is not None else run["rounds"]
     argv = [
         python or sys.executable, "scripts/run_federated.py",
         "--config", config,
         "--features", features,
         "--partition-json", str(run["partition_json"]),
         "--strategy", str(run["strategy"]),
-        "--rounds", str(int(run["rounds"])),
+        "--rounds", str(int(effective_rounds)),
         "--local-epochs", str(int(run["local_epochs"])),
         "--lr", _num(run["learning_rate"]),
         "--optimizer", str(run["optimizer"]),
@@ -537,7 +542,8 @@ def _rc_hint(code: int) -> str:
 
 def _run_job(job: dict, *, config: str, features: str, out: str,
              baseline_partition: str, log_dir: Path | None,
-             python: str, threads: int) -> dict:
+             python: str, threads: int,
+             rounds_override: int | None = None) -> dict:
     """跑一个任务，返回 {run_ids, ok, seconds, output}。"""
     if job["kind"] == "baseline":
         argv = build_baseline_command(
@@ -546,7 +552,8 @@ def _run_job(job: dict, *, config: str, features: str, out: str,
         )
     else:
         argv = build_federated_command(
-            job["run"], config=config, features=features, out=out, python=python
+            job["run"], config=config, features=features, out=out, python=python,
+            rounds_override=rounds_override,
         )
     env = pinned_env(threads)
     t0 = time.time()
@@ -633,6 +640,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="放行 torch 版本不一致的检查（只在做版本对比时用）")
     ap.add_argument("--skip-existing", action="store_true",
                     help="产物已存在就跳过（断点续跑）")
+    ap.add_argument("--rounds-override", type=int, default=None,
+                    help="把每个联邦 run 的轮数覆盖成这个值（如把 100 轮重跑成 "
+                         "300 轮）。只作用于联邦臂，不动基线；文件名不变，会覆盖 "
+                         "原轮数那份产物——这是「按 300 轮重跑 H1/H2/H3」想要的")
     ap.add_argument("--log-dir", default=None, help="把每个 run 的输出写进该目录")
     ap.add_argument("--compare", default=None,
                     help="跑完与旧结果目录逐 run 对比（如 results/fullcycle-bug）")
@@ -745,6 +756,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"待跑 {len(jobs)} 个任务，旧墙钟合计 {est / 3600:.2f} 小时，"
           f"--jobs {args.jobs} 预计 {est / 3600 / max(args.jobs, 1):.2f} 小时"
           f"（解释器 {python}，每进程 {args.threads} 线程）")
+    if args.rounds_override is not None:
+        print(
+            f"注意：--rounds-override {args.rounds_override} 已生效，上面的耗时"
+            "是按原轮数估的，实际会随轮数近似线性变长"
+        )
 
     if not args.execute:
         for job in jobs:
@@ -757,6 +773,7 @@ def main(argv: list[str] | None = None) -> int:
                 cmd = build_federated_command(
                     job["run"], config=args.config, features=args.features,
                     out=args.out, python=python,
+                    rounds_override=args.rounds_override,
                 )
             if not args.quiet:
                 print("  " + " ".join(cmd[1:]))
@@ -773,6 +790,7 @@ def main(argv: list[str] | None = None) -> int:
                 _run_job, job, config=args.config, features=args.features,
                 out=args.out, baseline_partition=args.baseline_partition,
                 log_dir=log_dir, python=python, threads=args.threads,
+                rounds_override=args.rounds_override,
             ): job
             for job in jobs
         }

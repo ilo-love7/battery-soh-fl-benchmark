@@ -100,6 +100,24 @@ class TestFederatedCommand:
         assert _pair(argv, "--seed") == "0"
         assert _pair(argv, "--partition-json") == "results/partition-mvp-k5-iid.json"
 
+    def test_rounds_override_replaces_the_recorded_rounds(self):
+        # §13.5.8：把 100 轮重跑成 300 轮时，命令行上的 --rounds 必须跟着变，
+        # 而文件名（--tag）不能变——否则新产物覆盖不到原 run_id，表里还是旧数字。
+        argv = ra.build_federated_command(
+            _fed(), config="c.toml", features="f.parquet", out="results",
+            rounds_override=300,
+        )
+        assert _pair(argv, "--rounds") == "300"
+        assert _pair(argv, "--tag") == "fedavg__iid__le10__seed0"
+
+    def test_rounds_override_none_keeps_recorded_rounds(self):
+        # 没给覆盖值时，必须原样用 JSON 里记的轮数，不能静默改成别的。
+        argv = ra.build_federated_command(
+            _fed(rounds=100), config="c.toml", features="f.parquet", out="results",
+            rounds_override=None,
+        )
+        assert _pair(argv, "--rounds") == "100"
+
     def test_fedavg_does_not_get_a_mu_flag(self):
         # FedAvg 传 --mu 0 会走到 proximal 分支之外，但更重要的是别传错值。
         argv = ra.build_federated_command(
